@@ -198,6 +198,6 @@ mdd-sim-gateway:三代目，也是借鉴他的代码
 
 
 
-![](docs\images\验证码.png)
+![验证码远程查看示例](docs/images/验证码.png)
 
-![页面](docs\images\页面.png)
+![VoWin 程序页面](docs/images/页面.png)
