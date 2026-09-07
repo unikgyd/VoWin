@@ -1,4 +1,4 @@
-# VoWin
+# VoWin：还在为没有Linux或mac而无法用上vowifi而困扰？
 
 <p align="center">
   <img src="VoWin/Assets/vowin.png" alt="VoWin Logo" width="128" height="128" />
@@ -16,6 +16,16 @@
 </p>
 
 > 本项目用于合法的个人研究、模组调试与已获授权的通信测试。VoWiFi、IMS 通话及 eSIM 下载均取决于模组、SIM、运营商开通状态和网络策略，不能保证对任意设备或运营商可用。
+
+## 赞助支持
+
+如果你觉得本项目有用，可以赞助作者一杯咖啡吗？你的赞助是我最大的动力！
+
+| 资产与网络                       | 地址                                         |
+| -------------------------------- | -------------------------------------------- |
+| USDT · TRON（TRC-20）            | `TDecoS5mFozuyfJSR2QhSsWbCkGm8nsvpH`         |
+| USDT · BNB Smart Chain（BEP-20） | `0x0e5e07b7604d8585fd936527f48874a10ad8b884` |
+| USDT · Polygon                   | `0x0e5e07b7604d8585fd936527f48874a10ad8b884` |
 
 ## 安装教程
 
