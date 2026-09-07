@@ -1,0 +1,1013 @@
+using System.Net;
+using System.Text;
+using System.Text.RegularExpressions;
+using VoSharp.Common.Events;
+using VoSharp.Sip;
+using VoSharp.Telephony.Audio;
+using VoSharp.Telephony.VoWifi;
+
+namespace VoSharp.Telephony.Calls;
+
+public record CallInfo(
+    string CallId,
+    string TargetNumber,
+    CallState State,
+    DateTime StartedAt,
+    DateTime? ConnectedAt,
+    DateTime? EndedAt,
+    string? Codec,
+    string? WavRecordingPath,
+    bool IsOutgoing = true
+);
+
+public class ImsCallManager : IDisposable
+{
+    public CallState State { get; private set; } = CallState.Idle;
+    public CallInfo? ActiveCall { get; private set; }
+    public AsyncEventBus? EventBus { get; }
+    public bool IsIncoming => ActiveCall != null && !ActiveCall.IsOutgoing;
+
+    public event EventHandler<CallStateChangedEventArgs>? CallStateChanged;
+    public event EventHandler<IncomingCallEventArgs>? IncomingCall;
+    public event EventHandler<CallConnectedEventArgs>? CallConnected;
+    public event EventHandler<CallEndedEventArgs>? CallEnded;
+    public event EventHandler<DtmfReceivedEventArgs>? DtmfReceived;
+    public event EventHandler<AudioStreamStateChangedEventArgs>? AudioStreamStateChanged;
+
+    private readonly WindowsAudioDevice _audio;
+    private RtpSession? _rtp;
+    private SipTransport? _callTransport;
+    private string? _currentCallId;
+    private string? _currentFromTag;
+    private string? _currentLocalIp;
+    private string? _targetUri;
+    private string? _dialogTargetUri;
+    private string? _dialogTo;
+    private string? _dialogFrom;
+    private List<string>? _dialogRoutes;
+    private VoWifi.VoWifiManager? _currentVoWifi;
+    private int _cseq = 1;
+    private string? _lastInviteBranch;
+    private int _lastInviteCSeq;
+    private string? _lastInviteVia;
+
+    private SipMessage? _incomingInvite;
+    private Func<SipMessage, Task>? _incomingReplySender;
+    private string? _remoteOfferSdp;
+
+    public ImsCallManager(AsyncEventBus? eventBus = null)
+    {
+        EventBus = eventBus;
+        _audio   = new WindowsAudioDevice(sampleRate: 8000);
+    }
+
+    /// <summary>
+    /// Dials a number over VoWiFi by sending a real SIP INVITE to the P-CSCF.
+    /// BUG-11 FIX: INVITE is now transmitted via SipTransport and a response is awaited.
+    /// </summary>
+    public async Task<CallInfo> DialAsync(
+        string number,
+        VoWifiManager voWifi,
+        CancellationToken ct = default)
+    {
+        if (voWifi.State != VoWifiState.ImsRegistered || string.IsNullOrEmpty(voWifi.AssignedIp))
+            throw new InvalidOperationException("IMS: no active VoWiFi session. Register first.");
+
+        if (State == CallState.Active || State == CallState.Dialing)
+            throw new InvalidOperationException("Another call is already in progress.");
+
+        var cleanNumber = number.Trim();
+        _cseq = 1;
+        _currentCallId  = Guid.NewGuid().ToString("N") + "@" + voWifi.AssignedIp;
+        _currentFromTag = Guid.NewGuid().ToString("N")[..8];
+
+        State = CallState.Dialing;
+        var startedAt = DateTime.UtcNow;
+
+        // BUG-20 FIX: clear recorded audio buffer before starting a new call
+        _audio.ClearRecording();
+
+        _audio.ClearRecording();
+        ReleaseRtpSession();
+        _rtp = new RtpSession(_audio, EventBus);
+        _currentVoWifi = voWifi;
+        voWifi.RegisterRtpSession(_rtp);
+
+        var localIp = voWifi.AssignedIp;
+
+        // ── Build SDP Offer ───────────────────────────────────────────────────
+        var sessionID = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var sdp = new StringBuilder();
+        sdp.Append("v=0\r\n");
+        sdp.Append($"o=- {sessionID} {sessionID} IN IP4 {localIp}\r\n");
+        sdp.Append("s=VoCat\r\n");
+        sdp.Append($"c=IN IP4 {localIp}\r\n");
+        sdp.Append("t=0 0\r\n");
+        sdp.Append($"m=audio {_rtp.LocalPort} RTP/AVP 104 102 101\r\n");
+        sdp.Append("a=rtpmap:104 AMR-WB/16000/1\r\n");
+        sdp.Append("a=fmtp:104 mode-change-capability=2; max-red=0\r\n");
+        sdp.Append("a=rtpmap:102 AMR/8000/1\r\n");
+        sdp.Append("a=fmtp:102 mode-change-capability=2; max-red=0\r\n");
+        sdp.Append("a=rtpmap:101 telephone-event/8000\r\n");
+        sdp.Append("a=fmtp:101 0-15\r\n");
+        sdp.Append("a=ptime:20\r\n");
+        sdp.Append("a=maxptime:240\r\n");
+        sdp.Append("a=sendrecv\r\n");
+        var sdpStr = sdp.ToString();
+
+        // ── Build SIP INVITE (matching voCore 3GPP TS 24.229) ──────────────────
+        var homeDomain = voWifi.EpdgInfo?.ImsDomain ?? "ims.mnc066.mcc515.3gppnetwork.org";
+        var targetUri = cleanNumber.StartsWith("sip:") || cleanNumber.StartsWith("tel:")
+            ? cleanNumber
+            : "tel:" + cleanNumber;
+
+        // Use primary public identity from P-Associated-URI or fallback to Impu
+        string publicURI = voWifi.EpdgInfo?.Impu ?? $"sip:{cleanNumber}@{homeDomain}";
+        if (!string.IsNullOrWhiteSpace(voWifi.ImsInfo?.PAssociatedUri))
+        {
+            var match = Regex.Match(voWifi.ImsInfo.PAssociatedUri, @"<([^>]+)>");
+            if (match.Success)
+            {
+                publicURI = match.Groups[1].Value.Trim();
+            }
+        }
+
+        var user = publicURI;
+        if (user.StartsWith("sip:", StringComparison.OrdinalIgnoreCase))
+        {
+            user = user[4..];
+            var at = user.IndexOf('@');
+            if (at >= 0) user = user[..at];
+        }
+        else if (user.StartsWith("tel:", StringComparison.OrdinalIgnoreCase))
+        {
+            user = user[4..];
+            var semi = user.IndexOf(';');
+            if (semi >= 0) user = user[..semi];
+        }
+
+        var instanceId = $"urn:gsma:imei:{voWifi.EpdgInfo?.Impi?.Split('@')[0] ?? "863212061673965"}";
+        if (voWifi.Modem != null)
+        {
+            try { instanceId = $"urn:gsma:imei:{voWifi.ImsInfo?.ContactUri ?? ""}"; } catch { }
+        }
+
+        var contactUser = !string.IsNullOrEmpty(voWifi.ImsInfo?.ContactUri)
+            ? Regex.Match(voWifi.ImsInfo.ContactUri, @"<sip:([^@]+)@").Groups[1].Value
+            : (voWifi.EpdgInfo?.Impi?.Split('@')[0] ?? user);
+        if (string.IsNullOrEmpty(contactUser)) contactUser = user;
+
+        string contact = $"<sip:{contactUser}@{localIp}:5060;transport=udp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio";
+        if (!string.IsNullOrWhiteSpace(voWifi.ImsInfo?.ContactUri))
+        {
+            var instMatch = Regex.Match(voWifi.ImsInfo.ContactUri, @"(\+sip\.instance=""[^""]+"")");
+            if (instMatch.Success)
+                contact += $";{instMatch.Groups[1].Value}";
+        }
+
+        _currentLocalIp = localIp;
+        _targetUri = targetUri;
+
+        var invite = new SipMessage
+        {
+            IsRequest  = true,
+            Method     = "INVITE",
+            RequestUri = targetUri,
+            SipVersion = "SIP/2.0",
+            Body       = sdpStr
+        };
+
+        if (!string.IsNullOrEmpty(voWifi.ImsInfo?.ServiceRoute))
+        {
+            invite.SetHeader("Route", voWifi.ImsInfo.ServiceRoute);
+        }
+
+        var branch = "z9hG4bK" + Guid.NewGuid().ToString("N")[..12];
+        _lastInviteBranch = branch;
+        _lastInviteCSeq = _cseq;
+        _lastInviteVia = $"SIP/2.0/UDP {localIp}:5060;branch={branch};rport";
+        _dialogFrom = $"<{publicURI}>;tag={_currentFromTag}";
+        _dialogTo = $"<{targetUri}>";
+        _targetUri = targetUri;
+        _currentLocalIp = localIp;
+
+        invite.SetHeader("Via",      _lastInviteVia);
+        invite.SetHeader("Max-Forwards", "70");
+        invite.SetHeader("From",     _dialogFrom);
+        invite.SetHeader("To",       _dialogTo);
+        invite.SetHeader("Call-ID",  _currentCallId);
+        invite.SetHeader("CSeq",     $"{_cseq++} INVITE");
+        invite.SetHeader("Contact",  contact);
+        invite.SetHeader("P-Preferred-Identity", $"<{publicURI}>");
+        invite.SetHeader("P-Preferred-Service",  "urn:urn-7:3gpp-service.ims.icsi.mmtel");
+        invite.SetHeader("Accept-Contact",      "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"");
+        invite.SetHeader("P-Access-Network-Info", "IEEE-802.11; i-wlan-node-id=505322000000");
+        invite.SetHeader("Allow",         "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE");
+        invite.SetHeader("Supported",     "100rel, timer");
+        invite.SetHeader("Content-Type",   "application/sdp");
+        invite.SetHeader("Content-Length", sdpStr.Length.ToString());
+        invite.SetHeader("User-Agent",    "iPhone Pro/17");
+
+        Console.WriteLine($"[ImsCallManager] INVITE headers:\n{string.Join("\n", invite.Headers.Select(h => $"  {h.Key}: {string.Join(", ", h.Value)}"))}");
+
+        var wavPath = Path.Combine(
+            Directory.GetCurrentDirectory(),
+            $"call_{cleanNumber}_{DateTime.Now:yyyyMMdd_HHmmss}.wav");
+
+        var call = new CallInfo(
+            CallId:           _currentCallId,
+            TargetNumber:     cleanNumber,
+            State:            CallState.Dialing,
+            StartedAt:        startedAt,
+            ConnectedAt:      null,
+            EndedAt:          null,
+            Codec:            "Negotiating...",
+            WavRecordingPath: wavPath
+        );
+        ActiveCall = call;
+
+        NotifyCallStateChanged(CallState.Idle, CallState.Dialing);
+        EventBus?.Publish("call.dialing", "ImsCallManager", ActiveCall);
+
+        // ── Single INVITE send + non-resending provisional response loop ──
+        var sipTransport = voWifi.SipTransport;
+        if (sipTransport != null)
+        {
+            _callTransport = sipTransport; // reuse VoWiFi SIP transport
+
+            try
+            {
+                var finalResp = await sipTransport.SendAndReceiveFinalAsync(
+                    invite,
+                    onProvisional: prov =>
+                    {
+                        if (prov.StatusCode is 180 or 183)
+                        {
+                            var old = State;
+                            State = CallState.Ringing;
+                            call = (ActiveCall ?? call) with { State = CallState.Ringing };
+                            ActiveCall = call;
+                            NotifyCallStateChanged(old, CallState.Ringing);
+                            EventBus?.Publish("call.ringing", "ImsCallManager", ActiveCall);
+                        }
+                    },
+                    timeoutMs: 30000,
+                    ct: ct
+                ).ConfigureAwait(false);
+
+                if (finalResp?.StatusCode == 200)
+                {
+                    var contactHeader = finalResp.GetHeader("Contact") ?? "";
+                    var contactMatch = Regex.Match(contactHeader, @"<([^>]+)>");
+                    _dialogTargetUri = contactMatch.Success ? contactMatch.Groups[1].Value.Trim() : (string.IsNullOrWhiteSpace(contactHeader) ? targetUri : contactHeader.Trim());
+                    _dialogTo = finalResp.GetHeader("To") ?? invite.GetHeader("To") ?? "";
+                    _dialogFrom = invite.GetHeader("From") ?? "";
+                    if (finalResp.Headers.TryGetValue("Record-Route", out var recordRoutes) && recordRoutes.Count > 0)
+                    {
+                        _dialogRoutes = ParseAndReverseRecordRoute(recordRoutes);
+                    }
+                    else if (invite.Headers.TryGetValue("Route", out var invRoutes) && invRoutes.Count > 0)
+                    {
+                        _dialogRoutes = invRoutes;
+                    }
+                    else if (!string.IsNullOrEmpty(voWifi.ImsInfo?.ServiceRoute))
+                    {
+                        _dialogRoutes = [voWifi.ImsInfo.ServiceRoute];
+                    }
+
+                    // Send ACK (RFC 3261 §13.2.2.4)
+                    await SendAckAsync(sipTransport, invite, finalResp, ct).ConfigureAwait(false);
+
+                    // Extract remote RTP endpoint from SDP Answer
+                    SetRtpFromSdpAnswer(finalResp.Body ?? string.Empty);
+
+                    var codec = ExtractCodecFromSdp(finalResp.Body ?? string.Empty);
+                    var old = State;
+                    call = (ActiveCall ?? call) with
+                    {
+                        State       = CallState.Active,
+                        ConnectedAt = DateTime.UtcNow,
+                        Codec       = codec
+                    };
+                    ActiveCall = call;
+                    State = CallState.Active;
+                    NotifyCallStateChanged(old, CallState.Active, codec);
+                    NotifyCallConnected(ActiveCall);
+                    EventBus?.Publish("call.connected", "ImsCallManager", ActiveCall);
+                }
+                else if (finalResp != null)
+                {
+                    // Call rejected
+                    var old = State;
+                    State = CallState.Ended;
+                    call = (ActiveCall ?? call) with { State = CallState.Ended, EndedAt = DateTime.UtcNow };
+                    ActiveCall = call;
+                    NotifyCallStateChanged(old, CallState.Ended);
+                    NotifyCallEnded(ActiveCall, finalResp.ReasonPhrase);
+                    EventBus?.Publish("call.rejected", "ImsCallManager",
+                        new { Code = finalResp.StatusCode, Reason = finalResp.ReasonPhrase });
+                    throw new InvalidOperationException(
+                        $"Call rejected: {finalResp.StatusCode} {finalResp.ReasonPhrase}\nHeaders:\n{string.Join("\n", finalResp.Headers.Select(h => $"  {h.Key}: {string.Join(", ", h.Value)}"))}\nBody:\n{finalResp.Body}");
+                }
+            }
+            catch (TimeoutException)
+            {
+                // P-CSCF unreachable — call failed
+                var old = State;
+                State      = CallState.Ended;
+                call       = (ActiveCall ?? call) with { State = CallState.Ended, EndedAt = DateTime.UtcNow };
+                ActiveCall = call;
+                NotifyCallStateChanged(old, CallState.Ended);
+                NotifyCallEnded(ActiveCall, "INVITE timeout");
+                EventBus?.Publish("call.failed", "ImsCallManager", "INVITE timeout");
+                throw;
+            }
+        }
+        else
+        {
+            // No SIP transport available — still emit event so CLI shows the call state
+            EventBus?.Publish("call.dialing", "ImsCallManager",
+                "WARNING: No SIP transport available. Call cannot be established.");
+        }
+
+        return ActiveCall ?? call;
+    }
+
+    /// <summary>
+    /// Handles an incoming SIP INVITE from the network (someone is calling us).
+    /// Sends 100 Trying and 180 Ringing, alerts the event bus, and prepares the call state.
+    /// </summary>
+    public async Task HandleIncomingInviteAsync(
+        SipMessage invite,
+        VoWifiManager voWifi,
+        Func<SipMessage, Task> replySender)
+    {
+        ArgumentNullException.ThrowIfNull(invite);
+        ArgumentNullException.ThrowIfNull(voWifi);
+        ArgumentNullException.ThrowIfNull(replySender);
+
+        if (State == CallState.Active || State == CallState.Dialing)
+        {
+            // Busy here (486)
+            var busyResp = new SipMessage
+            {
+                IsRequest = false,
+                StatusCode = 486,
+                ReasonPhrase = "Busy Here",
+                SipVersion = "SIP/2.0"
+            };
+            busyResp.SetHeader("Via", invite.GetHeader("Via") ?? string.Empty);
+            busyResp.SetHeader("From", invite.GetHeader("From") ?? string.Empty);
+            busyResp.SetHeader("To", $"{invite.GetHeader("To")};tag={Guid.NewGuid().ToString("N")[..8]}");
+            busyResp.SetHeader("Call-ID", invite.GetHeader("Call-ID") ?? string.Empty);
+            busyResp.SetHeader("CSeq", invite.GetHeader("CSeq") ?? "1 INVITE");
+            busyResp.SetHeader("Content-Length", "0");
+            await replySender(busyResp).ConfigureAwait(false);
+            return;
+        }
+
+        _incomingInvite = invite;
+        _incomingReplySender = replySender;
+        _currentVoWifi = voWifi;
+        _currentCallId = invite.GetHeader("Call-ID") ?? Guid.NewGuid().ToString("N");
+        _currentFromTag = Guid.NewGuid().ToString("N")[..8];
+        _remoteOfferSdp = invite.Body;
+
+        var fromHeader = invite.GetHeader("From") ?? "Unknown";
+        var callerNumber = ExtractNumberFromUri(fromHeader);
+
+        _dialogFrom = $"{invite.GetHeader("To")};tag={_currentFromTag}";
+        _dialogTo = fromHeader;
+        if (invite.Headers.TryGetValue("Record-Route", out var rrs))
+        {
+            _dialogRoutes = rrs.AsEnumerable().Reverse().ToList();
+        }
+        var contactHeader = invite.GetHeader("Contact") ?? "";
+        var contactMatch = Regex.Match(contactHeader, @"<([^>]+)>");
+        _dialogTargetUri = contactMatch.Success ? contactMatch.Groups[1].Value : (string.IsNullOrWhiteSpace(contactHeader) ? fromHeader : contactHeader);
+
+        // 1. Send 100 Trying
+        var resp100 = new SipMessage
+        {
+            IsRequest = false,
+            StatusCode = 100,
+            ReasonPhrase = "Trying",
+            SipVersion = "SIP/2.0"
+        };
+        resp100.SetHeader("Via", invite.GetHeader("Via") ?? string.Empty);
+        resp100.SetHeader("From", invite.GetHeader("From") ?? string.Empty);
+        resp100.SetHeader("To", invite.GetHeader("To") ?? string.Empty);
+        resp100.SetHeader("Call-ID", _currentCallId);
+        resp100.SetHeader("CSeq", invite.GetHeader("CSeq") ?? "1 INVITE");
+        resp100.SetHeader("Content-Length", "0");
+        await replySender(resp100).ConfigureAwait(false);
+
+        // 2. Send 180 Ringing
+        var localIp = voWifi.AssignedIp ?? "127.0.0.1";
+        var resp180 = new SipMessage
+        {
+            IsRequest = false,
+            StatusCode = 180,
+            ReasonPhrase = "Ringing",
+            SipVersion = "SIP/2.0"
+        };
+        resp180.SetHeader("Via", invite.GetHeader("Via") ?? string.Empty);
+        resp180.SetHeader("From", invite.GetHeader("From") ?? string.Empty);
+        resp180.SetHeader("To", $"{invite.GetHeader("To")};tag={_currentFromTag}");
+        resp180.SetHeader("Call-ID", _currentCallId);
+        resp180.SetHeader("CSeq", invite.GetHeader("CSeq") ?? "1 INVITE");
+        resp180.SetHeader("Contact", $"<sip:{localIp}:5060;transport=udp>;audio");
+        resp180.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE");
+        resp180.SetHeader("Content-Length", "0");
+        await replySender(resp180).ConfigureAwait(false);
+
+        // 3. Set Ringing state and notify event bus
+        var oldState = State;
+        State = CallState.Ringing;
+        var startedAt = DateTime.UtcNow;
+        var wavPath = Path.Combine(
+            Directory.GetCurrentDirectory(),
+            $"call_incoming_{callerNumber}_{DateTime.Now:yyyyMMdd_HHmmss}.wav");
+
+        ActiveCall = new CallInfo(
+            CallId: _currentCallId,
+            TargetNumber: callerNumber,
+            State: CallState.Ringing,
+            StartedAt: startedAt,
+            ConnectedAt: null,
+            EndedAt: null,
+            Codec: ExtractCodecFromSdp(_remoteOfferSdp ?? string.Empty),
+            WavRecordingPath: wavPath,
+            IsOutgoing: false
+        );
+
+        NotifyCallStateChanged(oldState, CallState.Ringing);
+        NotifyIncomingCall(_currentCallId, callerNumber);
+        EventBus?.Publish("call.incoming", "ImsCallManager", ActiveCall);
+        EventBus?.Publish(EventTopics.CallIncoming, "ImsCallManager", callerNumber);
+    }
+
+    /// <summary>
+    /// Answers an incoming ringing call by sending 200 OK with SDP answer and starting the RTP media session.
+    /// </summary>
+    public async Task<CallInfo> AnswerAsync(CancellationToken ct = default)
+    {
+        if (State != CallState.Ringing || _incomingInvite == null || _incomingReplySender == null || _currentVoWifi == null)
+            throw new InvalidOperationException("No incoming call in ringing state to answer.");
+
+        _audio.ClearRecording();
+        var voWifi = _currentVoWifi;
+        ReleaseRtpSession();
+        _rtp = new RtpSession(_audio, EventBus);
+        _currentVoWifi = voWifi;
+        voWifi.RegisterRtpSession(_rtp);
+
+        var localIp = voWifi.AssignedIp ?? "127.0.0.1";
+        var sessionID = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var sdp = new StringBuilder();
+        sdp.Append("v=0\r\n");
+        sdp.Append($"o=- {sessionID} {sessionID} IN IP4 {localIp}\r\n");
+        sdp.Append("s=VoCat\r\n");
+        sdp.Append($"c=IN IP4 {localIp}\r\n");
+        sdp.Append("t=0 0\r\n");
+        sdp.Append($"m=audio {_rtp.LocalPort} RTP/AVP 104 102 101\r\n");
+        sdp.Append("a=rtpmap:104 AMR-WB/16000/1\r\n");
+        sdp.Append("a=fmtp:104 mode-change-capability=2; max-red=0\r\n");
+        sdp.Append("a=rtpmap:102 AMR/8000/1\r\n");
+        sdp.Append("a=fmtp:102 mode-change-capability=2; max-red=0\r\n");
+        sdp.Append("a=rtpmap:101 telephone-event/8000\r\n");
+        sdp.Append("a=fmtp:101 0-15\r\n");
+        sdp.Append("a=ptime:20\r\n");
+        sdp.Append("a=maxptime:240\r\n");
+        sdp.Append("a=sendrecv\r\n");
+        var sdpStr = sdp.ToString();
+
+        var resp200 = new SipMessage
+        {
+            IsRequest = false,
+            StatusCode = 200,
+            ReasonPhrase = "OK",
+            SipVersion = "SIP/2.0",
+            Body = sdpStr
+        };
+        resp200.SetHeader("Via", _incomingInvite.GetHeader("Via") ?? string.Empty);
+        resp200.SetHeader("From", _incomingInvite.GetHeader("From") ?? string.Empty);
+        resp200.SetHeader("To", $"{_incomingInvite.GetHeader("To")};tag={_currentFromTag}");
+        resp200.SetHeader("Call-ID", _currentCallId ?? string.Empty);
+        resp200.SetHeader("CSeq", _incomingInvite.GetHeader("CSeq") ?? "1 INVITE");
+        resp200.SetHeader("Contact", $"<sip:{localIp}:5060;transport=udp>;audio");
+        resp200.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE");
+        resp200.SetHeader("Content-Type", "application/sdp");
+        resp200.SetHeader("Content-Length", sdpStr.Length.ToString());
+
+        await _incomingReplySender(resp200).ConfigureAwait(false);
+
+        // Configure RTP session from remote SDP offer
+        SetRtpFromSdpAnswer(_remoteOfferSdp ?? string.Empty);
+
+        var codec = ExtractCodecFromSdp(_remoteOfferSdp ?? string.Empty);
+        var old = State;
+        State = CallState.Active;
+        if (ActiveCall != null)
+        {
+            ActiveCall = ActiveCall with
+            {
+                State = CallState.Active,
+                ConnectedAt = DateTime.UtcNow,
+                Codec = codec
+            };
+        }
+
+        NotifyCallStateChanged(old, CallState.Active, codec);
+        if (ActiveCall != null)
+        {
+            NotifyCallConnected(ActiveCall);
+            EventBus?.Publish("call.connected", "ImsCallManager", ActiveCall);
+        }
+        EventBus?.Publish(EventTopics.CallState, "ImsCallManager", "ACTIVE");
+        return ActiveCall!;
+    }
+
+    /// <summary>
+    /// Rejects an incoming ringing call with 603 Decline or 486 Busy Here.
+    /// </summary>
+    public async Task<CallInfo?> RejectAsync(int statusCode = 603, string reason = "Decline", CancellationToken ct = default)
+    {
+        if (State != CallState.Ringing || _incomingInvite == null)
+            return await HangupAsync().ConfigureAwait(false);
+
+        var resp = new SipMessage
+        {
+            IsRequest = false,
+            StatusCode = statusCode,
+            ReasonPhrase = reason,
+            SipVersion = "SIP/2.0"
+        };
+        resp.SetHeader("Via", _incomingInvite.GetHeader("Via") ?? string.Empty);
+        resp.SetHeader("From", _incomingInvite.GetHeader("From") ?? string.Empty);
+        resp.SetHeader("To", $"{_incomingInvite.GetHeader("To")};tag={_currentFromTag}");
+        resp.SetHeader("Call-ID", _currentCallId ?? string.Empty);
+        resp.SetHeader("CSeq", _incomingInvite.GetHeader("CSeq") ?? "1 INVITE");
+        resp.SetHeader("Content-Length", "0");
+
+        if (_incomingReplySender != null)
+        {
+            try { await _incomingReplySender(resp).ConfigureAwait(false); } catch { }
+        }
+
+        var old = State;
+        State = CallState.Ended;
+        var ended = ActiveCall != null ? ActiveCall with { State = CallState.Ended, EndedAt = DateTime.UtcNow } : null;
+        ActiveCall = null;
+        _incomingInvite = null;
+        _incomingReplySender = null;
+        State = CallState.Idle;
+        NotifyCallStateChanged(old, CallState.Ended);
+        NotifyCallEnded(ended, reason);
+        EventBus?.Publish("call.ended", "ImsCallManager", ended);
+        return ended;
+    }
+
+    /// <summary>
+    /// Handles incoming CANCEL request from remote party before call was answered.
+    /// </summary>
+    public async Task HandleIncomingCancelAsync(SipMessage cancel, Func<SipMessage, Task> replySender)
+    {
+        // 1. Reply 200 OK to CANCEL
+        var cancel200 = new SipMessage
+        {
+            IsRequest = false,
+            StatusCode = 200,
+            ReasonPhrase = "OK",
+            SipVersion = "SIP/2.0"
+        };
+        cancel200.SetHeader("Via", cancel.GetHeader("Via") ?? string.Empty);
+        cancel200.SetHeader("From", cancel.GetHeader("From") ?? string.Empty);
+        cancel200.SetHeader("To", cancel.GetHeader("To") ?? string.Empty);
+        cancel200.SetHeader("Call-ID", cancel.GetHeader("Call-ID") ?? string.Empty);
+        cancel200.SetHeader("CSeq", cancel.GetHeader("CSeq") ?? "1 CANCEL");
+        cancel200.SetHeader("Content-Length", "0");
+        await replySender(cancel200).ConfigureAwait(false);
+
+        // 2. Reply 487 Request Terminated to original INVITE
+        if (_incomingInvite != null)
+        {
+            var resp487 = new SipMessage
+            {
+                IsRequest = false,
+                StatusCode = 487,
+                ReasonPhrase = "Request Terminated",
+                SipVersion = "SIP/2.0"
+            };
+            resp487.SetHeader("Via", _incomingInvite.GetHeader("Via") ?? string.Empty);
+            resp487.SetHeader("From", _incomingInvite.GetHeader("From") ?? string.Empty);
+            resp487.SetHeader("To", $"{_incomingInvite.GetHeader("To")};tag={_currentFromTag}");
+            resp487.SetHeader("Call-ID", _incomingInvite.GetHeader("Call-ID") ?? string.Empty);
+            resp487.SetHeader("CSeq", _incomingInvite.GetHeader("CSeq") ?? "1 INVITE");
+            resp487.SetHeader("Content-Length", "0");
+            await replySender(resp487).ConfigureAwait(false);
+        }
+
+        var old = State;
+        State = CallState.Ended;
+        var ended = ActiveCall != null ? ActiveCall with { State = CallState.Ended, EndedAt = DateTime.UtcNow } : null;
+        ActiveCall = null;
+        _incomingInvite = null;
+        _incomingReplySender = null;
+        State = CallState.Idle;
+        NotifyCallStateChanged(old, CallState.Ended);
+        NotifyCallEnded(ended, "CANCEL");
+        EventBus?.Publish("call.ended", "ImsCallManager", ended);
+    }
+
+    /// <summary>
+    /// Handles incoming BYE request from remote party when they hang up.
+    /// </summary>
+    public async Task HandleIncomingByeAsync(SipMessage bye, Func<SipMessage, Task> replySender)
+    {
+        var bye200 = new SipMessage
+        {
+            IsRequest = false,
+            StatusCode = 200,
+            ReasonPhrase = "OK",
+            SipVersion = "SIP/2.0"
+        };
+        bye200.SetHeader("Via", bye.GetHeader("Via") ?? string.Empty);
+        bye200.SetHeader("From", bye.GetHeader("From") ?? string.Empty);
+        bye200.SetHeader("To", bye.GetHeader("To") ?? string.Empty);
+        bye200.SetHeader("Call-ID", bye.GetHeader("Call-ID") ?? string.Empty);
+        bye200.SetHeader("CSeq", bye.GetHeader("CSeq") ?? "1 BYE");
+        bye200.SetHeader("Content-Length", "0");
+        await replySender(bye200).ConfigureAwait(false);
+
+        // Terminate call and save recording asynchronously
+        if (ActiveCall?.WavRecordingPath != null)
+        {
+            var wavPath = ActiveCall.WavRecordingPath;
+            var rtpToSave = _rtp;
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    if (rtpToSave != null)
+                        rtpToSave.SaveAudioRecording(wavPath);
+                    else
+                        _audio.SaveToWavFile(wavPath);
+                }
+                catch { }
+            });
+        }
+
+        ReleaseRtpSession();
+
+        var old = State;
+        State = CallState.Ended;
+        var ended = ActiveCall != null ? ActiveCall with { State = CallState.Ended, EndedAt = DateTime.UtcNow } : null;
+        ActiveCall = null;
+        _incomingInvite = null;
+        _incomingReplySender = null;
+        State = CallState.Idle;
+        NotifyCallStateChanged(old, CallState.Ended);
+        NotifyCallEnded(ended, "BYE");
+        EventBus?.Publish("call.ended", "ImsCallManager", ended);
+    }
+
+    public async Task<CallInfo?> HangupAsync()
+    {
+        if (ActiveCall == null || State == CallState.Idle)
+            return null;
+
+        // If incoming and ringing, reject
+        if (State == CallState.Ringing && !ActiveCall.IsOutgoing)
+        {
+            return await RejectAsync().ConfigureAwait(false);
+        }
+
+        // Cancel if outgoing and ringing, BYE if active
+        if (State == CallState.Ringing && _callTransport != null && _currentCallId != null)
+        {
+            try
+            {
+                var cancel = BuildCancelRequest();
+                _ = _callTransport.SendAsync(cancel);
+            }
+            catch { }
+        }
+        else if (State == CallState.Active && _callTransport != null && _currentCallId != null)
+        {
+            try
+            {
+                var bye = BuildByeRequest();
+                _ = _callTransport.SendAsync(bye);
+            }
+            catch { /* hangup must succeed even if BYE send fails */ }
+        }
+
+        var old = State;
+        State = CallState.Ended;
+        var endedAt = DateTime.UtcNow;
+
+        if (ActiveCall?.WavRecordingPath != null)
+        {
+            var wavPath = ActiveCall.WavRecordingPath;
+            var rtpToSave = _rtp;
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    if (rtpToSave != null)
+                        rtpToSave.SaveAudioRecording(wavPath);
+                    else
+                        _audio.SaveToWavFile(wavPath);
+                }
+                catch { }
+            });
+        }
+
+        if (ActiveCall != null)
+        {
+            ActiveCall = ActiveCall with { State = CallState.Ended, EndedAt = endedAt };
+            NotifyCallEnded(ActiveCall, "HANGUP");
+            EventBus?.Publish("call.ended", "ImsCallManager", ActiveCall);
+        }
+        NotifyCallStateChanged(old, CallState.Ended);
+
+        ReleaseRtpSession();
+
+        var result = ActiveCall;
+        State       = CallState.Idle;
+        ActiveCall  = null;
+        _incomingInvite = null;
+        _incomingReplySender = null;
+        return result;
+    }
+
+    private void NotifyCallStateChanged(CallState oldState, CallState newState, string? codec = null)
+    {
+        try
+        {
+            CallStateChanged?.Invoke(this, new CallStateChangedEventArgs(
+                ActiveCall?.CallId ?? _currentCallId ?? "",
+                ActiveCall?.TargetNumber ?? _targetUri ?? "",
+                oldState,
+                newState,
+                codec ?? ActiveCall?.Codec,
+                ActiveCall?.WavRecordingPath,
+                ActiveCall?.IsOutgoing ?? true
+            ));
+        }
+        catch { }
+    }
+
+    private void NotifyIncomingCall(string callId, string callerNumber)
+    {
+        try
+        {
+            IncomingCall?.Invoke(this, new IncomingCallEventArgs(
+                callId,
+                callerNumber,
+                callerNumber,
+                isVoWifi: true,
+                DateTime.UtcNow
+            ));
+        }
+        catch { }
+    }
+
+    private void NotifyCallConnected(CallInfo call)
+    {
+        try
+        {
+            CallConnected?.Invoke(this, new CallConnectedEventArgs(
+                call.CallId,
+                call.TargetNumber,
+                call.Codec,
+                call.ConnectedAt ?? DateTime.UtcNow
+            ));
+        }
+        catch { }
+    }
+
+    private void NotifyCallEnded(CallInfo? call, string? reason = null)
+    {
+        if (call == null) return;
+        try
+        {
+            var dur = (call.EndedAt ?? DateTime.UtcNow) - (call.ConnectedAt ?? call.StartedAt);
+            CallEnded?.Invoke(this, new CallEndedEventArgs(
+                call.CallId,
+                call.TargetNumber,
+                dur,
+                reason,
+                call.WavRecordingPath,
+                call.EndedAt ?? DateTime.UtcNow
+            ));
+            AudioStreamStateChanged?.Invoke(this, new AudioStreamStateChangedEventArgs(false, false));
+        }
+        catch { }
+    }
+
+    private static string ExtractNumberFromUri(string uriOrHeader)
+    {
+        var match = Regex.Match(uriOrHeader, @"(?<=(sip:|tel:))(\+?\d+)");
+        if (match.Success) return match.Groups[2].Value;
+
+        var nameMatch = Regex.Match(uriOrHeader, @"""([^""]+)""");
+        if (nameMatch.Success) return nameMatch.Groups[1].Value;
+
+        return uriOrHeader;
+    }
+
+    public Task<bool> SendDtmfAsync(char digit)
+    {
+        if (State != CallState.Active)
+            return Task.FromResult(false);
+
+        try { DtmfReceived?.Invoke(this, new DtmfReceivedEventArgs(digit)); } catch { }
+        EventBus?.Publish("call.dtmf.sent", "ImsCallManager", new { Digit = digit });
+        return Task.FromResult(true);
+    }
+
+    public void Dispose()
+    {
+        ReleaseRtpSession();
+        _audio.Dispose();
+    }
+
+    private void ReleaseRtpSession()
+    {
+        var rtp = _rtp;
+        _rtp = null;
+
+        if (rtp != null)
+            _currentVoWifi?.UnregisterRtpSession(rtp);
+        _currentVoWifi = null;
+        rtp?.Dispose();
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// <summary>Sends a SIP ACK for a 2xx response (RFC 3261 §13.2.2.4).</summary>
+    private async Task SendAckAsync(
+        SipTransport transport,
+        SipMessage invite,
+        SipMessage resp200,
+        CancellationToken ct)
+    {
+        var ack = new SipMessage
+        {
+            IsRequest  = true,
+            Method     = "ACK",
+            RequestUri = _dialogTargetUri ?? invite.RequestUri,
+            SipVersion = "SIP/2.0"
+        };
+
+        // RFC 3261 §13.2.2.4: ACK for 2xx has its own Via branch
+        var branch = "z9hG4bK" + Guid.NewGuid().ToString("N")[..12];
+        var via    = invite.GetHeader("Via") ?? string.Empty;
+        var viaHost = Regex.Match(via, @"SIP/2\.0/UDP ([^;]+)").Groups[1].Value;
+        ack.SetHeader("Via",          $"SIP/2.0/UDP {viaHost};branch={branch}");
+        ack.SetHeader("Max-Forwards", "70");
+        ack.SetHeader("From",         _dialogFrom ?? invite.GetHeader("From") ?? string.Empty);
+        ack.SetHeader("To",           _dialogTo ?? resp200.GetHeader("To") ?? string.Empty);
+        ack.SetHeader("Call-ID",      invite.GetHeader("Call-ID") ?? string.Empty);
+        var inviteCseqNum = invite.GetHeader("CSeq")?.Split(' ')[0] ?? "1";
+        ack.SetHeader("CSeq",         $"{inviteCseqNum} ACK");
+        if (_dialogRoutes != null && _dialogRoutes.Count > 0)
+        {
+            ack.SetHeader("Route", string.Join(", ", _dialogRoutes));
+        }
+        ack.SetHeader("Content-Length", "0");
+
+        Console.WriteLine($"[ImsCallManager] ACK sent -> {ack.RequestUri} (Route: {ack.GetHeader("Route") ?? "None"})");
+        await transport.SendAsync(ack, ct).ConfigureAwait(false);
+    }
+
+    private static List<string> ParseAndReverseRecordRoute(List<string> rawHeaders)
+    {
+        var entries = new List<string>();
+        foreach (var headerVal in rawHeaders)
+        {
+            var matches = Regex.Matches(headerVal, @"<[^>]+>");
+            if (matches.Count > 0)
+            {
+                foreach (Match m in matches)
+                {
+                    entries.Add(m.Value.Trim());
+                }
+            }
+            else
+            {
+                var parts = headerVal.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                entries.AddRange(parts);
+            }
+        }
+        entries.Reverse();
+        return entries;
+    }
+
+    /// <summary>Builds a SIP BYE request for the current active call.</summary>
+    private SipMessage BuildByeRequest()
+    {
+        var bye = new SipMessage
+        {
+            IsRequest  = true,
+            Method     = "BYE",
+            RequestUri = _dialogTargetUri ?? _targetUri ?? ActiveCall?.TargetNumber ?? string.Empty,
+            SipVersion = "SIP/2.0"
+        };
+
+        var branch = "z9hG4bK" + Guid.NewGuid().ToString("N")[..12];
+        var localIp = _currentLocalIp ?? "127.0.0.1";
+
+        bye.SetHeader("Via",            $"SIP/2.0/UDP {localIp}:5060;branch={branch};rport");
+        bye.SetHeader("Max-Forwards",   "70");
+        bye.SetHeader("From",           _dialogFrom ?? $"<sip:ue@{localIp}>;tag={_currentFromTag}");
+        bye.SetHeader("To",             _dialogTo ?? $"<{ActiveCall?.TargetNumber}>");
+        bye.SetHeader("Call-ID",        _currentCallId ?? string.Empty);
+        bye.SetHeader("CSeq",           $"{_cseq++} BYE");
+        if (_dialogRoutes != null && _dialogRoutes.Count > 0)
+        {
+            bye.SetHeader("Route", string.Join(", ", _dialogRoutes));
+        }
+        bye.SetHeader("Content-Length", "0");
+        return bye;
+    }
+
+    /// <summary>Builds a SIP CANCEL request for a ringing call (RFC 3261 §9).</summary>
+    private SipMessage BuildCancelRequest()
+    {
+        var cancel = new SipMessage
+        {
+            IsRequest  = true,
+            Method     = "CANCEL",
+            RequestUri = _targetUri ?? ActiveCall?.TargetNumber ?? string.Empty,
+            SipVersion = "SIP/2.0"
+        };
+
+        var localIp = _currentLocalIp ?? "127.0.0.1";
+        var viaHeader = _lastInviteVia ?? $"SIP/2.0/UDP {localIp}:5060;branch={_lastInviteBranch ?? ("z9hG4bK" + Guid.NewGuid().ToString("N")[..12])}";
+
+        cancel.SetHeader("Via",            viaHeader);
+        cancel.SetHeader("Max-Forwards",   "70");
+        cancel.SetHeader("From",           _dialogFrom ?? $"<sip:ue@{localIp}>;tag={_currentFromTag}");
+        cancel.SetHeader("To",             _dialogTo ?? $"<{_targetUri ?? ActiveCall?.TargetNumber}>");
+        cancel.SetHeader("Call-ID",        _currentCallId ?? string.Empty);
+        cancel.SetHeader("CSeq",           $"{_lastInviteCSeq} CANCEL");
+        cancel.SetHeader("Content-Length", "0");
+        return cancel;
+    }
+
+    /// <summary>
+    /// Parses the remote SDP Answer and configures the RTP session endpoint.
+    /// </summary>
+    private void SetRtpFromSdpAnswer(string sdpBody)
+    {
+        if (_rtp == null) return;
+
+        var connectionMatch = Regex.Match(sdpBody, @"c=IN IP4 (\S+)");
+        var mediaMatch      = Regex.Match(sdpBody, @"m=audio (\d+)");
+        var ptMatch         = Regex.Match(sdpBody, @"a=rtpmap:(\d+) ([A-Za-z0-9\-]+)/");
+
+        if (connectionMatch.Success && mediaMatch.Success)
+        {
+            if (IPAddress.TryParse(connectionMatch.Groups[1].Value, out var remoteIp)
+                && int.TryParse(mediaMatch.Groups[1].Value, out var remotePort))
+            {
+                byte pt = 8;
+                if (ptMatch.Success && byte.TryParse(ptMatch.Groups[1].Value, out var parsedPt))
+                {
+                    pt = parsedPt;
+                }
+
+                if (_currentVoWifi?.EspTunnel != null && _currentVoWifi.Transport != null && IPAddress.TryParse(_currentVoWifi.AssignedIp, out var localIp))
+                {
+                    var esp = _currentVoWifi.EspTunnel;
+                    var tr = _currentVoWifi.Transport;
+                    _rtp.CustomSender = async rtpBytes =>
+                    {
+                        var inner = VoWifi.IpPacketUtils.BuildIpv4UdpPacket(localIp, remoteIp, (ushort)_rtp.LocalPort, (ushort)remotePort, rtpBytes);
+                        var sealedEsp = esp.Seal(inner, nextHeader: 4);
+                        await tr.SendEspAsync(sealedEsp, CancellationToken.None).ConfigureAwait(false);
+                    };
+                }
+
+                _rtp.SetRemoteEndpoint(remoteIp, remotePort, pt);
+                try
+                {
+                    AudioStreamStateChanged?.Invoke(this, new AudioStreamStateChangedEventArgs(true, true, sampleRate: 8000, codec: pt == 8 ? "PCMA" : "PCMU"));
+                }
+                catch { }
+            }
+        }
+    }
+
+    /// <summary>Returns a human-readable codec string from the SDP answer.</summary>
+    private static string ExtractCodecFromSdp(string sdpBody)
+    {
+        var match = Regex.Match(sdpBody, @"a=rtpmap:(\d+) ([A-Za-z0-9\-]+)/(\d+)");
+        if (match.Success)
+            return $"{match.Groups[2].Value}/{match.Groups[3].Value}";
+        return "PCMA/8000";
+    }
+}

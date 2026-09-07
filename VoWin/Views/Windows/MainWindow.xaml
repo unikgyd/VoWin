@@ -1,0 +1,253 @@
+<ui:FluentWindow
+  x:Class="VoWin.Views.Windows.MainWindow"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:local="clr-namespace:VoWin.Views.Windows"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+  Title="{Binding ViewModel.ApplicationTitle, Mode=OneWay}"
+  Icon="pack://application:,,,/Assets/vowin.png"
+  Width="1200"
+  Height="780"
+  d:DataContext="{d:DesignInstance local:MainWindow,
+                                     IsDesignTimeCreatable=True}"
+  d:DesignHeight="450"
+  d:DesignWidth="800"
+  ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
+  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  ExtendsContentIntoTitleBar="True"
+  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  WindowBackdropType="Mica"
+  WindowCornerPreference="Round"
+  WindowStartupLocation="CenterScreen"
+  UseLayoutRounding="True"
+  SnapsToDevicePixels="True"
+  TextOptions.TextFormattingMode="Display"
+  TextOptions.TextRenderingMode="ClearType"
+  RenderOptions.BitmapScalingMode="HighQuality"
+  RenderOptions.ClearTypeHint="Enabled"
+  mc:Ignorable="d"
+>
+  <ui:FluentWindow.Resources>
+    <!-- 自定义 TitleBar 样式：移除 PART_Icon 的写死 Height="16"，让 1:1 正方形图标能够按原始比例完整展示，不被上下裁切遮挡 -->
+    <Style TargetType="{x:Type ui:TitleBar}" BasedOn="{StaticResource {x:Type ui:TitleBar}}">
+      <Setter Property="Padding" Value="12,0,8,0" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="{x:Type ui:TitleBar}">
+            <Grid
+              x:Name="PART_MainGrid"
+              HorizontalAlignment="{TemplateBinding HorizontalAlignment}"
+              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+              Background="{TemplateBinding Background}">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
+
+              <Grid
+                x:Name="TitleGrid"
+                Grid.Column="0"
+                Margin="{TemplateBinding Padding}"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <!-- 应用图标：自适应高度与宽度，支持 1:1 完整显示不遮挡 -->
+                <ContentPresenter
+                  x:Name="PART_Icon"
+                  Grid.Column="0"
+                  VerticalAlignment="Center"
+                  HorizontalAlignment="Center"
+                  AutomationProperties.AutomationId="TitleBarIcon"
+                  Content="{TemplateBinding Icon}"
+                  Focusable="False"
+                  RenderOptions.BitmapScalingMode="HighQuality" />
+              </Grid>
+
+              <Grid Grid.Column="1">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <!-- 标题文本 -->
+                <ContentPresenter
+                  Grid.Column="0"
+                  HorizontalAlignment="Left"
+                  VerticalAlignment="Center"
+                  Content="{TemplateBinding Header}" />
+
+                <!-- 居中内容 -->
+                <ContentPresenter
+                  Grid.Column="1"
+                  HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                  VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                  Content="{TemplateBinding CenterContent}" />
+
+                <!-- 尾部附加内容 -->
+                <ContentPresenter
+                  Grid.Column="2"
+                  HorizontalAlignment="Right"
+                  VerticalAlignment="Center"
+                  Content="{TemplateBinding TrailingContent}" />
+
+                <!-- 窗口控制按钮：帮助、最小化、最大化/还原、关闭 -->
+                <Grid
+                  Grid.Column="3"
+                  HorizontalAlignment="Right"
+                  VerticalAlignment="Top">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                  </Grid.ColumnDefinitions>
+
+                  <ui:TitleBarButton
+                    x:Name="PART_HelpButton"
+                    Grid.Column="0"
+                    AutomationProperties.AutomationId="TitleBarHelpButton"
+                    ButtonType="Help" />
+
+                  <ui:TitleBarButton
+                    x:Name="PART_MinimizeButton"
+                    Grid.Column="1"
+                    AutomationProperties.AutomationId="TitleBarMinimizeButton"
+                    ButtonType="Minimize" />
+
+                  <ui:TitleBarButton
+                    x:Name="PART_MaximizeButton"
+                    Grid.Column="2"
+                    AutomationProperties.AutomationId="TitleBarMaximizeButton"
+                    ButtonType="Maximize"
+                    IsHitTestVisible="True" />
+
+                  <ui:TitleBarButton
+                    x:Name="PART_CloseButton"
+                    Grid.Column="4"
+                    AutomationProperties.AutomationId="TitleBarCloseButton"
+                    ButtonType="Close"
+                    MouseOverBackground="{DynamicResource PaletteRedBrush}"
+                    MouseOverButtonsForeground="White" />
+                </Grid>
+              </Grid>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <MultiTrigger>
+                <MultiTrigger.Conditions>
+                  <Condition Property="Icon" Value="{x:Null}" />
+                  <Condition Property="Title" Value="{x:Null}" />
+                </MultiTrigger.Conditions>
+                <Setter TargetName="TitleGrid" Property="Visibility" Value="Collapsed" />
+              </MultiTrigger>
+              <Trigger Property="ApplicationTheme" Value="Dark">
+                <Setter Property="ButtonsBackground">
+                  <Setter.Value>
+                    <SolidColorBrush Color="#17FFFFFF" />
+                  </Setter.Value>
+                </Setter>
+              </Trigger>
+              <Trigger Property="Icon" Value="{x:Null}">
+                <Setter TargetName="PART_Icon" Property="Visibility" Value="Collapsed" />
+                <Setter TargetName="PART_Icon" Property="Margin" Value="0" />
+              </Trigger>
+              <MultiTrigger>
+                <MultiTrigger.Conditions>
+                  <Condition Property="ShowMaximize" Value="True" />
+                  <Condition Property="IsMaximized" Value="True" />
+                </MultiTrigger.Conditions>
+                <Setter TargetName="PART_MaximizeButton" Property="ButtonType" Value="Restore" />
+              </MultiTrigger>
+              <Trigger Property="ShowHelp" Value="False">
+                <Setter TargetName="PART_HelpButton" Property="Visibility" Value="Collapsed" />
+              </Trigger>
+              <Trigger Property="ShowMinimize" Value="False">
+                <Setter TargetName="PART_MinimizeButton" Property="Visibility" Value="Collapsed" />
+              </Trigger>
+              <Trigger Property="ShowMaximize" Value="False">
+                <Setter TargetName="PART_MaximizeButton" Property="Visibility" Value="Collapsed" />
+              </Trigger>
+              <Trigger Property="ShowClose" Value="False">
+                <Setter TargetName="PART_CloseButton" Property="Visibility" Value="Collapsed" />
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </ui:FluentWindow.Resources>
+
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+    <ui:NavigationView
+      x:Name="RootNavigation"
+      Grid.Row="1"
+      ScrollViewer.VerticalScrollBarVisibility="Disabled"
+      ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+      FooterMenuItemsSource="{Binding ViewModel.FooterMenuItems, Mode=OneWay}"
+      FrameMargin="0"
+      IsBackButtonVisible="Collapsed"
+      IsPaneToggleVisible="True"
+      MenuItemsSource="{Binding ViewModel.MenuItems, Mode=OneWay}"
+      PaneDisplayMode="LeftFluent"
+    >
+      <ui:NavigationView.ContentOverlay>
+        <Grid>
+          <ui:SnackbarPresenter x:Name="SnackbarPresenter" />
+        </Grid>
+      </ui:NavigationView.ContentOverlay>
+    </ui:NavigationView>
+    <ContentPresenter x:Name="RootContentDialog" Grid.Row="0" Grid.RowSpan="2" />
+    <ui:TitleBar
+      x:Name="TitleBar"
+      Title="{Binding ViewModel.ApplicationTitle}"
+      Grid.Row="0"
+      Height="38"
+      CloseWindowByDoubleClickOnIcon="True"
+    >
+      <ui:TitleBar.Icon>
+        <ui:ImageIcon
+          Source="pack://application:,,,/Assets/vowin.png"
+          Width="24"
+          Height="24"
+          VerticalAlignment="Center"
+          HorizontalAlignment="Center"
+          RenderOptions.BitmapScalingMode="HighQuality"
+        />
+      </ui:TitleBar.Icon>
+    </ui:TitleBar>
+    <Border Grid.Row="0" Grid.RowSpan="2" Panel.ZIndex="100"
+            Background="#D9202020" IsHitTestVisible="True">
+      <Border.Style>
+        <Style TargetType="Border">
+          <Setter Property="Visibility" Value="Collapsed" />
+          <Style.Triggers>
+            <DataTrigger Binding="{Binding KernelService.IsInitialScanRunning}" Value="True">
+              <Setter Property="Visibility" Value="Visible" />
+            </DataTrigger>
+          </Style.Triggers>
+        </Style>
+      </Border.Style>
+      <Border Width="360" Padding="32" CornerRadius="12"
+              HorizontalAlignment="Center" VerticalAlignment="Center"
+              Background="{DynamicResource CardBackgroundFillColorDefaultBrush}">
+        <StackPanel HorizontalAlignment="Center">
+          <ui:ProgressRing Width="52" Height="52" IsIndeterminate="True" Margin="0,0,0,20" />
+          <TextBlock Text="正在发现蜂窝设备" HorizontalAlignment="Center" FontSize="18" FontWeight="SemiBold" />
+          <TextBlock Text="{Binding KernelService.InitialScanStatus}" HorizontalAlignment="Center" Margin="0,10,0,0"
+                     Foreground="{DynamicResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" TextAlignment="Center" />
+        </StackPanel>
+      </Border>
+    </Border>
+  </Grid>
+</ui:FluentWindow>

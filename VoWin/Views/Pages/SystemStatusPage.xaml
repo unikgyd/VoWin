@@ -1,0 +1,885 @@
+<Page
+  x:Class="VoWin.Views.Pages.SystemStatusPage"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:controls="clr-namespace:VoWin.Views.Controls"
+  xmlns:helpers="clr-namespace:VoWin.Helpers"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+  xmlns:vm="clr-namespace:VoWin.ViewModels.Pages"
+  Title="系统状态"
+  d:DataContext="{d:DesignInstance vm:SystemStatusViewModel, IsDesignTimeCreatable=False}"
+  d:DesignHeight="750"
+  d:DesignWidth="1200"
+  ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
+  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  ScrollViewer.VerticalScrollBarVisibility="Disabled"
+  ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+  mc:Ignorable="d"
+>
+  <Page.Resources>
+    <helpers:BoolToVisibilityConverter x:Key="BoolToVis" />
+    <helpers:BoolToVisibilityConverter x:Key="InvertBoolToVis" Invert="True" />
+    <helpers:SignalBarsToSymbolConverter x:Key="SignalBarsSymbol" />
+
+    <!-- Style for Filter Segment Buttons -->
+    <Style x:Key="LogFilterButtonStyle" TargetType="ui:Button" BasedOn="{StaticResource {x:Type ui:Button}}">
+      <Setter Property="Padding" Value="7,3" />
+      <Setter Property="Margin" Value="0,0,4,0" />
+      <Setter Property="FontSize" Value="11" />
+      <Setter Property="FontWeight" Value="Medium" />
+      <Setter Property="Appearance" Value="Transparent" />
+    </Style>
+  </Page.Resources>
+
+  <Grid Margin="20,12,20,14">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+
+    <!-- ================= TOP HEADER (Page Title + Equipment Selector + Mutually Exclusive Single Action) ================= -->
+    <Grid Grid.Row="0" Margin="0,0,0,14">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+
+      <!-- Page Title & Slot Switcher -->
+      <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+        <TextBlock
+          FontSize="22"
+          FontWeight="SemiBold"
+          VerticalAlignment="Center"
+          Text="系统状态"
+          Margin="0,0,14,0"
+        />
+
+        <!-- Current Slot Selector Badge -->
+        <Border
+          Padding="8,3"
+          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          BorderThickness="1"
+          CornerRadius="8"
+          VerticalAlignment="Center"
+        >
+          <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+            <ui:SymbolIcon Symbol="Sim24" FontSize="14" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,6,0" VerticalAlignment="Center" />
+            <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="通信设备: " VerticalAlignment="Center" />
+            <ComboBox
+              ItemsSource="{Binding Slots}"
+              SelectedItem="{Binding SelectedSlot, Mode=TwoWay}"
+              DisplayMemberPath="Name"
+              MinWidth="130"
+              Height="26"
+              Padding="6,1"
+              BorderThickness="0"
+              Background="Transparent"
+              VerticalAlignment="Center"
+            />
+          </StackPanel>
+        </Border>
+      </StackPanel>
+
+      <!-- Header Actions: Mutually Exclusive Single Action + Refresh -->
+      <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+        <ui:ProgressRing
+          Width="16"
+          Height="16"
+          Margin="0,0,10,0"
+          IsIndeterminate="True"
+          Visibility="{Binding IsBusy, Converter={StaticResource BoolToVis}}"
+        />
+
+        <!-- Action Button when Connected (Danger style: 断开连接) -->
+        <ui:Button
+          Margin="0,0,8,0"
+          Appearance="Danger"
+          Command="{Binding ExecutePrimaryActionCommand}"
+          Icon="{ui:SymbolIcon Symbol=Stop24}"
+          Content="断开连接"
+          Visibility="{Binding IsVoWifiRunning, Converter={StaticResource BoolToVis}}"
+        />
+
+        <!-- Action Button when Not Connected (Primary style: 连接 VoWiFi / 取消连接 / 重新连接) -->
+        <ui:Button
+          Margin="0,0,8,0"
+          Appearance="Primary"
+          Command="{Binding ExecutePrimaryActionCommand}"
+          Icon="{ui:SymbolIcon Symbol=Play24}"
+          Content="{Binding PrimaryActionButtonText, Mode=OneWay}"
+          Visibility="{Binding IsVoWifiRunning, Converter={StaticResource InvertBoolToVis}}"
+        />
+
+        <!-- Refresh Telemetry Button -->
+        <ui:Button
+          Appearance="Secondary"
+          Command="{Binding RefreshMetricsCommand}"
+          Icon="{ui:SymbolIcon Symbol=ArrowSync24}"
+          Content="刷新状态"
+        />
+      </StackPanel>
+    </Grid>
+
+    <!-- ================= MAIN CONTENT (Left 70%~75%, Right Collapsible Log 25%~30%) ================= -->
+    <Grid Grid.Row="1">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" MinWidth="480" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+
+      <!-- ================= LEFT COLUMN: Status Telemetry & Quality Dashboard ================= -->
+      <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,14,0">
+        <StackPanel>
+
+          <!-- ================= CARD 1: 总状态卡 (Page-level Master Status) ================= -->
+          <Border
+            Margin="0,0,0,14"
+            Padding="18,16"
+            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            BorderThickness="1"
+            CornerRadius="12"
+          >
+            <StackPanel>
+
+              <!-- Top Row: Ring + Large Status Title + SubSummary -->
+              <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <!-- 1. Four-segment Ring with Semantic Colors & Hover Motion -->
+                <Border
+                  Grid.Column="0"
+                  Width="92"
+                  Height="92"
+                  Margin="2,0,36,0"
+                  VerticalAlignment="Center"
+                  ClipToBounds="False"
+                >
+                  <controls:VoWifiStageRing
+                    Stage1Brush="{Binding Stage1Brush, Mode=OneWay}"
+                    Stage2Brush="{Binding Stage2Brush, Mode=OneWay}"
+                    Stage3Brush="{Binding Stage3Brush, Mode=OneWay}"
+                    Stage4Brush="{Binding Stage4Brush, Mode=OneWay}"
+                    CenterDotBrush="{Binding CenterDotBrush, Mode=OneWay}"
+                    IsBreathing="{Binding IsRingBreathing, Mode=OneWay}"
+                    Stage1Detail="{Binding Stage1Detail, Mode=OneWay}"
+                    Stage2Detail="{Binding Stage2Detail, Mode=OneWay}"
+                    Stage3Detail="{Binding Stage3Detail, Mode=OneWay}"
+                    Stage4Detail="{Binding Stage4Detail, Mode=OneWay}"
+                  />
+                </Border>
+
+                <!-- 2. Headline & SubSummary -->
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                  <StackPanel Orientation="Horizontal" Margin="0,0,0,5">
+                    <ui:SymbolIcon
+                      Symbol="{Binding MainStatusSymbol, Mode=OneWay}"
+                      Foreground="{Binding MainStatusBrush, Mode=OneWay}"
+                      FontSize="20"
+                      Margin="0,0,8,0"
+                      VerticalAlignment="Center"
+                    />
+                    <TextBlock
+                      FontSize="19"
+                      FontWeight="SemiBold"
+                      Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                      Text="{Binding MainStatusTitle, Mode=OneWay}"
+                      VerticalAlignment="Center"
+                    />
+                    <Border
+                      Margin="10,0,0,0"
+                      Padding="8,2"
+                      CornerRadius="6"
+                      Background="{Binding MainStatusBg, Mode=OneWay}"
+                      VerticalAlignment="Center"
+                    >
+                      <TextBlock
+                        FontSize="11"
+                        FontWeight="SemiBold"
+                        Foreground="{Binding MainStatusBrush, Mode=OneWay}"
+                        Text="{Binding StagesProgressText, Mode=OneWay}"
+                      />
+                    </Border>
+                  </StackPanel>
+
+                  <!-- Link Summary line (e.g. 51566 PH · COM6 · LTE/NR · IMS Registered) -->
+                  <TextBlock
+                    FontSize="12"
+                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                    Text="{Binding MainStatusSubText, Mode=OneWay}"
+                    Margin="0,0,0,6"
+                  />
+
+                  <!-- Endpoints: Virtual IP & P-CSCF -->
+                  <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}">
+                    <Run Text="虚拟内网 IP: " />
+                    <Run Text="{Binding AssignedIp, Mode=OneWay}" FontFamily="Consolas" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                    <Run Text="   ·   P-CSCF 端点: " />
+                    <Run Text="{Binding PcscfIp, Mode=OneWay}" FontFamily="Consolas" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                  </TextBlock>
+                </StackPanel>
+              </Grid>
+
+              <!-- Four Stage Checklist Pills (Unified Semantic Colors: Green=Success, Blue=Running, Gray=Waiting, Red=Error) -->
+              <Grid Margin="0,4,0,0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <!-- Stage 1 Pill: ePDG DNS -->
+                <Border Grid.Column="0" Margin="0,0,4,0" Padding="8,6" Background="{Binding Stage1Bg, Mode=OneWay}" CornerRadius="8" ToolTip="{Binding Stage1Detail, Mode=OneWay}">
+                  <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                    <ui:SymbolIcon Symbol="{Binding Stage1Symbol, Mode=OneWay}" Foreground="{Binding Stage1Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage1Brush, Mode=OneWay}" Text="1. ePDG DNS" VerticalAlignment="Center" />
+                  </StackPanel>
+                </Border>
+
+                <!-- Stage 2 Pill: IKEv2 / EAP-AKA -->
+                <Border Grid.Column="1" Margin="3,0,3,0" Padding="8,6" Background="{Binding Stage2Bg, Mode=OneWay}" CornerRadius="8" ToolTip="{Binding Stage2Detail, Mode=OneWay}">
+                  <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                    <ui:SymbolIcon Symbol="{Binding Stage2Symbol, Mode=OneWay}" Foreground="{Binding Stage2Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage2Brush, Mode=OneWay}" Text="2. IKEv2 鉴权" VerticalAlignment="Center" />
+                  </StackPanel>
+                </Border>
+
+                <!-- Stage 3 Pill: IPsec Tunnel -->
+                <Border Grid.Column="2" Margin="3,0,3,0" Padding="8,6" Background="{Binding Stage3Bg, Mode=OneWay}" CornerRadius="8" ToolTip="{Binding Stage3Detail, Mode=OneWay}">
+                  <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                    <ui:SymbolIcon Symbol="{Binding Stage3Symbol, Mode=OneWay}" Foreground="{Binding Stage3Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage3Brush, Mode=OneWay}" Text="3. IPsec 隧道" VerticalAlignment="Center" />
+                  </StackPanel>
+                </Border>
+
+                <!-- Stage 4 Pill: IMS 200 OK -->
+                <Border Grid.Column="3" Margin="4,0,0,0" Padding="8,6" Background="{Binding Stage4Bg, Mode=OneWay}" CornerRadius="8" ToolTip="{Binding Stage4Detail, Mode=OneWay}">
+                  <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                    <ui:SymbolIcon Symbol="{Binding Stage4Symbol, Mode=OneWay}" Foreground="{Binding Stage4Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage4Brush, Mode=OneWay}" Text="4. IMS 200 OK" VerticalAlignment="Center" />
+                  </StackPanel>
+                </Border>
+              </Grid>
+
+              <!-- Error Banner (Shown when HasError == true, provides clear recovery actions) -->
+              <Border
+                Margin="0,10,0,0"
+                Padding="12,10"
+                Background="#18DC2626"
+                BorderBrush="#40DC2626"
+                BorderThickness="1"
+                CornerRadius="8"
+                Visibility="{Binding HasError, Converter={StaticResource BoolToVis}}"
+              >
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                  </Grid.ColumnDefinitions>
+
+                  <ui:SymbolIcon Grid.Column="0" Symbol="DismissCircle24" Foreground="#DC2626" FontSize="18" Margin="0,0,10,0" VerticalAlignment="Center" />
+
+                  <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                    <TextBlock FontSize="13" FontWeight="SemiBold" Foreground="#DC2626" Text="{Binding ErrorTitle, Mode=OneWay}" />
+                    <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding ErrorDetail, Mode=OneWay}" Margin="0,2,0,0" TextWrapping="Wrap" />
+                  </StackPanel>
+
+                  <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
+                    <ui:Button
+                      Appearance="Primary"
+                      Padding="10,4"
+                      Command="{Binding ExecutePrimaryActionCommand}"
+                      Content="重新连接"
+                    />
+                  </StackPanel>
+                </Grid>
+              </Border>
+
+            </StackPanel>
+          </Border>
+
+          <!-- ================= CARD 2: 蜂窝网络 (Cellular Network & SIM Card) ================= -->
+          <Border
+            Margin="0,0,0,14"
+            Padding="18,16"
+            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            BorderThickness="1"
+            CornerRadius="12"
+          >
+            <StackPanel>
+              <!-- Module Header -->
+              <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                  <ui:SymbolIcon Symbol="CellularData124" FontSize="16" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,8,0" />
+                  <TextBlock FontSize="15" FontWeight="SemiBold" Text="蜂窝网络与 SIM" />
+                </StackPanel>
+
+                <!-- Header Badges -->
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                  <!-- Retail card-profile country; a hosted IMSI may differ. -->
+                  <Border Margin="0,0,6,0" Padding="8,3" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="6">
+                    <TextBlock FontSize="11" FontWeight="SemiBold" ToolTip="仅用于展示根据 ICCID / 卡配置识别的卡品牌，不会改写 IMSI、PLMN 或网络鉴权参数。">
+                      <Run Text="SIM 卡：" />
+                      <Run Text="{Binding CardProfileDisplay, Mode=OneWay}" />
+                    </TextBlock>
+                  </Border>
+                  <!-- Roaming Badge -->
+                  <Border Margin="0,0,6,0" Padding="8,3" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="6">
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Text="{Binding RoamingText, Mode=OneWay}" />
+                  </Border>
+                  <!-- SIM Ready Badge -->
+                  <Border Padding="8,3" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="6">
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Text="{Binding SimCardStatusText, Mode=OneWay}" />
+                  </Border>
+                </StackPanel>
+              </Grid>
+
+              <!-- 4 Core Metrics (Clean Typography, Natural Whitespace, High SNR) -->
+              <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <!-- 1. RSSI -->
+                <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="信号强度 (RSSI)" />
+                  <TextBlock FontSize="16" FontWeight="Bold" Margin="0,3,0,0" Text="{Binding SignalDbmText, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0">
+                    <Run Text="{Binding SignalEvaluation, Mode=OneWay}" />
+                    <Run Text=" · " />
+                    <Run Text="{Binding SignalBars, Mode=OneWay}" /><Run Text="/5格" />
+                  </TextBlock>
+                </StackPanel>
+
+                <!-- 2. RAT -->
+                <StackPanel Grid.Column="1" Margin="4,0,8,0">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="接入制式 (RAT)" />
+                  <TextBlock FontSize="16" FontWeight="Bold" Margin="0,3,0,0" Text="{Binding Rat, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="4G / 5G 蜂窝数据" />
+                </StackPanel>
+
+                <!-- 3. Retail carrier / card profile -->
+                <StackPanel Grid.Column="2" Margin="4,0,8,0">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="卡配置运营商（ICCID）" />
+                  <TextBlock FontSize="15" FontWeight="Bold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding OperatorName, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis">
+                    <Run Text="IMSI 认证归属：" /><Run Text="{Binding ImsiHomeDisplay, Mode=OneWay}" />
+                  </TextBlock>
+                </StackPanel>
+
+                <!-- 4. Modem Port -->
+                <StackPanel Grid.Column="3" Margin="4,0,0,0">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="通信模组与端口" />
+                  <TextBlock FontSize="15" FontFamily="Consolas" FontWeight="Bold" Margin="0,3,0,0" Text="{Binding PortName, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="{Binding SlotStateText, Mode=OneWay}" />
+                </StackPanel>
+              </Grid>
+
+              <!-- Toggle Button for Collapsible Device Details -->
+              <Grid Margin="0,4,0,0">
+                <ui:Button
+                  HorizontalAlignment="Left"
+                  Appearance="Transparent"
+                  Padding="4,2"
+                  Command="{Binding ToggleDeviceDetailsCommand}"
+                  Content="{Binding DeviceDetailsToggleText, Mode=OneWay}"
+                  Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                  FontSize="12"
+                />
+              </Grid>
+
+              <!-- Collapsible Device Details Matrix (6 Low-Frequency Diagnostic Parameters) -->
+              <Border
+                Margin="0,8,0,0"
+                Padding="12,10"
+                Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                CornerRadius="8"
+                Visibility="{Binding IsDeviceDetailsExpanded, Converter={StaticResource BoolToVis}}"
+              >
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                  </Grid.ColumnDefinitions>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                  </Grid.RowDefinitions>
+
+                  <!-- Row 0: ICCID, IMSI, IMEI -->
+                  <StackPanel Grid.Row="0" Grid.Column="0" Margin="0,0,8,8">
+                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="SIM 识别码 (ICCID) · 卡配置归属" />
+                    <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding Iccid, Mode=OneWay}" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding CardProfileDisplay, Mode=OneWay}" />
+                  </StackPanel>
+
+                  <StackPanel Grid.Row="0" Grid.Column="1" Margin="4,0,8,8">
+                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="国际移动用户识别码 (IMSI) · 认证归属" />
+                    <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding Imsi, Mode=OneWay}" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding ImsiHomeDisplay, Mode=OneWay}" />
+                  </StackPanel>
+
+                  <StackPanel Grid.Row="0" Grid.Column="2" Margin="4,0,0,8">
+                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="设备识别码 (IMEI)" />
+                    <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding Imei, Mode=OneWay}" />
+                  </StackPanel>
+
+                  <!-- Row 1: Cell ID, Modem HW, Firmware -->
+                  <StackPanel Grid.Row="1" Grid.Column="0" Margin="0,0,8,0">
+                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="服务小区 (Cell ID)" />
+                    <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding CellIdText, Mode=OneWay}" />
+                  </StackPanel>
+
+                  <StackPanel Grid.Row="1" Grid.Column="1" Margin="4,0,8,0">
+                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="模组型号与波特率" />
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding BaudRateText, Mode=OneWay}" />
+                  </StackPanel>
+
+                  <StackPanel Grid.Row="1" Grid.Column="2" Margin="4,0,0,0">
+                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="基带固件版本" />
+                    <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding ModemFirmware, Mode=OneWay}" />
+                  </StackPanel>
+                </Grid>
+              </Border>
+
+            </StackPanel>
+          </Border>
+
+          <!-- ================= CARD 3: IMS / SIP 网络质量与实时保活 ================= -->
+          <Border
+            Padding="18,16"
+            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            BorderThickness="1"
+            CornerRadius="12"
+          >
+            <StackPanel>
+              <!-- Card Header -->
+              <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                  <ui:SymbolIcon Symbol="Pulse24" FontSize="16" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,8,0" />
+                  <TextBlock FontSize="15" FontWeight="SemiBold" Text="IMS / SIP 网络质量与保活" />
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                  <!-- Probe Now Manual Trigger -->
+                  <ui:Button
+                    Margin="0,0,8,0"
+                    Padding="10,3"
+                    Appearance="Secondary"
+                    Command="{Binding SendSipProbeCommand}"
+                    IsEnabled="{Binding Stage3Success, Mode=OneWay}"
+                    ToolTip="立即发送 SIP OPTIONS 探测包并测试实时往返延迟"
+                  >
+                    <StackPanel Orientation="Horizontal">
+                      <ui:SymbolIcon Symbol="ArrowSync16" FontSize="12" Margin="0,0,4,0" VerticalAlignment="Center" />
+                      <TextBlock FontSize="11" FontWeight="SemiBold" Text="立即探测" VerticalAlignment="Center" />
+                    </StackPanel>
+                  </ui:Button>
+
+                  <Border Margin="0,0,6,0" Padding="8,3" Background="{Binding Stage4Bg, Mode=OneWay}" CornerRadius="6">
+                    <TextBlock FontSize="11" FontWeight="Bold" Foreground="{Binding Stage4Brush, Mode=OneWay}" Text="{Binding SipProbeStatus, Mode=OneWay}" />
+                  </Border>
+                  <Border Padding="8,3" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="6">
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="NAT-T RFC 3948" />
+                  </Border>
+                </StackPanel>
+              </Grid>
+
+              <!-- 4 Real-time Quality & Probe Metrics -->
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="1.4*" />
+                </Grid.ColumnDefinitions>
+
+                <!-- 1. RTT Latency -->
+                <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="往返延迟 (RTT)" />
+                  <TextBlock FontSize="16" FontWeight="Bold" Margin="0,3,0,0" Foreground="{Binding Stage4Brush, Mode=OneWay}" Text="{Binding SipProbeRtt, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastProbeStatusText, Mode=OneWay}" />
+                </StackPanel>
+
+                <!-- 2. Probe Stats (Success / Failed / Loss Rate) -->
+                <StackPanel Grid.Column="1" Margin="4,0,8,0">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="探针统计 (成功 / 失败)" />
+                  <TextBlock FontSize="15" FontWeight="Bold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SipProbeCountText, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SipProbeLossDetailText, Mode=OneWay}" />
+                </StackPanel>
+
+                <!-- 3. Last Probe Time & Interval -->
+                <StackPanel Grid.Column="2" Margin="4,0,8,0">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="上次探测保活" />
+                  <TextBlock FontSize="15" FontWeight="SemiBold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastHeartbeatRelativeText, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastHeartbeatExactText, Mode=OneWay}" />
+                </StackPanel>
+
+                <!-- 4. NAT Binding -->
+                <StackPanel Grid.Column="3" Margin="4,0,0,0">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="NAT 映射与端点" />
+                  <TextBlock FontSize="12" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding NatBindingText, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="RFC 3948 UDP 5060 (20s窗口)" />
+                </StackPanel>
+              </Grid>
+
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </ScrollViewer>
+
+      <!-- ================= RIGHT COLUMN: Collapsible Structured Real-Time Event Log ================= -->
+      <!-- 1. Expanded Panel (Default ~360px) -->
+      <Border
+        x:Name="ExpandedTerminalPanel"
+        Grid.Column="1"
+        Width="370"
+        Padding="14,12"
+        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+        BorderThickness="1"
+        CornerRadius="12"
+        PreviewMouseWheel="OnTerminalPreviewMouseWheel"
+        Visibility="{Binding IsLogPanelExpanded, Converter={StaticResource BoolToVis}}"
+      >
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+          </Grid.RowDefinitions>
+
+          <!-- Terminal Header: Title + Fold button + Counter + Action icons -->
+          <Grid Grid.Row="0" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Title & Count -->
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+              <ui:SymbolIcon Symbol="Code24" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,6,0" FontSize="16" />
+              <TextBlock FontSize="14" FontWeight="SemiBold" Text="实时日志" VerticalAlignment="Center" />
+              <Border Margin="6,0,0,0" Padding="6,2" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="4">
+                <TextBlock FontSize="10" FontWeight="Medium" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding FilteredLogsCountText, Mode=OneWay}" />
+              </Border>
+            </StackPanel>
+
+            <!-- Actions: AutoScroll toggle, Copy, Clear, Collapse -->
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+              <!-- AutoScroll status toggle -->
+              <ui:Button
+                Appearance="Transparent"
+                Padding="6,2"
+                Margin="0,0,4,0"
+                Command="{Binding ToggleAutoScrollCommand}"
+                ToolTip="切换自动滚动状态 (跟随最新 / 暂停跟随)"
+              >
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                  <ui:SymbolIcon Symbol="{Binding AutoScrollStatusIcon, Mode=OneWay}" FontSize="12" Margin="0,0,3,0" />
+                  <TextBlock FontSize="11" Text="{Binding AutoScrollStatusText, Mode=OneWay}" />
+                </StackPanel>
+              </ui:Button>
+
+              <!-- Copy button -->
+              <ui:Button
+                Appearance="Transparent"
+                Padding="6,2"
+                Margin="0,0,2,0"
+                Command="{Binding CopyLogsCommand}"
+                Icon="{ui:SymbolIcon Symbol=Copy24}"
+                ToolTip="复制全部日志"
+              />
+
+              <!-- Clear button -->
+              <ui:Button
+                Appearance="Transparent"
+                Padding="6,2"
+                Margin="0,0,2,0"
+                Command="{Binding ClearLogsCommand}"
+                Icon="{ui:SymbolIcon Symbol=Delete24}"
+                ToolTip="清空实时日志"
+              />
+
+              <!-- Collapse panel button -->
+              <ui:Button
+                Appearance="Transparent"
+                Padding="6,2"
+                Command="{Binding ToggleLogPanelCommand}"
+                Icon="{ui:SymbolIcon Symbol=ChevronRight24}"
+                ToolTip="收起实时日志面板"
+              />
+            </StackPanel>
+          </Grid>
+
+          <!-- Module Filter Pills Bar: 全部 / Modem / VoWiFi / IMS / SIP -->
+          <Grid Grid.Row="1" Margin="0,0,0,6">
+            <StackPanel Orientation="Horizontal">
+              <ui:Button
+                Content="全部"
+                Command="{Binding SetLogModuleCommand}"
+                CommandParameter="全部"
+              >
+                <ui:Button.Style>
+                  <Style TargetType="ui:Button" BasedOn="{StaticResource LogFilterButtonStyle}">
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding IsFilterAll, Mode=OneWay}" Value="True">
+                        <Setter Property="Appearance" Value="Primary" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </ui:Button.Style>
+              </ui:Button>
+
+              <ui:Button
+                Content="Modem"
+                Command="{Binding SetLogModuleCommand}"
+                CommandParameter="Modem"
+              >
+                <ui:Button.Style>
+                  <Style TargetType="ui:Button" BasedOn="{StaticResource LogFilterButtonStyle}">
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding IsFilterModem, Mode=OneWay}" Value="True">
+                        <Setter Property="Appearance" Value="Primary" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </ui:Button.Style>
+              </ui:Button>
+
+              <ui:Button
+                Content="VoWiFi"
+                Command="{Binding SetLogModuleCommand}"
+                CommandParameter="VoWiFi"
+              >
+                <ui:Button.Style>
+                  <Style TargetType="ui:Button" BasedOn="{StaticResource LogFilterButtonStyle}">
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding IsFilterVoWifi, Mode=OneWay}" Value="True">
+                        <Setter Property="Appearance" Value="Primary" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </ui:Button.Style>
+              </ui:Button>
+
+              <ui:Button
+                Content="IMS"
+                Command="{Binding SetLogModuleCommand}"
+                CommandParameter="IMS"
+              >
+                <ui:Button.Style>
+                  <Style TargetType="ui:Button" BasedOn="{StaticResource LogFilterButtonStyle}">
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding IsFilterIms, Mode=OneWay}" Value="True">
+                        <Setter Property="Appearance" Value="Primary" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </ui:Button.Style>
+              </ui:Button>
+
+              <ui:Button
+                Content="SIP"
+                Command="{Binding SetLogModuleCommand}"
+                CommandParameter="SIP"
+              >
+                <ui:Button.Style>
+                  <Style TargetType="ui:Button" BasedOn="{StaticResource LogFilterButtonStyle}">
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding IsFilterSip, Mode=OneWay}" Value="True">
+                        <Setter Property="Appearance" Value="Primary" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </ui:Button.Style>
+              </ui:Button>
+            </StackPanel>
+          </Grid>
+
+          <!-- Search Input Box -->
+          <ui:TextBox
+            Grid.Row="2"
+            Margin="0,0,0,8"
+            Padding="8,3"
+            FontSize="11"
+            PlaceholderText="搜索日志内容..."
+            Text="{Binding LogSearchText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+            ClearButtonEnabled="True"
+          />
+
+          <!-- Structured Log List with Fixed Columns (Time / Level / Module / Message) -->
+          <Border
+            Grid.Row="3"
+            Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            BorderThickness="1"
+            CornerRadius="8"
+            Padding="6,6,4,6"
+          >
+            <ListBox
+              x:Name="LogList"
+              ItemsSource="{Binding FilteredLogs}"
+              Background="Transparent"
+              BorderThickness="0"
+              ScrollViewer.VerticalScrollBarVisibility="Visible"
+              ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+              ScrollViewer.CanContentScroll="True"
+              VirtualizingPanel.IsVirtualizing="True"
+              VirtualizingPanel.VirtualizationMode="Recycling"
+              VirtualizingPanel.ScrollUnit="Pixel"
+              Focusable="False"
+            >
+              <ListBox.ItemContainerStyle>
+                <Style TargetType="ListBoxItem">
+                  <Setter Property="Padding" Value="0" />
+                  <Setter Property="Margin" Value="0,0,0,4" />
+                  <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                  <Setter Property="Focusable" Value="False" />
+                </Style>
+              </ListBox.ItemContainerStyle>
+              <ListBox.ItemTemplate>
+                <DataTemplate>
+                  <Grid Margin="0,1,0,2">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="54" />
+                      <ColumnDefinition Width="42" />
+                      <ColumnDefinition Width="52" />
+                      <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <!-- 1. Fixed Time (HH:mm:ss) -->
+                    <TextBlock
+                      Grid.Column="0"
+                      FontFamily="Consolas"
+                      FontSize="10"
+                      VerticalAlignment="Center"
+                      Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                      Text="{Binding Timestamp, StringFormat='{}{0:HH:mm:ss}', Mode=OneWay}"
+                    />
+
+                    <!-- 2. Fixed Level Badge (INFO/WARN/ERROR/DEBUG with Token Colors) -->
+                    <Border
+                      Grid.Column="1"
+                      Margin="2,0,4,0"
+                      Padding="3,1"
+                      CornerRadius="4"
+                      HorizontalAlignment="Left"
+                      VerticalAlignment="Center"
+                      Background="{Binding LevelBackground, Mode=OneWay}"
+                    >
+                      <TextBlock
+                        FontFamily="Consolas"
+                        FontSize="9"
+                        FontWeight="Bold"
+                        Foreground="{Binding LevelColor, Mode=OneWay}"
+                        Text="{Binding Level, Mode=OneWay}"
+                      />
+                    </Border>
+
+                    <!-- 3. Fixed Module Source -->
+                    <Border
+                      Grid.Column="2"
+                      Margin="0,0,4,0"
+                      Padding="3,1"
+                      CornerRadius="4"
+                      HorizontalAlignment="Left"
+                      VerticalAlignment="Center"
+                      Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+                    >
+                      <TextBlock
+                        FontFamily="Consolas"
+                        FontSize="9"
+                        FontWeight="SemiBold"
+                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                        Text="{Binding Source, Mode=OneWay}"
+                        TextTrimming="CharacterEllipsis"
+                      />
+                    </Border>
+
+                    <!-- 4. Log Message -->
+                    <TextBlock
+                      Grid.Column="3"
+                      FontFamily="Consolas"
+                      FontSize="11"
+                      LineHeight="16"
+                      Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                      Text="{Binding Message, Mode=OneWay}"
+                      TextWrapping="Wrap"
+                      VerticalAlignment="Center"
+                    />
+                  </Grid>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
+          </Border>
+        </Grid>
+      </Border>
+
+      <!-- 2. Collapsed Vertical Strip (When user collapses log panel, shows slim icon bar to restore) -->
+      <Border
+        x:Name="CollapsedTerminalStrip"
+        Grid.Column="1"
+        Width="36"
+        Margin="4,0,0,0"
+        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+        BorderThickness="1"
+        CornerRadius="10"
+        Visibility="{Binding IsLogPanelExpanded, Converter={StaticResource InvertBoolToVis}}"
+      >
+        <ui:Button
+          Appearance="Transparent"
+          Padding="0"
+          HorizontalAlignment="Stretch"
+          VerticalAlignment="Stretch"
+          Command="{Binding ToggleLogPanelCommand}"
+          ToolTip="展开实时日志面板"
+        >
+          <StackPanel Orientation="Vertical" HorizontalAlignment="Center" VerticalAlignment="Center">
+            <ui:SymbolIcon Symbol="ChevronLeft24" FontSize="16" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,0,10" />
+            <ui:SymbolIcon Symbol="Code24" FontSize="16" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,10" />
+            <TextBlock
+              Text="实时日志"
+              FontSize="11"
+              FontWeight="SemiBold"
+              Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+              HorizontalAlignment="Center"
+            >
+              <TextBlock.LayoutTransform>
+                <RotateTransform Angle="90" />
+              </TextBlock.LayoutTransform>
+            </TextBlock>
+          </StackPanel>
+        </ui:Button>
+      </Border>
+
+    </Grid>
+  </Grid>
+</Page>

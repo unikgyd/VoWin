@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="VoSharp.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\VoSharp.Common\VoSharp.Common.csproj" />
+    <ProjectReference Include="..\VoSharp.StateMachine\VoSharp.StateMachine.csproj" />
+    <ProjectReference Include="..\VoSharp.Crypto\VoSharp.Crypto.csproj" />
+    <ProjectReference Include="..\VoSharp.Sim\VoSharp.Sim.csproj" />
+    <ProjectReference Include="..\VoSharp.Modem\VoSharp.Modem.csproj" />
+    <ProjectReference Include="..\VoSharp.Telephony\VoSharp.Telephony.csproj" />
+    <ProjectReference Include="..\VoSharp.Sip\VoSharp.Sip.csproj" />
+    <ProjectReference Include="..\VoSharp.Euicc\VoSharp.Euicc.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

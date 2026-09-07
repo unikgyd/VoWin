@@ -1,0 +1,132 @@
+<Page
+  x:Class="VoWin.Views.Pages.SettingsPage"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:helpers="clr-namespace:VoWin.Helpers"
+  xmlns:local="clr-namespace:VoWin.Views.Pages"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+  xmlns:vm="clr-namespace:VoWin.ViewModels.Pages"
+  Title="系统设置"
+  d:DataContext="{d:DesignInstance vm:SettingsViewModel, IsDesignTimeCreatable=False}"
+  d:DesignHeight="750"
+  d:DesignWidth="900"
+  ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
+  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  Background="Transparent"
+  PreviewMouseWheel="OnPagePreviewMouseWheel"
+  mc:Ignorable="d"
+>
+  <Page.Resources>
+    <helpers:EnumToBooleanConverter x:Key="EnumToBooleanConverter" />
+  </Page.Resources>
+
+  <Grid Margin="32,24,32,32" Background="Transparent">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+
+    <!-- Header -->
+    <Grid Grid.Row="0" Margin="0,0,0,24" Background="Transparent">
+      <TextBlock
+        FontSize="28"
+        FontWeight="SemiBold"
+        Text="设置"
+      />
+    </Grid>
+
+    <ScrollViewer
+      x:Name="SettingsScrollViewer"
+      Grid.Row="1"
+      Background="Transparent"
+      VerticalScrollBarVisibility="Auto"
+    >
+      <StackPanel MaxWidth="800" HorizontalAlignment="Left" Background="Transparent">
+        
+        <!-- Section 1: Personalization -->
+        <Border
+          Margin="0,0,0,16"
+          Padding="16,14"
+          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          BorderThickness="1"
+          CornerRadius="12"
+        >
+          <StackPanel>
+            <TextBlock FontSize="18" FontWeight="SemiBold" Text="界面与个性化" />
+            <TextBlock Margin="0,4,0,20" FontSize="13" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="选择应用的主题外观模式" />
+
+            <StackPanel Orientation="Horizontal">
+              <RadioButton
+                Margin="0,0,32,0"
+                Command="{Binding ViewModel.ChangeThemeCommand, Mode=OneWay}"
+                CommandParameter="theme_light"
+                Content="浅色主题 (Light)"
+                GroupName="themeSelect"
+                IsChecked="{Binding ViewModel.CurrentTheme, Converter={StaticResource EnumToBooleanConverter}, ConverterParameter=Light, Mode=OneWay}"
+              />
+              <RadioButton
+                Command="{Binding ViewModel.ChangeThemeCommand, Mode=OneWay}"
+                CommandParameter="theme_dark"
+                Content="深色主题 (Dark)"
+                GroupName="themeSelect"
+                IsChecked="{Binding ViewModel.CurrentTheme, Converter={StaticResource EnumToBooleanConverter}, ConverterParameter=Dark, Mode=OneWay}"
+              />
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <!-- Section 2: Telephony Preferences -->
+        <Border
+          Margin="0,0,0,16"
+          Padding="16,14"
+          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          BorderThickness="1"
+          CornerRadius="12"
+        >
+          <StackPanel>
+            <TextBlock FontSize="18" FontWeight="SemiBold" Text="策略" />
+            <TextBlock Margin="0,4,0,20" FontSize="13" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="全局行为设置" />
+
+            <ui:ToggleSwitch
+              Margin="0,0,0,16"
+              IsChecked="{Binding ViewModel.AutoConnectKnownModem}"
+              Content="自动挂载"
+            />
+            <ui:ToggleSwitch
+              IsChecked="{Binding ViewModel.PreferVowifiCalling}"
+              Content="语音呼叫与短信默认优先采用 VoWiFi"
+            />
+          </StackPanel>
+        </Border>
+
+        <Border Margin="0,0,0,16" Padding="16,14" Background="{DynamicResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="12">
+          <StackPanel>
+            <TextBlock FontSize="18" FontWeight="SemiBold" Text="通话音频与自动接听" />
+            <TextBlock Margin="0,4,0,16" FontSize="13" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="设置 VoLTE 音频启动速度、来电响铃和超时自动接听。" />
+            <ui:ToggleSwitch Margin="0,0,0,8" IsChecked="{Binding ViewModel.VolteAudioPrewarmEnabled}" Content="启用 VoLTE 音频预热" />
+            <Border Margin="0,0,0,18" Padding="12,9" Background="#18FFB900" BorderBrush="#66FFB900" BorderThickness="1" CornerRadius="6">
+              <TextBlock Foreground="{DynamicResource TextFillColorPrimaryBrush}" TextWrapping="Wrap" Text="注意：开启 VoLTE 音频预热后，VoWin 会长期占用麦克风，以缩短接通后的音频启动时间。关闭后，麦克风只在实际通话时启用。" />
+            </Border>
+            <ui:ToggleSwitch Margin="0,0,0,12" IsChecked="{Binding ViewModel.AutoAnswerEnabled}" Content="30 秒无人接听时自动接听" />
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+              <TextBlock VerticalAlignment="Center" Text="等待秒数" Margin="0,0,12,0" />
+              <TextBox Width="80" Text="{Binding ViewModel.AutoAnswerDelaySeconds, UpdateSourceTrigger=PropertyChanged}" />
+            </StackPanel>
+            <TextBlock Text="接听后播放的录音文件" Margin="0,0,0,6" />
+            <DockPanel Margin="0,0,0,12">
+              <ui:Button DockPanel.Dock="Right" Content="选择文件" Command="{Binding ViewModel.BrowseAutoAnswerMessageCommand}" />
+              <TextBox Margin="0,0,12,0" Text="{Binding ViewModel.AutoAnswerMessagePath, UpdateSourceTrigger=PropertyChanged}" />
+            </DockPanel>
+            <ui:Button HorizontalAlignment="Left" Appearance="Primary" Content="保存通话设置" Command="{Binding ViewModel.SaveCallSettingsCommand}" />
+            <TextBlock Margin="0,10,0,0" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding ViewModel.CallSettingsStatus}" />
+          </StackPanel>
+        </Border>
+      </StackPanel>
+    </ScrollViewer>
+  </Grid>
+</Page>

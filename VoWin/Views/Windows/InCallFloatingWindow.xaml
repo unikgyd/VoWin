@@ -1,0 +1,163 @@
+<Window
+  x:Class="VoWin.Views.Windows.InCallFloatingWindow"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+  Title="通话中悬浮窗"
+  Width="340"
+  Height="76"
+  AllowsTransparency="True"
+  Background="Transparent"
+  ResizeMode="NoResize"
+  ShowInTaskbar="False"
+  Topmost="True"
+  WindowStyle="None"
+  WindowStartupLocation="Manual"
+  mc:Ignorable="d"
+>
+  <Window.Resources>
+    <DropShadowEffect
+      x:Key="FloatingShadow"
+      BlurRadius="20"
+      Direction="270"
+      Opacity="0.6"
+      ShadowDepth="5"
+      Color="#000000"
+    />
+  </Window.Resources>
+
+  <Border
+    Margin="8"
+    Background="#EB181A26"
+    BorderBrush="#4010B981"
+    BorderThickness="1.2"
+    CornerRadius="30"
+    Effect="{StaticResource FloatingShadow}"
+    Cursor="Hand"
+    ToolTip="拖动可移动位置，双击或点击文字返回主窗口"
+    MouseLeftButtonDown="OnWindowMouseLeftButtonDown"
+  >
+    <Grid Margin="12,6,12,6">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto" />
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+
+      <!-- Left: In-Call Pulse Icon Badge -->
+      <Border
+        Grid.Column="0"
+        Width="38"
+        Height="38"
+        VerticalAlignment="Center"
+        Background="#2210B981"
+        BorderBrush="#10B981"
+        BorderThickness="1.2"
+        CornerRadius="19"
+      >
+        <ui:SymbolIcon
+          FontSize="18"
+          Foreground="#10B981"
+          Symbol="Call24"
+        />
+      </Border>
+
+      <!-- Center: Number & Live Call Duration -->
+      <StackPanel
+        Grid.Column="1"
+        Margin="10,0,8,0"
+        VerticalAlignment="Center"
+      >
+        <TextBlock
+          x:Name="TxtNumber"
+          FontSize="14"
+          FontWeight="SemiBold"
+          Foreground="#FFFFFF"
+          Text="10086"
+          TextTrimming="CharacterEllipsis"
+        />
+        <StackPanel Orientation="Horizontal" Margin="0,2,0,0">
+          <Border
+            Width="6"
+            Height="6"
+            CornerRadius="3"
+            Background="#10B981"
+            VerticalAlignment="Center"
+            Margin="0,0,5,0"
+          />
+          <TextBlock
+            x:Name="TxtDuration"
+            FontSize="11"
+            FontWeight="Medium"
+            Foreground="#34D399"
+            Text="00:00"
+          />
+          <TextBlock
+            x:Name="TxtSlot"
+            FontSize="11"
+            Foreground="#9CA3AF"
+            Margin="6,0,0,0"
+            Text="· SIM 1"
+          />
+        </StackPanel>
+      </StackPanel>
+
+      <!-- Right: Quick Actions (Mute & Hangup) -->
+      <StackPanel
+        Grid.Column="2"
+        Orientation="Horizontal"
+        VerticalAlignment="Center"
+      >
+        <!-- Mute Toggle Button -->
+        <Button
+          x:Name="BtnMute"
+          Width="34"
+          Height="34"
+          Margin="0,0,6,0"
+          Background="#25FFFFFF"
+          BorderThickness="0"
+          Click="BtnMute_Click"
+          Cursor="Hand"
+          ToolTip="静音麦克风"
+        >
+          <Button.Resources>
+            <Style TargetType="Border">
+              <Setter Property="CornerRadius" Value="17" />
+            </Style>
+          </Button.Resources>
+          <ui:SymbolIcon
+            x:Name="IconMute"
+            FontSize="16"
+            Foreground="White"
+            Symbol="Mic24"
+          />
+        </Button>
+
+        <!-- Hangup Button (Red) -->
+        <Button
+          x:Name="BtnHangup"
+          Width="34"
+          Height="34"
+          Background="#EF4444"
+          BorderThickness="0"
+          Click="BtnHangup_Click"
+          Cursor="Hand"
+          ToolTip="挂断通话"
+        >
+          <Button.Resources>
+            <Style TargetType="Border">
+              <Setter Property="CornerRadius" Value="17" />
+            </Style>
+          </Button.Resources>
+          <ui:SymbolIcon
+            FontSize="16"
+            Foreground="White"
+            Symbol="CallDismiss24"
+          />
+        </Button>
+      </StackPanel>
+    </Grid>
+  </Border>
+</Window>

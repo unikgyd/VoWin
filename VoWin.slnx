@@ -1,0 +1,24 @@
+﻿<Solution>
+  <Folder Name="/voSharp/">
+    <Project Path="voSharp/src/VoSharp.Common/VoSharp.Common.csproj" />
+    <Project Path="voSharp/src/VoSharp.Crypto/VoSharp.Crypto.csproj" />
+    <Project Path="voSharp/src/VoSharp.Euicc/VoSharp.Euicc.csproj" />
+    <Project Path="voSharp/src/VoSharp.Ike/VoSharp.Ike.csproj" />
+    <Project Path="voSharp/src/VoSharp.Ipsec/VoSharp.Ipsec.csproj" />
+    <Project Path="voSharp/src/VoSharp.Kernel/VoSharp.Kernel.csproj" />
+    <Project Path="voSharp/src/VoSharp.Modem/VoSharp.Modem.csproj" />
+    <Project Path="voSharp/src/VoSharp.Native/VoSharp.Native.csproj" />
+    <Project Path="voSharp/src/VoSharp.Sim/VoSharp.Sim.csproj" />
+    <Project Path="voSharp/src/VoSharp.Sip/VoSharp.Sip.csproj" />
+    <Project Path="voSharp/src/VoSharp.StateMachine/VoSharp.StateMachine.csproj" />
+    <Project Path="voSharp/src/VoSharp.Telephony/VoSharp.Telephony.csproj" />
+    <Project Path="voSharp/src/VoSharp.Cli/VoSharp.Cli.csproj" />
+  </Folder>
+  <Folder Name="/voSharp/tests/">
+    <Project Path="voSharp/tests/VoSharp.Ike.Tests/VoSharp.Ike.Tests.csproj" />
+    <Project Path="voSharp/tests/VoSharp.Tests/VoSharp.Tests.csproj" />
+  </Folder>
+  <Folder Name="/VoWin/">
+    <Project Path="VoWin/VoWin.csproj" />
+  </Folder>
+</Solution>

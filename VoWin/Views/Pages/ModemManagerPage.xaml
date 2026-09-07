@@ -1,0 +1,1156 @@
+<Page
+  x:Class="VoWin.Views.Pages.ModemManagerPage"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+  xmlns:converters="clr-namespace:VoWin.Helpers"
+  Title="ModemManagerPage"
+  d:DesignHeight="850"
+  d:DesignWidth="1200"
+  ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
+  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  mc:Ignorable="d"
+>
+  <Page.Resources>
+    <converters:BoolToVisibilityConverter x:Key="BoolToVis" />
+    <converters:BoolToVisibilityConverter x:Key="InvertBoolToVis" Invert="True" />
+    <converters:SlotStateToColorConverter x:Key="SlotStateColor" />
+    <converters:SignalBarsToSymbolConverter x:Key="SignalBarsSymbol" />
+    <converters:NullToVisibilityConverter x:Key="NullToVis" />
+    <converters:NullToVisibilityConverter x:Key="InvertNullToVis" Invert="True" />
+    <converters:CountToVisibilityConverter x:Key="CountToVis" />
+    <converters:CountToVisibilityConverter x:Key="InvertCountToVis" Invert="True" />
+
+    <Style TargetType="TabItem">
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="Padding" Value="14,8" />
+      <Setter Property="Cursor" Value="Hand" />
+    </Style>
+  </Page.Resources>
+
+  <Grid Margin="18,12,18,16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+
+    <!-- ================= PAGE HEADER ================= -->
+    <Grid Grid.Row="0" Margin="0,0,0,12">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="Auto" />
+      </Grid.ColumnDefinitions>
+
+      <StackPanel Grid.Column="0">
+        <TextBlock
+          FontSize="22"
+          FontWeight="Bold"
+          Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+          Text="设备管理"
+        />
+        <TextBlock
+          FontSize="12"
+          Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+          Margin="0,2,0,0"
+          Text="管理 Modem、SIM、eSIM 与 VoWiFi 连接状态"
+        />
+      </StackPanel>
+
+      <!-- Header Action Buttons (Primary Refresh, Secondary Scan) -->
+      <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+        <ui:Button
+          Margin="0,0,8,0"
+          Appearance="Primary"
+          Command="{Binding RefreshSlotMetricsCommand}"
+          Icon="{ui:SymbolIcon Symbol=ArrowCounterclockwise24}"
+          Content="刷新状态"
+        />
+        <ui:Button
+          Appearance="Secondary"
+          Command="{Binding DiscoverSlotsCommand}"
+          Icon="{ui:SymbolIcon Symbol=ArrowSync24}"
+          Content="重新扫描"
+          ToolTip="扫描并装载所有物理 Modem 串口"
+        />
+      </StackPanel>
+    </Grid>
+
+    <!-- Dynamic Status Banner (Only visible during active operation) -->
+    <Border
+      Grid.Row="1"
+      Margin="0,0,0,12"
+      Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+      BorderThickness="1"
+      CornerRadius="8"
+      Padding="12,8"
+      Visibility="{Binding IsOperationRunning, Converter={StaticResource BoolToVis}}"
+    >
+      <StackPanel Orientation="Horizontal">
+        <ui:ProgressRing IsIndeterminate="True" Width="16" Height="16" Margin="0,0,10,0" VerticalAlignment="Center" />
+        <TextBlock VerticalAlignment="Center" FontSize="12" FontWeight="Medium" Text="{Binding StatusMessage, Mode=OneWay}" />
+      </StackPanel>
+    </Border>
+
+    <!-- ================= MASTER-DETAIL LAYOUT ================= -->
+    <Grid Grid.Row="2">
+      <Grid.ColumnDefinitions>
+        <!-- Left: Compact Master List (270px) -->
+        <ColumnDefinition Width="270" />
+        <ColumnDefinition Width="14" />
+        <!-- Right: Device Detail Area -->
+        <ColumnDefinition Width="*" />
+      </Grid.ColumnDefinitions>
+
+      <!-- ================= LEFT COLUMN: Compact Master List ================= -->
+      <Border
+        Grid.Column="0"
+        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+        BorderThickness="1"
+        CornerRadius="10"
+      >
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+          </Grid.RowDefinitions>
+
+          <!-- List Header -->
+          <Border Grid.Row="0" BorderThickness="0,0,0,1" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" Padding="14,10">
+            <Grid>
+              <TextBlock FontWeight="SemiBold" FontSize="13" Text="已接入设备" VerticalAlignment="Center" />
+              <TextBlock HorizontalAlignment="Right" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center">
+                <Run Text="{Binding Slots.Count, Mode=OneWay}" /><Run Text=" 台设备" />
+              </TextBlock>
+            </Grid>
+          </Border>
+
+          <!-- Compact Device List -->
+          <ListBox
+            Grid.Row="1"
+            ItemsSource="{Binding Slots}"
+            SelectedItem="{Binding SelectedSlot, Mode=TwoWay}"
+            SelectionMode="Single"
+            BorderThickness="0"
+            Background="Transparent"
+            Padding="6"
+            ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+            ScrollViewer.CanContentScroll="True"
+            VirtualizingPanel.IsVirtualizing="True"
+            VirtualizingPanel.VirtualizationMode="Recycling"
+            Visibility="{Binding Slots.Count, Converter={StaticResource InvertCountToVis}}"
+          >
+            <ListBox.ItemContainerStyle>
+              <Style TargetType="ListBoxItem">
+                <Setter Property="Padding" Value="0" />
+                <Setter Property="Margin" Value="0,2" />
+                <Setter Property="Cursor" Value="Hand" />
+                <Setter Property="Template">
+                  <Setter.Value>
+                    <ControlTemplate TargetType="ListBoxItem">
+                      <Border
+                        x:Name="ItemBorder"
+                        Padding="10,8"
+                        CornerRadius="8"
+                        Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                        BorderThickness="1"
+                      >
+                        <ContentPresenter />
+                      </Border>
+                      <ControlTemplate.Triggers>
+                        <Trigger Property="IsSelected" Value="True">
+                          <Setter TargetName="ItemBorder" Property="BorderBrush" Value="{DynamicResource AccentFillColorDefaultBrush}" />
+                          <Setter TargetName="ItemBorder" Property="BorderThickness" Value="2" />
+                          <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}" />
+                        </Trigger>
+                        <MultiTrigger>
+                          <MultiTrigger.Conditions>
+                            <Condition Property="IsMouseOver" Value="True" />
+                            <Condition Property="IsSelected" Value="False" />
+                          </MultiTrigger.Conditions>
+                          <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}" />
+                        </MultiTrigger>
+                      </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                  </Setter.Value>
+                </Setter>
+              </Style>
+            </ListBox.ItemContainerStyle>
+            <ListBox.ItemTemplate>
+              <DataTemplate>
+                <Grid>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                  </Grid.RowDefinitions>
+
+                  <!-- Line 1: Status Dot + Device Name + Flight Mode -->
+                  <Grid Grid.Row="0">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="Auto" />
+                      <ColumnDefinition Width="*" />
+                      <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <!-- Dot -->
+                    <Ellipse Grid.Column="0" Width="8" Height="8" Margin="0,0,8,0" VerticalAlignment="Center" Fill="{Binding State, Converter={StaticResource SlotStateColor}}" />
+
+                    <!-- Name -->
+                    <TextBlock Grid.Column="1" FontWeight="SemiBold" FontSize="13" Text="{Binding Name, Mode=OneWay}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+
+                    <!-- Flight Mode Badge -->
+                    <Border
+                      Grid.Column="2"
+                      Margin="4,0,0,0"
+                      Padding="4,1"
+                      Background="#1EF59E0B"
+                      CornerRadius="4"
+                      Visibility="{Binding IsFlightMode, Converter={StaticResource BoolToVis}}"
+                    >
+                      <TextBlock FontSize="9" FontWeight="SemiBold" Foreground="#F59E0B" Text="✈ 飞行模式" />
+                    </Border>
+                  </Grid>
+
+                  <!-- Line 2: Operator / RAT / SIM Status -->
+                  <TextBlock Grid.Row="1" FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="16,3,0,0" TextTrimming="CharacterEllipsis">
+                    <Run Text="{Binding Sim.OperatorName, Mode=OneWay, FallbackValue='51566'}" />
+                    <Run Text=" · " />
+                    <Run Text="{Binding Signal.Rat, Mode=OneWay, FallbackValue='LTE/NR'}" />
+                    <Run Text=" · " />
+                    <Run Text="{Binding Sim.Imsi, Mode=OneWay, FallbackValue='SIM 就绪'}" />
+                  </TextBlock>
+
+                  <!-- Line 3: VoWiFi State Summary -->
+                  <TextBlock Grid.Row="2" FontSize="10" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="16,2,0,0" TextTrimming="CharacterEllipsis">
+                    <Run Text="VoWiFi: " />
+                    <Run Text="{Binding VoWifi.State, Mode=OneWay, FallbackValue='Disconnected'}" />
+                  </TextBlock>
+                </Grid>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+
+          <!-- Empty State for List -->
+          <StackPanel
+            Grid.Row="1"
+            VerticalAlignment="Center"
+            HorizontalAlignment="Center"
+            Visibility="{Binding Slots.Count, Converter={StaticResource CountToVis}}"
+          >
+            <ui:SymbolIcon Symbol="Sim24" FontSize="32" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+            <TextBlock Margin="0,10,0,0" Text="暂无设备接入" FontWeight="Medium" Foreground="{DynamicResource TextFillColorSecondaryBrush}" HorizontalAlignment="Center" />
+            <TextBlock Margin="0,4,0,0" FontSize="11" Text="点击右上角【重新扫描】开始" Foreground="{DynamicResource TextFillColorTertiaryBrush}" HorizontalAlignment="Center" />
+          </StackPanel>
+        </Grid>
+      </Border>
+
+      <!-- ================= RIGHT COLUMN: Device Detail Area ================= -->
+      <Grid Grid.Column="2">
+        <!-- Active Slot Detail Content -->
+        <Border
+          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          BorderThickness="1"
+          CornerRadius="10"
+          Visibility="{Binding SelectedSlot, Converter={StaticResource NullToVis}}"
+        >
+          <Grid Margin="16,14">
+            <Grid.RowDefinitions>
+              <!-- Row 0: Unified Device Summary Card -->
+              <RowDefinition Height="Auto" />
+              <!-- Row 1: Detail Tabs -->
+              <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <!-- ================= UNIFIED DEVICE SUMMARY CARD ================= -->
+            <Border
+              Grid.Row="0"
+              Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              BorderThickness="1"
+              CornerRadius="10"
+              Padding="16,12"
+              Margin="0,0,0,12"
+            >
+              <Grid>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- Row 1: Title + Health Badges + Action Buttons -->
+                <Grid Grid.Row="0" Margin="0,0,0,8">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                  </Grid.ColumnDefinitions>
+
+                  <!-- Left: Device Title & Semantic Health Badges -->
+                  <WrapPanel Grid.Column="0" VerticalAlignment="Center">
+                    <!-- Device Name -->
+                    <TextBlock
+                      FontSize="18"
+                      FontWeight="Bold"
+                      Text="{Binding SelectedSlot.Name, Mode=OneWay}"
+                      VerticalAlignment="Center"
+                      Margin="0,0,10,0"
+                    />
+
+                    <!-- Badge 1: Online Status -->
+                    <Border Margin="0,0,6,0" Padding="7,2" Background="{DynamicResource CardBackgroundFillColorDefaultBrush}" CornerRadius="6" VerticalAlignment="Center">
+                      <StackPanel Orientation="Horizontal">
+                        <Ellipse Width="7" Height="7" Fill="{Binding SelectedSlot.State, Converter={StaticResource SlotStateColor}}" Margin="0,0,5,0" VerticalAlignment="Center" />
+                        <TextBlock FontSize="11" FontWeight="SemiBold" Text="{Binding SelectedSlot.State, Mode=OneWay}" VerticalAlignment="Center" />
+                      </StackPanel>
+                    </Border>
+
+                    <!-- Badge 2: SIM Status -->
+                    <Border Margin="0,0,6,0" Padding="7,2" Background="{Binding SelectedSlotSimBg, Mode=OneWay}" CornerRadius="6" VerticalAlignment="Center">
+                      <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding SelectedSlotSimBrush, Mode=OneWay}" Text="{Binding SelectedSlotSimStatusText, Mode=OneWay}" VerticalAlignment="Center" />
+                    </Border>
+
+                    <!-- Badge 3: RAT -->
+                    <Border Margin="0,0,6,0" Padding="7,2" Background="{DynamicResource CardBackgroundFillColorDefaultBrush}" CornerRadius="6" VerticalAlignment="Center">
+                      <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding SelectedSlotRatText, Mode=OneWay}" VerticalAlignment="Center" />
+                    </Border>
+
+                    <!-- Badge 4: Signal RSSI & Evaluation -->
+                    <Border Margin="0,0,6,0" Padding="7,2" Background="{DynamicResource CardBackgroundFillColorDefaultBrush}" CornerRadius="6" VerticalAlignment="Center">
+                      <TextBlock FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center">
+                        <Run Text="{Binding SelectedSlotSignalDbmText, Mode=OneWay}" />
+                        <Run Text=" (" /><Run Text="{Binding SelectedSlotSignalEvaluation, Mode=OneWay}" /><Run Text=")" />
+                      </TextBlock>
+                    </Border>
+
+                    <!-- Badge 5: VoWiFi Status -->
+                    <Border Padding="7,2" Background="{Binding SelectedSlotVoWifiBg, Mode=OneWay}" CornerRadius="6" VerticalAlignment="Center">
+                      <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding SelectedSlotVoWifiBrush, Mode=OneWay}" Text="{Binding SelectedSlotVoWifiStateText, Mode=OneWay}" VerticalAlignment="Center" />
+                    </Border>
+                  </WrapPanel>
+
+                  <!-- Right: Unified Action Buttons -->
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <!-- Action Button when Connected (Danger style: 断开连接) -->
+                    <ui:Button
+                      Margin="0,0,8,0"
+                      Appearance="Danger"
+                      Command="{Binding ExecuteVoWifiActionCommand}"
+                      Icon="{ui:SymbolIcon Symbol=Stop24}"
+                      Content="断开连接"
+                      Visibility="{Binding IsVoWifiRunning, Converter={StaticResource BoolToVis}}"
+                    />
+
+                    <!-- Action Button when Not Connected (Primary style: 连接 VoWiFi / 取消连接 / 重新连接) -->
+                    <ui:Button
+                      Margin="0,0,8,0"
+                      Appearance="Primary"
+                      Command="{Binding ExecuteVoWifiActionCommand}"
+                      Icon="{ui:SymbolIcon Symbol=Play24}"
+                      Content="{Binding VoWifiActionText, Mode=OneWay}"
+                      Visibility="{Binding IsVoWifiRunning, Converter={StaticResource InvertBoolToVis}}"
+                    />
+
+                    <!-- Secondary Renegotiate Button -->
+                    <ui:Button
+                      Margin="0,0,8,0"
+                      Appearance="Secondary"
+                      Command="{Binding ReconnectVoWifiCommand}"
+                      Content="重新协商"
+                      ToolTip="重新协商并建立该卡槽的 VoWiFi IPsec 隧道"
+                    />
+
+                    <!-- Secondary Safe Reboot Button (with Confirmation dialog) -->
+                    <ui:Button
+                      Appearance="Secondary"
+                      Command="{Binding RebootModemCommand}"
+                      Icon="{ui:SymbolIcon Symbol=Power24}"
+                      Content="重启模组"
+                      ToolTip="安全软重启模组射频基带 (需二次确认)"
+                    />
+                  </StackPanel>
+                </Grid>
+
+                <!-- Row 2: Secondary Identity & Port Details with Quick Copy -->
+                <WrapPanel Grid.Row="1" VerticalAlignment="Center">
+                  <!-- Carrier & Country -->
+                  <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" Margin="0,0,14,0">
+                    <Run Text="{Binding SelectedSlotCountryDisplay, Mode=OneWay}" />
+                    <Run Text=" · " />
+                    <Run FontWeight="SemiBold" Text="{Binding SelectedSlotOperatorDisplay, Mode=OneWay}" />
+                  </TextBlock>
+
+                  <!-- IMEI with Copy -->
+                  <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">
+                    <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Text="IMEI: " VerticalAlignment="Center" />
+                    <TextBlock FontSize="12" FontFamily="Consolas" FontWeight="Medium" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding SelectedSlot.Imei, Mode=OneWay, FallbackValue='--'}" VerticalAlignment="Center" />
+                    <ui:Button
+                      Appearance="Transparent"
+                      Padding="4,2"
+                      Margin="2,0,0,0"
+                      Command="{Binding CopyToClipboardCommand}"
+                      CommandParameter="{Binding SelectedSlot.Imei, Mode=OneWay}"
+                      ToolTip="复制 IMEI"
+                    >
+                      <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                    </ui:Button>
+                  </StackPanel>
+
+                  <!-- IMSI with Copy -->
+                  <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">
+                    <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Text="IMSI: " VerticalAlignment="Center" />
+                    <TextBlock FontSize="12" FontFamily="Consolas" FontWeight="Medium" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding SelectedSlot.Sim.Imsi, Mode=OneWay, FallbackValue='--'}" VerticalAlignment="Center" />
+                    <ui:Button
+                      Appearance="Transparent"
+                      Padding="4,2"
+                      Margin="2,0,0,0"
+                      Command="{Binding CopyToClipboardCommand}"
+                      CommandParameter="{Binding SelectedSlot.Sim.Imsi, Mode=OneWay}"
+                      ToolTip="复制 IMSI"
+                    >
+                      <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                    </ui:Button>
+                  </StackPanel>
+
+                  <!-- Port & Baud -->
+                  <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}" VerticalAlignment="Center">
+                    <Run Text="端口: " />
+                    <Run FontFamily="Consolas" FontWeight="Medium" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding SelectedSlot.PortName, Mode=OneWay}" />
+                    <Run Text=" @ " />
+                    <Run FontFamily="Consolas" Text="{Binding SelectedSlot.BaudRate, Mode=OneWay}" />
+                    <Run Text=" bps" />
+                  </TextBlock>
+                </WrapPanel>
+              </Grid>
+            </Border>
+
+            <!-- ================= DETAIL TABS ================= -->
+            <TabControl Grid.Row="1" Background="Transparent" BorderThickness="0">
+
+              <!-- ================= TAB 1: 概览 (3 Health Summary Cards) ================= -->
+              <TabItem Header="概览">
+                <ScrollViewer Margin="0,10,0,0" VerticalScrollBarVisibility="Auto">
+                  <StackPanel>
+
+                    <!-- Card 1: 蜂窝网络与射频 (Cellular Network & Radio) -->
+                    <Border
+                      Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                      BorderThickness="1"
+                      CornerRadius="10"
+                      Padding="16,14"
+                      Margin="0,0,0,12"
+                    >
+                      <StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                          <ui:SymbolIcon Symbol="CellularData124" FontSize="16" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,8,0" VerticalAlignment="Center" />
+                          <TextBlock FontSize="14" FontWeight="SemiBold" Text="蜂窝网络与无线射频" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <Grid>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                          </Grid.ColumnDefinitions>
+
+                          <!-- 1. RSSI -->
+                          <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="信号质量 (RSSI)" />
+                            <TextBlock FontSize="18" FontWeight="Bold" Margin="0,4,0,0" Text="{Binding SelectedSlotSignalDbmText, Mode=OneWay}" />
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0">
+                              <Run Text="{Binding SelectedSlotSignalEvaluation, Mode=OneWay}" />
+                              <Run Text=" · " />
+                              <Run Text="{Binding SelectedSlotSignalBars, Mode=OneWay}" /><Run Text="/5格" />
+                            </TextBlock>
+                          </StackPanel>
+
+                          <!-- 2. RAT -->
+                          <StackPanel Grid.Column="1" Margin="4,0,8,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="接入制式 (RAT)" />
+                            <TextBlock FontSize="18" FontWeight="Bold" Margin="0,4,0,0" Text="{Binding SelectedSlotRatText, Mode=OneWay}" />
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="{Binding SelectedSlotRegStatusText, Mode=OneWay}" />
+                          </StackPanel>
+
+                          <!-- 3. Operator -->
+                          <StackPanel Grid.Column="2" Margin="4,0,8,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="服务运营商" />
+                            <TextBlock FontSize="15" FontWeight="Bold" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlotOperatorDisplay, Mode=OneWay}" />
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0">
+                              <Run Text="PLMN: " /><Run Text="{Binding SelectedSlotPlmnDisplay, Mode=OneWay}" />
+                            </TextBlock>
+                          </StackPanel>
+
+                          <!-- 4. Port & State -->
+                          <StackPanel Grid.Column="3" Margin="4,0,0,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="通信串口与状态" />
+                            <TextBlock FontSize="14" FontFamily="Consolas" FontWeight="Bold" Margin="0,4,0,0" Text="{Binding SelectedSlot.PortName, Mode=OneWay}" />
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0">
+                              <Run Text="{Binding SelectedSlot.BaudRate, Mode=OneWay}" /><Run Text=" bps · " /><Run Text="{Binding SelectedSlot.State, Mode=OneWay}" />
+                            </TextBlock>
+                          </StackPanel>
+                        </Grid>
+                      </StackPanel>
+                    </Border>
+
+                    <!-- Card 2: SIM 卡与芯片标识 (SIM & Identifiers) -->
+                    <Border
+                      Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                      BorderThickness="1"
+                      CornerRadius="10"
+                      Padding="16,14"
+                      Margin="0,0,0,12"
+                    >
+                      <StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                          <ui:SymbolIcon Symbol="Sim24" FontSize="16" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,8,0" VerticalAlignment="Center" />
+                          <TextBlock FontSize="14" FontWeight="SemiBold" Text="SIM 卡识别与芯片状态" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <Grid>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                          </Grid.ColumnDefinitions>
+
+                          <!-- ICCID with Copy -->
+                          <StackPanel Grid.Column="0" Margin="0,0,10,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="SIM 识别码 (ICCID)" />
+                            <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                              <TextBlock FontSize="13" FontFamily="Consolas" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.Sim.Iccid, Mode=OneWay, FallbackValue='未插卡'}" VerticalAlignment="Center" />
+                              <ui:Button Appearance="Transparent" Padding="4,2" Margin="4,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.Sim.Iccid, Mode=OneWay}" ToolTip="复制 ICCID">
+                                <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                              </ui:Button>
+                            </StackPanel>
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="物理 SIM / eSIM 卡号" />
+                          </StackPanel>
+
+                          <!-- IMSI with Copy -->
+                          <StackPanel Grid.Column="1" Margin="4,0,10,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="国际移动用户识别码 (IMSI)" />
+                            <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                              <TextBlock FontSize="13" FontFamily="Consolas" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.Sim.Imsi, Mode=OneWay, FallbackValue='--'}" VerticalAlignment="Center" />
+                              <ui:Button Appearance="Transparent" Padding="4,2" Margin="4,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.Sim.Imsi, Mode=OneWay}" ToolTip="复制 IMSI">
+                                <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                              </ui:Button>
+                            </StackPanel>
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="核心网鉴权身份" />
+                          </StackPanel>
+
+                          <!-- eSIM (eUICC) Chip -->
+                          <StackPanel Grid.Column="2" Margin="4,0,0,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="eSIM (eUICC) 状态" />
+                            <TextBlock FontSize="13" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" Text="{Binding EuiccEid, Mode=OneWay}" />
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0">
+                              <Run Text="已载入 " /><Run Text="{Binding EuiccProfiles.Count, Mode=OneWay}" /><Run Text=" 个 Profile" />
+                            </TextBlock>
+                          </StackPanel>
+                        </Grid>
+                      </StackPanel>
+                    </Border>
+
+                    <!-- Card 3: VoWiFi 与 IMS 核心网状态 (VoWiFi & IMS Session) -->
+                    <Border
+                      Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                      BorderThickness="1"
+                      CornerRadius="10"
+                      Padding="16,14"
+                    >
+                      <StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                          <ui:SymbolIcon Symbol="Pulse24" FontSize="16" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,8,0" VerticalAlignment="Center" />
+                          <TextBlock FontSize="14" FontWeight="SemiBold" Text="VoWiFi 隧道与 IMS 会话质量" VerticalAlignment="Center" />
+                        </StackPanel>
+
+                        <Grid>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                          </Grid.ColumnDefinitions>
+
+                          <!-- 1. VoWiFi State -->
+                          <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="VoWiFi 状态" />
+                            <TextBlock FontSize="15" FontWeight="Bold" Margin="0,4,0,0" Foreground="{Binding SelectedSlotVoWifiBrush, Mode=OneWay}" Text="{Binding SelectedSlotVoWifiStateText, Mode=OneWay}" />
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="3GPP TS 24.302" />
+                          </StackPanel>
+
+                          <!-- 2. IMS Registration -->
+                          <StackPanel Grid.Column="1" Margin="4,0,8,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="IMS 注册状态" />
+                            <TextBlock FontSize="14" FontWeight="SemiBold" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.VoWifiDiag.Ims.RegistrationState, Mode=OneWay, FallbackValue='未注册 (Offline)'}" />
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="SIP 核心网响应" />
+                          </StackPanel>
+
+                          <!-- 3. P-CSCF & IP -->
+                          <StackPanel Grid.Column="2" Margin="4,0,8,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="虚拟内网 IP" />
+                            <TextBlock FontSize="13" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.VoWifiDiag.Tunnel.AssignedIPv4, Mode=OneWay, FallbackValue='--'}" />
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0">
+                              <Run Text="P-CSCF: " /><Run Text="{Binding SelectedSlot.VoWifiDiag.Ims.PcscfEndpoint, Mode=OneWay, FallbackValue='--'}" />
+                            </TextBlock>
+                          </StackPanel>
+
+                          <!-- 4. Proxy Route -->
+                          <StackPanel Grid.Column="3" Margin="4,0,0,0">
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="出站代理路由" />
+                            <TextBlock FontSize="12" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.ProxyUrl, Mode=OneWay, FallbackValue='跟随国家码分流'}" />
+                            <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="UDP 5060 直连/代理" />
+                          </StackPanel>
+                        </Grid>
+                      </StackPanel>
+                    </Border>
+
+                  </StackPanel>
+                </ScrollViewer>
+              </TabItem>
+
+              <!-- ================= TAB 2: IMS / VoWiFi (4-Stage Chain & Key-Value Matrix) ================= -->
+              <TabItem Header="IMS / VoWiFi">
+                <ScrollViewer Margin="0,10,0,0" VerticalScrollBarVisibility="Auto">
+                  <StackPanel>
+
+                    <!-- Four Stage Checklist Pills (Unified Semantic Colors) -->
+                    <Border
+                      Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                      BorderThickness="1"
+                      CornerRadius="10"
+                      Padding="14,10"
+                      Margin="0,0,0,12"
+                    >
+                      <Grid>
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Stage 1 Pill: ePDG DNS -->
+                        <Border Grid.Column="0" Margin="0,0,4,0" Padding="8,6" Background="{Binding Stage1Bg, Mode=OneWay}" CornerRadius="8">
+                          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                            <ui:SymbolIcon Symbol="{Binding Stage1Symbol, Mode=OneWay}" Foreground="{Binding Stage1Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
+                            <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage1Brush, Mode=OneWay}" Text="1. ePDG DNS" VerticalAlignment="Center" />
+                          </StackPanel>
+                        </Border>
+
+                        <!-- Stage 2 Pill: IKEv2 / EAP-AKA -->
+                        <Border Grid.Column="1" Margin="3,0,3,0" Padding="8,6" Background="{Binding Stage2Bg, Mode=OneWay}" CornerRadius="8">
+                          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                            <ui:SymbolIcon Symbol="{Binding Stage2Symbol, Mode=OneWay}" Foreground="{Binding Stage2Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
+                            <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage2Brush, Mode=OneWay}" Text="2. IKEv2 鉴权" VerticalAlignment="Center" />
+                          </StackPanel>
+                        </Border>
+
+                        <!-- Stage 3 Pill: IPsec Tunnel -->
+                        <Border Grid.Column="2" Margin="3,0,3,0" Padding="8,6" Background="{Binding Stage3Bg, Mode=OneWay}" CornerRadius="8">
+                          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                            <ui:SymbolIcon Symbol="{Binding Stage3Symbol, Mode=OneWay}" Foreground="{Binding Stage3Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
+                            <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage3Brush, Mode=OneWay}" Text="3. IPsec 隧道" VerticalAlignment="Center" />
+                          </StackPanel>
+                        </Border>
+
+                        <!-- Stage 4 Pill: IMS 200 OK -->
+                        <Border Grid.Column="3" Margin="4,0,0,0" Padding="8,6" Background="{Binding Stage4Bg, Mode=OneWay}" CornerRadius="8">
+                          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                            <ui:SymbolIcon Symbol="{Binding Stage4Symbol, Mode=OneWay}" Foreground="{Binding Stage4Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
+                            <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage4Brush, Mode=OneWay}" Text="4. IMS 200 OK" VerticalAlignment="Center" />
+                          </StackPanel>
+                        </Border>
+                      </Grid>
+                    </Border>
+
+                    <!-- Error Diagnosis Banner (Shown when HasImsError == true) -->
+                    <Border
+                      Margin="0,0,0,12"
+                      Padding="12,10"
+                      Background="#18DC2626"
+                      BorderBrush="#40DC2626"
+                      BorderThickness="1"
+                      CornerRadius="8"
+                      Visibility="{Binding HasImsError, Converter={StaticResource BoolToVis}}"
+                    >
+                      <Grid>
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="Auto" />
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <ui:SymbolIcon Grid.Column="0" Symbol="DismissCircle24" Foreground="#DC2626" FontSize="18" Margin="0,0,10,0" VerticalAlignment="Center" />
+
+                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                          <TextBlock FontSize="13" FontWeight="SemiBold" Foreground="#DC2626" Text="{Binding ImsErrorTitle, Mode=OneWay}" />
+                          <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding ImsErrorDetail, Mode=OneWay}" Margin="0,2,0,0" TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <ui:Button
+                          Grid.Column="2"
+                          Appearance="Secondary"
+                          Padding="10,4"
+                          Command="{Binding ReconnectVoWifiCommand}"
+                          Content="重新协商"
+                          VerticalAlignment="Center"
+                          Margin="10,0,0,0"
+                        />
+                      </Grid>
+                    </Border>
+
+                    <!-- Section 1: IMS 核心网会话遥测 (SIP / P-CSCF) -->
+                    <Border
+                      Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                      BorderThickness="1"
+                      CornerRadius="10"
+                      Padding="16,14"
+                      Margin="0,0,0,12"
+                    >
+                      <StackPanel>
+                        <TextBlock FontSize="14" FontWeight="SemiBold" Text="IMS 核心网会话遥测 (SIP / P-CSCF)" Margin="0,0,0,12" />
+
+                        <Grid>
+                          <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="8" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="8" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="8" />
+                            <RowDefinition Height="Auto" />
+                          </Grid.RowDefinitions>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="160" />
+                            <ColumnDefinition Width="*" />
+                          </Grid.ColumnDefinitions>
+
+                          <!-- Field 1: IMS Registration State -->
+                          <TextBlock Grid.Row="0" Grid.Column="0" Text="IMS 注册状态" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                          <TextBlock Grid.Row="0" Grid.Column="1" FontWeight="SemiBold" Text="{Binding SelectedSlot.VoWifiDiag.Ims.RegistrationState, Mode=OneWay, FallbackValue='未注册 (Offline)'}" VerticalAlignment="Center" />
+
+                          <!-- Field 2: Home Domain with Copy -->
+                          <TextBlock Grid.Row="2" Grid.Column="0" Text="归属域 (Home Domain)" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                          <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock FontFamily="Consolas" FontWeight="Medium" Text="{Binding SelectedSlot.VoWifiDiag.Ims.HomeDomain, Mode=OneWay, FallbackValue='ims.mnc000.mcc460.3gppnetwork.org'}" VerticalAlignment="Center" />
+                            <ui:Button Appearance="Transparent" Padding="4,2" Margin="6,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.VoWifiDiag.Ims.HomeDomain, Mode=OneWay}" ToolTip="复制域名">
+                              <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                            </ui:Button>
+                          </StackPanel>
+
+                          <!-- Field 3: IMPU with Copy -->
+                          <TextBlock Grid.Row="4" Grid.Column="0" Text="公有身份 (IMPU)" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                          <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock FontFamily="Consolas" Text="{Binding SelectedSlot.VoWifiDiag.Ims.Impu, Mode=OneWay, FallbackValue='--'}" VerticalAlignment="Center" />
+                            <ui:Button Appearance="Transparent" Padding="4,2" Margin="6,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.VoWifiDiag.Ims.Impu, Mode=OneWay}" ToolTip="复制 IMPU">
+                              <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                            </ui:Button>
+                          </StackPanel>
+
+                          <!-- Field 4: P-CSCF with Copy -->
+                          <TextBlock Grid.Row="6" Grid.Column="0" Text="P-CSCF 接入节点" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                          <StackPanel Grid.Row="6" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock FontFamily="Consolas" FontWeight="Medium" Text="{Binding SelectedSlot.VoWifiDiag.Ims.PcscfEndpoint, Mode=OneWay, FallbackValue='--'}" VerticalAlignment="Center" />
+                            <ui:Button Appearance="Transparent" Padding="4,2" Margin="6,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.VoWifiDiag.Ims.PcscfEndpoint, Mode=OneWay}" ToolTip="复制端点">
+                              <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                            </ui:Button>
+                          </StackPanel>
+                        </Grid>
+                      </StackPanel>
+                    </Border>
+
+                    <!-- Section 2: IPsec / IKEv2 安全隧道参数 -->
+                    <Border
+                      Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                      BorderThickness="1"
+                      CornerRadius="10"
+                      Padding="16,14"
+                    >
+                      <StackPanel>
+                        <TextBlock FontSize="14" FontWeight="SemiBold" Text="IPsec / IKEv2 安全隧道参数" Margin="0,0,0,12" />
+
+                        <Grid>
+                          <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="8" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="8" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="8" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="8" />
+                            <RowDefinition Height="Auto" />
+                          </Grid.RowDefinitions>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="160" />
+                            <ColumnDefinition Width="*" />
+                          </Grid.ColumnDefinitions>
+
+                          <!-- ePDG FQDN with Copy -->
+                          <TextBlock Grid.Row="0" Grid.Column="0" Text="ePDG 核心网节点" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                          <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock FontFamily="Consolas" FontWeight="Medium" Text="{Binding SelectedSlot.VoWifiDiag.EpdgFqdn, Mode=OneWay, FallbackValue='--'}" VerticalAlignment="Center" />
+                            <ui:Button Appearance="Transparent" Padding="4,2" Margin="6,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.VoWifiDiag.EpdgFqdn, Mode=OneWay}" ToolTip="复制 ePDG">
+                              <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                            </ui:Button>
+                          </StackPanel>
+
+                          <!-- Virtual IPv4 with Copy -->
+                          <TextBlock Grid.Row="2" Grid.Column="0" Text="分配虚拟内网 IP" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                          <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock FontFamily="Consolas" FontWeight="SemiBold" Text="{Binding SelectedSlot.VoWifiDiag.Tunnel.AssignedIPv4, Mode=OneWay, FallbackValue='--'}" VerticalAlignment="Center" />
+                            <ui:Button Appearance="Transparent" Padding="4,2" Margin="6,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.VoWifiDiag.Tunnel.AssignedIPv4, Mode=OneWay}" ToolTip="复制 IP">
+                              <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                            </ui:Button>
+                          </StackPanel>
+
+                          <!-- Virtual DNS with Copy -->
+                          <TextBlock Grid.Row="4" Grid.Column="0" Text="分配内网 DNS" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                          <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock FontFamily="Consolas" Text="{Binding SelectedSlot.VoWifiDiag.Tunnel.AssignedDns, Mode=OneWay, FallbackValue='--'}" VerticalAlignment="Center" />
+                            <ui:Button Appearance="Transparent" Padding="4,2" Margin="6,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.VoWifiDiag.Tunnel.AssignedDns, Mode=OneWay}" ToolTip="复制 DNS">
+                              <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                            </ui:Button>
+                          </StackPanel>
+
+                          <!-- Suite & DH Group -->
+                          <TextBlock Grid.Row="6" Grid.Column="0" Text="IKEv2 提议规范" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                          <TextBlock Grid.Row="6" Grid.Column="1" VerticalAlignment="Center">
+                            <Run FontWeight="SemiBold" Text="{Binding SelectedSlot.VoWifiDiag.Suite, Mode=OneWay, FallbackValue='Auto'}" />
+                            <Run Text=" · " />
+                            <Run Text="{Binding SelectedSlot.VoWifiDiag.DhGroup, Mode=OneWay, FallbackValue='--'}" />
+                          </TextBlock>
+
+                          <!-- SPIs -->
+                          <TextBlock Grid.Row="8" Grid.Column="0" Text="IKE SA 标识 (SPI)" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                          <TextBlock Grid.Row="8" Grid.Column="1" FontFamily="Consolas" FontSize="11" VerticalAlignment="Center">
+                            <Run Text="Init: " /><Run Text="{Binding SelectedSlot.VoWifiDiag.IkeInitiatorSpi, Mode=OneWay, FallbackValue='--'}" />
+                            <Run Text="  |  Resp: " /><Run Text="{Binding SelectedSlot.VoWifiDiag.IkeResponderSpi, Mode=OneWay, FallbackValue='--'}" />
+                          </TextBlock>
+                        </Grid>
+                      </StackPanel>
+                    </Border>
+
+                  </StackPanel>
+                </ScrollViewer>
+              </TabItem>
+
+              <!-- ================= TAB 3: eSIM (eUICC) ================= -->
+              <TabItem Header="eSIM">
+                <Grid Margin="0,10,0,0">
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                  </Grid.RowDefinitions>
+
+                  <!-- eSIM Header Toolbar -->
+                  <Border Grid.Row="0" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,10">
+                    <Grid>
+                      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <ui:Button Appearance="Primary" Command="{Binding LoadEuiccDataCommand}" Content="读取 eUICC 芯片" Icon="{ui:SymbolIcon Symbol=Sim24}" Margin="0,0,16,0" />
+                        <TextBlock VerticalAlignment="Center" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="芯片 EID: " />
+                        <TextBlock VerticalAlignment="Center" FontFamily="Consolas" FontWeight="SemiBold" Text="{Binding EuiccEid, Mode=OneWay}" />
+                      </StackPanel>
+                    </Grid>
+                  </Border>
+
+                  <!-- Verified eSIM download -->
+                  <Border Grid.Row="1" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="14,12" Margin="0,0,0,10">
+                    <StackPanel>
+                      <Grid>
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0">
+                          <TextBlock Text="下载并写入 eSIM Profile" FontSize="14" FontWeight="SemiBold" />
+                          <TextBlock Text="支持标准 LPA:1 激活链接或二维码图片；写入完成后会重新读取卡片核对 ICCID。"
+                                     Margin="0,3,0,0" FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                        <ui:Button Grid.Column="1" Appearance="Secondary" Command="{Binding SelectEuiccQrImageCommand}"
+                                   Content="选择二维码图片" Margin="12,0,0,0" />
+                      </Grid>
+
+                      <Grid Margin="0,12,0,0">
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="3*" />
+                          <ColumnDefinition Width="10" />
+                          <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <ui:TextBox Grid.Column="0" Text="{Binding EuiccActivationCode, UpdateSourceTrigger=PropertyChanged}"
+                                    PlaceholderText="LPA:1$SM-DP+地址$Matching ID" ToolTip="激活码仅通过标准输入传给本地 LPA，不写入日志" />
+                        <ui:TextBox Grid.Column="2" Text="{Binding EuiccConfirmationCode, UpdateSourceTrigger=PropertyChanged}"
+                                    PlaceholderText="确认码（如运营商要求）" />
+                      </Grid>
+
+                      <Grid Margin="0,10,0,0">
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="*" />
+                          <ColumnDefinition Width="Auto" />
+                          <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                          <TextBlock Text="{Binding EuiccQrFileName}" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                          <TextBlock Text="{Binding EuiccDownloadStatus}" Margin="0,2,12,0" TextWrapping="Wrap"
+                                     FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                        <ui:Button Grid.Column="1" Appearance="Secondary" Command="{Binding CancelEuiccDownloadCommand}"
+                                   Content="取消" Margin="0,0,8,0" />
+                        <ui:Button Grid.Column="2" Appearance="Primary" Command="{Binding DownloadEuiccProfileCommand}"
+                                   Content="验证并下载" />
+                      </Grid>
+
+                      <ProgressBar Height="4" Minimum="0" Maximum="100" Value="{Binding EuiccDownloadProgress}"
+                                   Margin="0,10,0,0" Visibility="{Binding IsEuiccDownloading, Converter={StaticResource BoolToVis}}" />
+                      <TextBlock Text="开始运营商认证后不可取消；结果不确定时会锁定该激活码，禁止直接重试。" Margin="0,6,0,0"
+                                 FontSize="10" Foreground="{DynamicResource SystemFillColorCautionBrush}" />
+                    </StackPanel>
+                  </Border>
+
+                  <!-- Profiles List -->
+                  <ListBox Grid.Row="2" ItemsSource="{Binding EuiccProfiles}" SelectedItem="{Binding SelectedProfile}" BorderThickness="0" Background="Transparent" ScrollViewer.CanContentScroll="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
+                    <ListBox.ItemTemplate>
+                      <DataTemplate>
+                        <Border Padding="12,10" Margin="0,3" CornerRadius="8" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                          <Grid>
+                            <Grid.ColumnDefinitions>
+                              <ColumnDefinition Width="*" />
+                              <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <StackPanel Grid.Column="0">
+                              <TextBlock FontWeight="Bold" FontSize="13" Text="{Binding ProfileName, Mode=OneWay}" />
+                              <TextBlock Text="{Binding ICCID, Mode=OneWay}" FontFamily="Consolas" Foreground="{DynamicResource TextFillColorSecondaryBrush}" FontSize="11" Margin="0,2,0,0" />
+                              <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                <TextBlock Text="{Binding State, Mode=OneWay}" Foreground="#16A34A" FontWeight="SemiBold" FontSize="11" Margin="0,0,12,0" />
+                                <TextBlock Text="{Binding ProviderName, Mode=OneWay}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontSize="11" />
+                              </StackPanel>
+                            </StackPanel>
+
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                              <ui:Button
+                                Margin="0,0,8,0"
+                                Appearance="Secondary"
+                                Command="{Binding DataContext.SwitchEuiccProfileCommand, RelativeSource={RelativeSource AncestorType=Page}}"
+                                CommandParameter="{Binding}"
+                                Content="启用"
+                              />
+                              <ui:Button
+                                Appearance="Secondary"
+                                Command="{Binding DataContext.DisableEuiccProfileCommand, RelativeSource={RelativeSource AncestorType=Page}}"
+                                CommandParameter="{Binding}"
+                                Content="禁用"
+                              />
+                            </StackPanel>
+                          </Grid>
+                        </Border>
+                      </DataTemplate>
+                    </ListBox.ItemTemplate>
+                  </ListBox>
+                </Grid>
+              </TabItem>
+
+              <!-- ================= TAB 4: AT 终端 (AT Terminal) ================= -->
+              <TabItem Header="AT 终端">
+                <Grid Margin="0,10,0,0">
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                  </Grid.RowDefinitions>
+
+                  <!-- Quick AT Command Buttons -->
+                  <WrapPanel Grid.Row="0" Margin="0,0,0,10">
+                    <TextBlock Text="快捷指令: " VerticalAlignment="Center" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,0" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickAtCommand}" CommandParameter="ATI" Content="ATI" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickAtCommand}" CommandParameter="AT+CSQ" Content="AT+CSQ" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickAtCommand}" CommandParameter="AT+CPIN?" Content="AT+CPIN?" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickAtCommand}" CommandParameter="AT+COPS?" Content="AT+COPS?" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickAtCommand}" CommandParameter="AT+CGDCONT?" Content="AT+CGDCONT?" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickAtCommand}" CommandParameter="AT+CFUN?" Content="AT+CFUN?" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickAtCommand}" CommandParameter="AT+QENG=&quot;servingcell&quot;" Content="ServingCell" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickAtCommand}" CommandParameter="AT+CGCONTRDP" Content="CGCONTRDP" />
+                  </WrapPanel>
+
+                  <!-- Terminal Log Screen -->
+                  <Border Grid.Row="1" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="8" Margin="0,0,0,10" Padding="8">
+                    <ListBox ItemsSource="{Binding AtLogEntries}" FontFamily="Consolas" FontSize="12" Background="Transparent" Foreground="#1E293B" BorderThickness="0" ScrollViewer.VerticalScrollBarVisibility="Visible" ScrollViewer.CanContentScroll="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" />
+                  </Border>
+
+                  <!-- Command Input Bar -->
+                  <Grid Grid.Row="2">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*" />
+                      <ColumnDefinition Width="Auto" />
+                      <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <ui:TextBox Grid.Column="0" Text="{Binding AtCommandInput, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="输入 AT 指令 (如 ATI 或 AT+CSQ)..." Margin="0,0,8,0">
+                      <ui:TextBox.InputBindings>
+                        <KeyBinding Key="Enter" Command="{Binding ExecuteAtCommandCommand}" />
+                      </ui:TextBox.InputBindings>
+                    </ui:TextBox>
+
+                    <ui:Button Grid.Column="1" Appearance="Primary" Command="{Binding ExecuteAtCommandCommand}" Content="发送" Margin="0,0,8,0" />
+                    <ui:Button Grid.Column="2" Appearance="Secondary" Command="{Binding ClearAtHistoryCommand}" Content="清空日志" />
+                  </Grid>
+                </Grid>
+              </TabItem>
+
+              <!-- ================= TAB 5: USSD 交互 (USSD Tab) ================= -->
+              <TabItem Header="USSD">
+                <Grid Margin="0,10,0,0">
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                  </Grid.RowDefinitions>
+
+                  <!-- Quick USSD Command Buttons -->
+                  <WrapPanel Grid.Row="0" Margin="0,0,0,10">
+                    <TextBlock Text="常用代码: " VerticalAlignment="Center" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,8,0" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickUssdCommand}" CommandParameter="*100#" Content="*100# (查话费)" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickUssdCommand}" CommandParameter="*101#" Content="*101# (查本机号)" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickUssdCommand}" CommandParameter="*123#" Content="*123# (服务菜单)" />
+                    <ui:Button Margin="0,0,6,6" Appearance="Secondary" Command="{Binding SendQuickUssdCommand}" CommandParameter="*#06#" Content="*#06# (IMEI)" />
+                  </WrapPanel>
+
+                  <!-- USSD Log Screen -->
+                  <Border Grid.Row="1" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="8" Margin="0,0,0,10" Padding="8">
+                    <ListBox ItemsSource="{Binding UssdLogEntries}" FontFamily="Consolas" FontSize="12" Background="Transparent" Foreground="#1E293B" BorderThickness="0" ScrollViewer.VerticalScrollBarVisibility="Visible" ScrollViewer.CanContentScroll="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" />
+                  </Border>
+
+                  <!-- USSD Input Bar -->
+                  <Grid Grid.Row="2">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*" />
+                      <ColumnDefinition Width="Auto" />
+                      <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <ui:TextBox Grid.Column="0" Text="{Binding UssdCommandInput, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="输入 USSD 代码 (例如 *100# 或菜单回复数字)..." Margin="0,0,8,0">
+                      <ui:TextBox.InputBindings>
+                        <KeyBinding Key="Enter" Command="{Binding ExecuteUssdCommand}" />
+                      </ui:TextBox.InputBindings>
+                    </ui:TextBox>
+
+                    <ui:Button Grid.Column="1" Appearance="Primary" Command="{Binding ExecuteUssdCommand}" Content="发送 USSD" Margin="0,0,8,0" />
+                    <ui:Button Grid.Column="2" Appearance="Secondary" Command="{Binding ClearUssdHistoryCommand}" Content="清空记录" />
+                  </Grid>
+                </Grid>
+              </TabItem>
+
+              <!-- ================= TAB 6: 卡槽偏好设置 (Slot Preferences) ================= -->
+              <TabItem Header="卡槽偏好">
+                <ScrollViewer Margin="0,10,0,0" VerticalScrollBarVisibility="Auto">
+                  <StackPanel>
+                    <TextBlock FontSize="13" FontWeight="SemiBold" Text="硬件与 SIM 卡偏好配置 (出站代理已全权收敛至“网络分流与代理”页面)" Margin="0,0,0,12" />
+
+                    <!-- Flight Mode Card -->
+                    <Border Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
+                      <Grid>
+                        <StackPanel>
+                          <TextBlock FontWeight="Medium" Text="飞行模式 (CFUN=4)" />
+                          <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="关闭模块蜂窝射频发射。仅使用 VoWiFi 建立连接。" />
+                        </StackPanel>
+                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding ModuleFlightMode, Mode=TwoWay}" />
+                      </Grid>
+                    </Border>
+
+                    <!-- VoWiFi Auto Card -->
+                    <Border Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
+                      <Grid>
+                        <StackPanel>
+                          <TextBlock FontWeight="Medium" Text="默认开启 VoWiFi" />
+                          <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="当检测到此模块插卡时，自动建立 IPsec 隧道。" />
+                        </StackPanel>
+                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding ModuleVoWifi, Mode=TwoWay}" />
+                      </Grid>
+                    </Border>
+
+                    <!-- Cellular Data Switch Card -->
+                    <Border Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
+                      <Grid>
+                        <StackPanel>
+                          <TextBlock FontWeight="Medium" Text="蜂窝移动数据" />
+                          <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="开启或关闭此模组的蜂窝移动数据连接 (PS 域上网业务)。" />
+                        </StackPanel>
+                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding ModuleCellularData, Mode=TwoWay}" />
+                      </Grid>
+                    </Border>
+
+                    <!-- Data Roaming Card -->
+                    <Border Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
+                      <Grid>
+                        <StackPanel>
+                          <TextBlock FontWeight="Medium" Text="数据漫游" />
+                          <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="在非归属运营商网络漫游时，允许使用蜂窝移动数据业务。" />
+                        </StackPanel>
+                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding ModuleDataRoaming, Mode=TwoWay}" />
+                      </Grid>
+                    </Border>
+
+                    <!-- SIM Card Nickname -->
+                    <Border Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,12">
+                      <Grid>
+                        <Grid.RowDefinitions>
+                          <RowDefinition Height="Auto" />
+                          <RowDefinition Height="6" />
+                          <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <StackPanel Grid.Row="0">
+                          <TextBlock FontWeight="Medium" Text="卡片别名 / 本机号码备注" />
+                          <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="如: 我的主力移动卡 (+86 138xxxx) 或 UK Giffgaff" />
+                        </StackPanel>
+                        <ui:TextBox Grid.Row="2" Text="{Binding SimCardNickname, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="输入卡片备注或电话号码..." />
+                      </Grid>
+                    </Border>
+
+                    <!-- Save All Preferences Button -->
+                    <ui:Button
+                      Appearance="Primary"
+                      Command="{Binding SaveAllPreferencesCommand}"
+                      Content="保存偏好设置至 SQLite"
+                      HorizontalAlignment="Left"
+                      Margin="0,0,0,20"
+                    />
+                  </StackPanel>
+                </ScrollViewer>
+              </TabItem>
+
+            </TabControl>
+          </Grid>
+        </Border>
+
+        <!-- Empty State for Detail Pane -->
+        <Border
+          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          BorderThickness="1"
+          CornerRadius="10"
+          Visibility="{Binding SelectedSlot, Converter={StaticResource InvertNullToVis}}"
+        >
+          <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+            <ui:SymbolIcon Symbol="Sim24" FontSize="48" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+            <TextBlock Margin="0,16,0,0" Text="请在左侧选择一个设备以查看详情" Foreground="{DynamicResource TextFillColorSecondaryBrush}" FontSize="15" FontWeight="Medium" />
+            <TextBlock Margin="0,6,0,0" Text="支持多模组并发运行与热插拔" Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontSize="12" />
+          </StackPanel>
+        </Border>
+      </Grid>
+    </Grid>
+  </Grid>
+</Page>

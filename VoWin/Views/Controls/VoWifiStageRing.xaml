@@ -1,0 +1,220 @@
+<UserControl
+  x:Class="VoWin.Views.Controls.VoWifiStageRing"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  mc:Ignorable="d"
+  d:DesignHeight="96"
+  d:DesignWidth="96"
+  Width="96"
+  Height="96"
+  ClipToBounds="False"
+>
+  <UserControl.Resources>
+    <!-- Breathing Animation for Fully Registered State (1.2s sine cycle) -->
+    <Storyboard x:Key="BreathingAnimation" RepeatBehavior="Forever" AutoReverse="True">
+      <DoubleAnimation
+        Storyboard.TargetName="CenterDotCore"
+        Storyboard.TargetProperty="Opacity"
+        From="0.45"
+        To="1.0"
+        Duration="0:0:1.2"
+      >
+        <DoubleAnimation.EasingFunction>
+          <SineEase EasingMode="EaseInOut" />
+        </DoubleAnimation.EasingFunction>
+      </DoubleAnimation>
+      <DoubleAnimation
+        Storyboard.TargetName="CenterDotHalo"
+        Storyboard.TargetProperty="Opacity"
+        From="0.1"
+        To="0.65"
+        Duration="0:0:1.2"
+      >
+        <DoubleAnimation.EasingFunction>
+          <SineEase EasingMode="EaseInOut" />
+        </DoubleAnimation.EasingFunction>
+      </DoubleAnimation>
+      <DoubleAnimation
+        Storyboard.TargetName="HaloScale"
+        Storyboard.TargetProperty="ScaleX"
+        From="0.85"
+        To="1.3"
+        Duration="0:0:1.2"
+      >
+        <DoubleAnimation.EasingFunction>
+          <SineEase EasingMode="EaseInOut" />
+        </DoubleAnimation.EasingFunction>
+      </DoubleAnimation>
+      <DoubleAnimation
+        Storyboard.TargetName="HaloScale"
+        Storyboard.TargetProperty="ScaleY"
+        From="0.85"
+        To="1.3"
+        Duration="0:0:1.2"
+      >
+        <DoubleAnimation.EasingFunction>
+          <SineEase EasingMode="EaseInOut" />
+        </DoubleAnimation.EasingFunction>
+      </DoubleAnimation>
+    </Storyboard>
+  </UserControl.Resources>
+
+  <Viewbox Stretch="Uniform" ClipToBounds="False">
+    <Grid
+      x:Name="RootRingGrid"
+      Width="92"
+      Height="92"
+      Background="Transparent"
+      RenderTransformOrigin="0.5,0.5"
+      Cursor="Hand"
+      ClipToBounds="False"
+    >
+      <Grid.RenderTransform>
+        <ScaleTransform x:Name="RootScale" ScaleX="1.0" ScaleY="1.0" />
+      </Grid.RenderTransform>
+
+      <Canvas Width="80" Height="80" HorizontalAlignment="Center" VerticalAlignment="Center" Background="Transparent" ClipToBounds="False">
+
+        <!-- ================= TRACK BACKGROUNDS (Subtle Translucent Neutral Gray) ================= -->
+        <!-- Track 1: Top-Right (Stage 1) -->
+        <Path
+          Data="M 45.21,10.46 A 30,30 0 0 1 69.54,34.79"
+          Stroke="#1A888888"
+          StrokeThickness="6"
+          StrokeStartLineCap="Round"
+          StrokeEndLineCap="Round"
+        />
+
+        <!-- Track 2: Bottom-Right (Stage 2) -->
+        <Path
+          Data="M 69.54,45.21 A 30,30 0 0 1 45.21,69.54"
+          Stroke="#1A888888"
+          StrokeThickness="6"
+          StrokeStartLineCap="Round"
+          StrokeEndLineCap="Round"
+        />
+
+        <!-- Track 3: Bottom-Left (Stage 3) -->
+        <Path
+          Data="M 34.79,69.54 A 30,30 0 0 1 10.46,45.21"
+          Stroke="#1A888888"
+          StrokeThickness="6"
+          StrokeStartLineCap="Round"
+          StrokeEndLineCap="Round"
+        />
+
+        <!-- Track 4: Top-Left (Stage 4) -->
+        <Path
+          Data="M 10.46,34.79 A 30,30 0 0 1 34.79,10.46"
+          Stroke="#1A888888"
+          StrokeThickness="6"
+          StrokeStartLineCap="Round"
+          StrokeEndLineCap="Round"
+        />
+
+        <!-- ================= ACTIVE STAGE SEGMENTS WITH HOVER MOTION ================= -->
+        <!-- Segment 1: ePDG DNS (Top-Right: Coral-Orange #F97316 on success, Red #EF4444 on unsuccess) -->
+        <Path
+          x:Name="Seg1Path"
+          Data="M 45.21,10.46 A 30,30 0 0 1 69.54,34.79"
+          Stroke="#EF4444"
+          StrokeThickness="6"
+          StrokeStartLineCap="Round"
+          StrokeEndLineCap="Round"
+          RenderTransformOrigin="0.5,0.5"
+          Cursor="Hand"
+        >
+          <Path.RenderTransform>
+            <ScaleTransform x:Name="Seg1Scale" ScaleX="1.0" ScaleY="1.0" />
+          </Path.RenderTransform>
+        </Path>
+
+        <!-- Segment 2: IKEv2 / EAP-AKA (Bottom-Right: Golden-Amber #EAB308 on success, Red #EF4444 on unsuccess) -->
+        <Path
+          x:Name="Seg2Path"
+          Data="M 69.54,45.21 A 30,30 0 0 1 45.21,69.54"
+          Stroke="#EF4444"
+          StrokeThickness="6"
+          StrokeStartLineCap="Round"
+          StrokeEndLineCap="Round"
+          RenderTransformOrigin="0.5,0.5"
+          Cursor="Hand"
+        >
+          <Path.RenderTransform>
+            <ScaleTransform x:Name="Seg2Scale" ScaleX="1.0" ScaleY="1.0" />
+          </Path.RenderTransform>
+        </Path>
+
+        <!-- Segment 3: IPsec Child SA (Bottom-Left: Lime-Green #84CC16 on success, Red #EF4444 on unsuccess) -->
+        <Path
+          x:Name="Seg3Path"
+          Data="M 34.79,69.54 A 30,30 0 0 1 10.46,45.21"
+          Stroke="#EF4444"
+          StrokeThickness="6"
+          StrokeStartLineCap="Round"
+          StrokeEndLineCap="Round"
+          RenderTransformOrigin="0.5,0.5"
+          Cursor="Hand"
+        >
+          <Path.RenderTransform>
+            <ScaleTransform x:Name="Seg3Scale" ScaleX="1.0" ScaleY="1.0" />
+          </Path.RenderTransform>
+        </Path>
+
+        <!-- Segment 4: SIP REGISTER IMS (Top-Left: Emerald-Green #22C55E on success, Red #EF4444 on unsuccess) -->
+        <Path
+          x:Name="Seg4Path"
+          Data="M 10.46,34.79 A 30,30 0 0 1 34.79,10.46"
+          Stroke="#EF4444"
+          StrokeThickness="6"
+          StrokeStartLineCap="Round"
+          StrokeEndLineCap="Round"
+          RenderTransformOrigin="0.5,0.5"
+          Cursor="Hand"
+        >
+          <Path.RenderTransform>
+            <ScaleTransform x:Name="Seg4Scale" ScaleX="1.0" ScaleY="1.0" />
+          </Path.RenderTransform>
+        </Path>
+
+        <!-- ================= CENTER DOT WITH BREATHING GREEN & HOVER EXPANSION ================= -->
+        <!-- Breathing Outer Halo (Centered at 40, 40) -->
+        <Ellipse
+          x:Name="CenterDotHalo"
+          Canvas.Left="28"
+          Canvas.Top="28"
+          Width="24"
+          Height="24"
+          Fill="#22C55E"
+          Opacity="0"
+          RenderTransformOrigin="0.5,0.5"
+          IsHitTestVisible="False"
+        >
+          <Ellipse.RenderTransform>
+            <ScaleTransform x:Name="HaloScale" ScaleX="1.0" ScaleY="1.0" />
+          </Ellipse.RenderTransform>
+        </Ellipse>
+
+        <!-- Center Dot Core (Centered at 40, 40, Diameter 14) -->
+        <Ellipse
+          x:Name="CenterDotCore"
+          Canvas.Left="33"
+          Canvas.Top="33"
+          Width="14"
+          Height="14"
+          Fill="#EF4444"
+          Opacity="0.85"
+          RenderTransformOrigin="0.5,0.5"
+          Cursor="Hand"
+        >
+          <Ellipse.RenderTransform>
+            <ScaleTransform x:Name="CenterDotScale" ScaleX="1.0" ScaleY="1.0" />
+          </Ellipse.RenderTransform>
+        </Ellipse>
+
+      </Canvas>
+    </Grid>
+  </Viewbox>
+</UserControl>

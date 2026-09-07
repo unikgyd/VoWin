@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\VoSharp.Common\VoSharp.Common.csproj" />
+    <ProjectReference Include="..\VoSharp.Modem\VoSharp.Modem.csproj" />
+    <ProjectReference Include="..\VoSharp.Crypto\VoSharp.Crypto.csproj" />
+    <ProjectReference Include="..\VoSharp.Sip\VoSharp.Sip.csproj" />
+    <ProjectReference Include="..\VoSharp.Sim\VoSharp.Sim.csproj" />
+    <ProjectReference Include="..\VoSharp.Native\VoSharp.Native.csproj" />
+    <ProjectReference Include="..\VoSharp.Ike\VoSharp.Ike.csproj" />
+    <ProjectReference Include="..\VoSharp.Ipsec\VoSharp.Ipsec.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\native\amd64\opencore-amr.dll" Link="Native\opencore-amr.dll" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

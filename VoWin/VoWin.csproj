@@ -1,0 +1,66 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>vowin.ico</ApplicationIcon>
+    <UseWPF>true</UseWPF>
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- Framework-dependent single-file build: the host supplies .NET Desktop Runtime. -->
+    <SelfContained>false</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="vowin.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.11" />
+    <PackageReference Include="NAudio" Version="3.0.1" />
+    <PackageReference Include="WPF-UI" Version="4.2.0" />
+    <PackageReference Include="WPF-UI.DependencyInjection" Version="4.2.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.1" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0 " />
+    <PackageReference Include="ZXing.Net" Version="0.16.11" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\voSharp\src\VoSharp.Kernel\VoSharp.Kernel.csproj" />
+  </ItemGroup>
+
+  <!-- Old releases placed the removed Go LPA helper in the normal output folder.
+       Remove it before build/publish so incremental builds cannot ship a stale copy. -->
+  <Target Name="RemoveLegacyEuiccLpaWorker" BeforeTargets="Build;Publish">
+    <Delete Files="$(OutputPath)native\VoSharp.EuiccLpaWorker.exe;$(OutputPath)native\VoSharp.EuiccLpaWorker.LICENSE.txt;$(PublishDir)native\VoSharp.EuiccLpaWorker.exe;$(PublishDir)native\VoSharp.EuiccLpaWorker.LICENSE.txt" />
+  </Target>
+
+  <Target Name="RemoveSingleFileSymbols" AfterTargets="Publish" Condition="'$(PublishSingleFile)' == 'true'">
+    <ItemGroup>
+      <SingleFileSymbols Include="$(PublishDir)*.pdb" />
+    </ItemGroup>
+    <Delete Files="@(SingleFileSymbols)" />
+  </Target>
+
+
+  <ItemGroup>
+    <None Remove="Assets\*.png" />
+    <None Remove="Assets\*.jpg" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\*.png" />
+    <Resource Include="Assets\*.jpg" />
+    <Content Include="Assets\*.jpg">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

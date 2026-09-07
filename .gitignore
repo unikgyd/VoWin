@@ -1,0 +1,36 @@
+﻿# Visual Studio / Visual Studio Code / Rider
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.Backup*.tmp
+
+# Build Results & Intermediate Files
+[Bb]in/
+[Oo]bj/
+[Pp]ublish/
+[Oo]ut/
+*.pdb
+*.tmp
+
+# SQLite & Runtime Storage
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Runtime Logs and Audio Recordings
+*.log
+*.wav
+*.amr
+
+# OS Specific
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Locally cloned upstream source used only to build the bundled AMR native DLL
+voSharp/src/VoSharp.Native/opencore-amr/
