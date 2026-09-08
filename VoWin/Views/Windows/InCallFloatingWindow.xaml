@@ -30,8 +30,8 @@
 
   <Border
     Margin="8"
-    Background="#EB181A26"
-    BorderBrush="#4010B981"
+    Background="{DynamicResource AppFloatingSurfaceBrush}"
+    BorderBrush="{DynamicResource AppSuccessBrush}"
     BorderThickness="1.2"
     CornerRadius="30"
     Effect="{StaticResource FloatingShadow}"
@@ -52,14 +52,14 @@
         Width="38"
         Height="38"
         VerticalAlignment="Center"
-        Background="#2210B981"
-        BorderBrush="#10B981"
+        Background="{DynamicResource AppFloatingSuccessSoftBrush}"
+        BorderBrush="{DynamicResource AppSuccessBrush}"
         BorderThickness="1.2"
         CornerRadius="19"
       >
         <ui:SymbolIcon
           FontSize="18"
-          Foreground="#10B981"
+          Foreground="{DynamicResource AppSuccessBrush}"
           Symbol="Call24"
         />
       </Border>
@@ -74,7 +74,7 @@
           x:Name="TxtNumber"
           FontSize="14"
           FontWeight="SemiBold"
-          Foreground="#FFFFFF"
+          Foreground="{DynamicResource AppFloatingTextPrimaryBrush}"
           Text="10086"
           TextTrimming="CharacterEllipsis"
         />
@@ -83,7 +83,7 @@
             Width="6"
             Height="6"
             CornerRadius="3"
-            Background="#10B981"
+            Background="{DynamicResource AppSuccessBrush}"
             VerticalAlignment="Center"
             Margin="0,0,5,0"
           />
@@ -91,13 +91,13 @@
             x:Name="TxtDuration"
             FontSize="11"
             FontWeight="Medium"
-            Foreground="#34D399"
+            Foreground="{DynamicResource AppSuccessBrush}"
             Text="00:00"
           />
           <TextBlock
             x:Name="TxtSlot"
             FontSize="11"
-            Foreground="#9CA3AF"
+            Foreground="{DynamicResource AppFloatingTextTertiaryBrush}"
             Margin="6,0,0,0"
             Text="· SIM 1"
           />
@@ -140,7 +140,7 @@
           x:Name="BtnHangup"
           Width="34"
           Height="34"
-          Background="#EF4444"
+          Background="{DynamicResource AppDangerBrush}"
           BorderThickness="0"
           Click="BtnHangup_Click"
           Cursor="Hand"

@@ -13,14 +13,14 @@
   d:DesignHeight="450"
   d:DesignWidth="800"
   ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
-  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
-  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  ui:Design.Foreground="{DynamicResource AppTextPrimaryBrush}"
+  Foreground="{DynamicResource AppTextPrimaryBrush}"
   ScrollViewer.CanContentScroll="False"
   mc:Ignorable="d"
 >
   <Grid>
     <ui:VirtualizingItemsControl
-      Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+      Foreground="{DynamicResource AppTextSecondaryBrush}"
       ItemsSource="{Binding ViewModel.Colors, Mode=OneWay}"
       VirtualizingPanel.CacheLengthUnit="Item"
     >

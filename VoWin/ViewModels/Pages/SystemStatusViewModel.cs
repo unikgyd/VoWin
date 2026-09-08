@@ -2,6 +2,7 @@ using System;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -37,30 +38,16 @@ namespace VoWin.ViewModels.Pages
         private int _refreshNotificationScheduled;
 
         // UI Design Token Colors (Frozen for performance & thread safety)
-        public static readonly Brush TokenPrimary = new SolidColorBrush(Color.FromRgb(0x25, 0x63, 0xEB));   // #2563EB 进行中 / 强调
-        public static readonly Brush TokenPrimaryBg = new SolidColorBrush(Color.FromArgb(0x1E, 0x25, 0x63, 0xEB));
-        public static readonly Brush TokenSuccess = new SolidColorBrush(Color.FromRgb(0x16, 0xA3, 0x4A));   // #16A34A 成功 / 已就绪
-        public static readonly Brush TokenSuccessBg = new SolidColorBrush(Color.FromArgb(0x1E, 0x16, 0xA3, 0x4A));
-        public static readonly Brush TokenWarning = new SolidColorBrush(Color.FromRgb(0xF5, 0x9E, 0x0B));   // #F59E0B 警告 / 关注
-        public static readonly Brush TokenWarningBg = new SolidColorBrush(Color.FromArgb(0x1E, 0xF5, 0x9E, 0x0B));
-        public static readonly Brush TokenDanger = new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26));    // #DC2626 失败 / 错误
-        public static readonly Brush TokenDangerBg = new SolidColorBrush(Color.FromArgb(0x1E, 0xDC, 0x26, 0x26));
-        public static readonly Brush TokenMuted = new SolidColorBrush(Color.FromRgb(0x9C, 0xA3, 0xAF));     // #9CA3AF 等待 / 离线
-        public static readonly Brush TokenMutedBg = new SolidColorBrush(Color.FromArgb(0x14, 0x9C, 0xA3, 0xAF));
-
-        static SystemStatusViewModel()
-        {
-            TokenPrimary.Freeze();
-            TokenPrimaryBg.Freeze();
-            TokenSuccess.Freeze();
-            TokenSuccessBg.Freeze();
-            TokenWarning.Freeze();
-            TokenWarningBg.Freeze();
-            TokenDanger.Freeze();
-            TokenDangerBg.Freeze();
-            TokenMuted.Freeze();
-            TokenMutedBg.Freeze();
-        }
+        public static Brush TokenPrimary => ThemeBrushes.Accent;
+        public static Brush TokenPrimaryBg => ThemeBrushes.Get("AppAccentSoftBrush", Color.FromRgb(0xE7, 0xF0, 0xFF));
+        public static Brush TokenSuccess => ThemeBrushes.Success;
+        public static Brush TokenSuccessBg => ThemeBrushes.Get("AppSuccessSoftBrush", Color.FromRgb(0xE7, 0xF8, 0xF2));
+        public static Brush TokenWarning => ThemeBrushes.Warning;
+        public static Brush TokenWarningBg => ThemeBrushes.Get("AppWarningSoftBrush", Color.FromRgb(0xFF, 0xF5, 0xE6));
+        public static Brush TokenDanger => ThemeBrushes.Danger;
+        public static Brush TokenDangerBg => ThemeBrushes.Get("AppDangerSoftBrush", Color.FromRgb(0xFF, 0xF0, 0xF3));
+        public static Brush TokenMuted => ThemeBrushes.Muted;
+        public static Brush TokenMutedBg => ThemeBrushes.Get("AppInputBrush", Color.FromRgb(0xF8, 0xFB, 0xFF));
 
         public SystemStatusViewModel ViewModel => this;
         public ObservableCollection<LogEntryModel> Logs => _kernelService.Logs;
@@ -91,9 +78,9 @@ namespace VoWin.ViewModels.Pages
         private string _logSearchText = string.Empty;
 
         public TelephonyState StateMachineState => _kernelService.StateMachineState;
-        public SignalQuality? CurrentSignal => SelectedSlot?.Signal ?? _kernelService.CurrentSignal;
-        public NetworkRegistration? CurrentRegistration => SelectedSlot?.Registration ?? _kernelService.CurrentRegistration;
-        public SimIdentity? CurrentSim => SelectedSlot?.Sim ?? _kernelService.CurrentSim;
+        public SignalQuality? CurrentSignal => SelectedSlot != null ? SelectedSlot.Signal : _kernelService.CurrentSignal;
+        public NetworkRegistration? CurrentRegistration => SelectedSlot != null ? SelectedSlot.Registration : _kernelService.CurrentRegistration;
+        public SimIdentity? CurrentSim => SelectedSlot != null ? SelectedSlot.Sim : _kernelService.CurrentSim;
         public VoWifiDiagnosticInfo? VoWifiDiag
         {
             get
@@ -154,13 +141,36 @@ namespace VoWin.ViewModels.Pages
         public string Plmn =>
             !string.IsNullOrWhiteSpace(CurrentSim?.Mcc) ? $"{CurrentSim.Mcc}-{CurrentSim.Mnc}" : "--";
 
-        public string Rat => CurrentSignal?.Rat ?? "LTE (4G)";
+        public string Rat => SelectedSlot?.IsFlightMode == true ? "射频关闭" : (CurrentSignal?.Rat ?? "--");
 
-        public string RegStatus => CurrentRegistration?.StatusDisplay ?? "已在网 (归属地)";
+        public string RegStatus => SelectedSlot?.IsFlightMode == true
+            ? "飞行模式（未搜索网络）"
+            : (CurrentRegistration?.StatusDisplay ?? "网络状态未知");
 
         public string Imsi => CurrentSim?.Imsi ?? "--";
 
         public string Iccid => !string.IsNullOrWhiteSpace(CurrentSim?.Iccid) ? CurrentSim.Iccid : "--";
+
+        public string CardNicknameDisplay => !string.IsNullOrWhiteSpace(SelectedSlot?.CardNickname)
+            ? SelectedSlot.CardNickname
+            : "未设置";
+
+        public string PhoneNumber
+        {
+            get
+            {
+                if (!string.IsNullOrWhiteSpace(CurrentSim?.PhoneNumber))
+                    return CurrentSim.PhoneNumber;
+
+                return ExtractPhoneNumber(VoWifiDiag?.Ims?.PAssociatedUri) ?? "未提供";
+            }
+        }
+
+        public string PhoneNumberDetail => !string.IsNullOrWhiteSpace(CurrentSim?.PhoneNumber)
+            ? "SIM 卡内置号码（AT+CNUM）"
+            : ExtractPhoneNumber(VoWifiDiag?.Ims?.PAssociatedUri) != null
+                ? "IMS 网络返回号码"
+                : "卡片未写入 MSISDN；数据卡常见";
 
         public string CardProfileDisplay => CarrierDisplayHelper.GetCardProfileDisplay(CurrentSim);
 
@@ -215,6 +225,17 @@ namespace VoWin.ViewModels.Pages
         };
 
         public string SimCardStatusText => !string.IsNullOrWhiteSpace(CurrentSim?.Imsi) ? "SIM 卡就绪" : "未插卡";
+
+        private static string? ExtractPhoneNumber(string? associatedUri)
+        {
+            if (string.IsNullOrWhiteSpace(associatedUri)) return null;
+
+            var match = Regex.Match(
+                associatedUri,
+                @"(?:tel:|sip:)(?<number>\+?[0-9]{5,15})(?:@|[;>,]|$)",
+                RegexOptions.IgnoreCase);
+            return match.Success ? match.Groups["number"].Value : null;
+        }
 
         // ================= 4-Stage State Machine Logic =================
         public bool Stage1Success =>
@@ -575,6 +596,7 @@ namespace VoWin.ViewModels.Pages
             _kernelService.Kernel.SignalQualityChanged += (s, e) => NotifyAll();
             _kernelService.Kernel.NetworkRegistrationChanged += (s, e) => NotifyAll();
             _kernelService.Kernel.SimStateChanged += (s, e) => NotifyAll();
+            _kernelService.Kernel.FlightModeChanged += (s, e) => NotifyAll();
 
             // 1-second live heartbeat tick for real-time probe telemetry
             _heartbeatTimer = new System.Windows.Threading.DispatcherTimer

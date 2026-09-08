@@ -822,6 +822,9 @@ public class VoKernel : IVoKernel
 
     public async Task<bool> SwitchEuiccProfileAsync(string iccidOrAid, bool refresh = true, CancellationToken ct = default)
     {
+        if (Pool.ActiveSlot != null)
+            return await Pool.ActiveSlot.SwitchEuiccProfileAsync(iccidOrAid, refresh, ct).ConfigureAwait(false);
+
         var mgr = await GetOrCreateEuiccManagerAsync(ct).ConfigureAwait(false);
         await mgr.SwitchProfileAsync(iccidOrAid, refresh, ct).ConfigureAwait(false);
         return true;
@@ -852,13 +855,15 @@ public class VoKernel : IVoKernel
         string activationCode,
         string? confirmationCode = null,
         IProgress<EuiccDownloadProgress>? progress = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool allowUntrustedTls = false,
+        bool allowRetryAfterUncertain = false)
     {
         var mgr = await GetOrCreateEuiccManagerAsync(ct).ConfigureAwait(false);
         var imei = Modem is null ? null : await Modem.GetImeiAsync(ct).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(imei))
             throw new InvalidOperationException("尚未读取到模组 IMEI，无法下载 eSIM Profile。");
-        return await mgr.DownloadProfileAsync(activationCode, imei, confirmationCode, progress, ct).ConfigureAwait(false);
+        return await mgr.DownloadProfileAsync(activationCode, imei, confirmationCode, progress, ct, allowUntrustedTls, allowRetryAfterUncertain).ConfigureAwait(false);
     }
 
     // ── Direct Metrics & Telemetry Operations ────────────────────────────────

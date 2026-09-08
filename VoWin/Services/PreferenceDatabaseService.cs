@@ -1,6 +1,7 @@
 using System.IO;
 using Microsoft.Data.Sqlite;
 using VoSharp.Telephony.Calls;
+using VoWin.Helpers;
 using VoWin.Models;
 
 namespace VoWin.Services
@@ -140,11 +141,80 @@ namespace VoWin.Services
                 }
                 catch { }
 
+                await NormalizeStoredTimestampsAsync(conn);
+
                 _isInitialized = true;
             }
             finally
             {
                 _lock.Release();
+            }
+        }
+
+        private static async Task NormalizeStoredTimestampsAsync(SqliteConnection conn)
+        {
+            var smsCorrections = new List<(string Id, DateTime TimestampUtc)>();
+            var receivedAtUtc = DateTime.UtcNow;
+
+            using (var select = new SqliteCommand(
+                "SELECT Id, Timestamp, IsOutgoing FROM SmsMessages;", conn))
+            using (var reader = await select.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                {
+                    var storedText = reader.GetString(1);
+                    if (!TimestampDisplayHelper.TryParseStoredUtc(storedText, out var storedUtc))
+                    {
+                        continue;
+                    }
+
+                    var normalized = reader.GetInt32(2) == 0
+                        ? TimestampDisplayHelper.NormalizeIncomingNetworkTime(storedUtc, receivedAtUtc)
+                        : storedUtc;
+                    var normalizedText = normalized.ToString("o", System.Globalization.CultureInfo.InvariantCulture);
+                    if (!string.Equals(storedText, normalizedText, StringComparison.Ordinal))
+                    {
+                        smsCorrections.Add((reader.GetString(0), normalized));
+                    }
+                }
+            }
+
+            foreach (var (id, timestampUtc) in smsCorrections)
+            {
+                using var update = new SqliteCommand(
+                    "UPDATE SmsMessages SET Timestamp = @time WHERE Id = @id;", conn);
+                update.Parameters.AddWithValue("@time", timestampUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture));
+                update.Parameters.AddWithValue("@id", id);
+                await update.ExecuteNonQueryAsync();
+            }
+
+            var callCorrections = new List<(string Id, DateTime TimestampUtc)>();
+            using (var select = new SqliteCommand("SELECT Id, Timestamp FROM CallRecords;", conn))
+            using (var reader = await select.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                {
+                    var storedText = reader.GetString(1);
+                    if (!TimestampDisplayHelper.TryParseStoredUtc(storedText, out var timestampUtc))
+                    {
+                        continue;
+                    }
+
+                    var normalizedText = timestampUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture);
+                    if (!string.Equals(storedText, normalizedText, StringComparison.Ordinal))
+                    {
+                        callCorrections.Add((reader.GetString(0), timestampUtc));
+                    }
+                }
+            }
+
+            foreach (var (id, timestampUtc) in callCorrections)
+            {
+                using var update = new SqliteCommand(
+                    "UPDATE CallRecords SET Timestamp = @time WHERE Id = @id;", conn);
+                update.Parameters.AddWithValue("@time", timestampUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture));
+                update.Parameters.AddWithValue("@id", id);
+                await update.ExecuteNonQueryAsync();
             }
         }
 
@@ -161,6 +231,11 @@ namespace VoWin.Services
                     SELECT Id, Imei, PortName, CustomName, DefaultFlightMode, DefaultVoWifi, DefaultCellularData, DefaultDataRoaming, DefaultProxyUrl, BaudRate, LastSeenAt
                     FROM ModulePreferences
                     WHERE Id = @id OR (@imei IS NOT NULL AND Imei = @imei) OR PortName = @id
+                    ORDER BY CASE
+                        WHEN Id = @id THEN 0
+                        WHEN @imei IS NOT NULL AND Imei = @imei THEN 1
+                        ELSE 2
+                    END, LastSeenAt DESC
                     LIMIT 1;
                 ";
 
@@ -434,7 +509,7 @@ namespace VoWin.Services
                 cmd.Parameters.AddWithValue("@name", (object?)record.DisplayName ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@dir", (int)record.Direction);
                 cmd.Parameters.AddWithValue("@state", (int)record.FinalState);
-                cmd.Parameters.AddWithValue("@time", record.Timestamp.ToString("o"));
+                cmd.Parameters.AddWithValue("@time", TimestampDisplayHelper.ToUtcStorageTime(record.Timestamp).ToString("o", System.Globalization.CultureInfo.InvariantCulture));
                 cmd.Parameters.AddWithValue("@duration", record.Duration.TotalSeconds);
                 cmd.Parameters.AddWithValue("@codec", (object?)record.Codec ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@slot", (object?)record.SlotId ?? DBNull.Value);
@@ -467,7 +542,7 @@ namespace VoWin.Services
                         DisplayName = reader.IsDBNull(2) ? null : reader.GetString(2),
                         Direction = (CallDirection)reader.GetInt32(3),
                         FinalState = (CallState)reader.GetInt32(4),
-                        Timestamp = DateTime.TryParse(reader.GetString(5), null, System.Globalization.DateTimeStyles.RoundtripKind, out var dt) ? dt.ToLocalTime() : DateTime.Now,
+                        Timestamp = TimestampDisplayHelper.TryParseStoredUtc(reader.GetString(5), out var dt) ? dt : DateTime.UtcNow,
                         Duration = TimeSpan.FromSeconds(reader.GetDouble(6)),
                         Codec = reader.IsDBNull(7) ? null : reader.GetString(7),
                         SlotId = reader.IsDBNull(8) ? null : reader.GetString(8),
@@ -537,7 +612,7 @@ namespace VoWin.Services
                 cmd.Parameters.AddWithValue("@id", message.Id);
                 cmd.Parameters.AddWithValue("@remote", message.SenderOrRecipient);
                 cmd.Parameters.AddWithValue("@text", message.Text);
-                cmd.Parameters.AddWithValue("@time", message.Timestamp.ToString("o"));
+                cmd.Parameters.AddWithValue("@time", TimestampDisplayHelper.ToUtcStorageTime(message.Timestamp).ToString("o", System.Globalization.CultureInfo.InvariantCulture));
                 cmd.Parameters.AddWithValue("@outgoing", message.IsOutgoing ? 1 : 0);
                 cmd.Parameters.AddWithValue("@state", (int)message.DeliveryState);
                 cmd.Parameters.AddWithValue("@status", (object?)message.DeliveryStatus ?? DBNull.Value);
@@ -569,7 +644,7 @@ namespace VoWin.Services
                         Id = reader.GetString(0),
                         SenderOrRecipient = reader.GetString(1),
                         Text = reader.GetString(2),
-                        Timestamp = DateTime.TryParse(reader.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind, out var dt) ? dt.ToLocalTime() : DateTime.Now,
+                        Timestamp = TimestampDisplayHelper.TryParseStoredUtc(reader.GetString(3), out var dt) ? dt : DateTime.UtcNow,
                         IsOutgoing = reader.GetInt32(4) == 1,
                         DeliveryState = (SmsDeliveryState)reader.GetInt32(5),
                         DeliveryStatus = reader.IsDBNull(6) ? null : reader.GetString(6),
@@ -604,7 +679,7 @@ namespace VoWin.Services
                         Id = reader.GetString(0),
                         SenderOrRecipient = reader.GetString(1),
                         Text = reader.GetString(2),
-                        Timestamp = DateTime.TryParse(reader.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind, out var dt) ? dt.ToLocalTime() : DateTime.Now,
+                        Timestamp = TimestampDisplayHelper.TryParseStoredUtc(reader.GetString(3), out var dt) ? dt : DateTime.UtcNow,
                         IsOutgoing = reader.GetInt32(4) == 1,
                         DeliveryState = (SmsDeliveryState)reader.GetInt32(5),
                         DeliveryStatus = reader.IsDBNull(6) ? null : reader.GetString(6),
@@ -719,9 +794,9 @@ namespace VoWin.Services
                 using var reader = await cmd.ExecuteReaderAsync();
                 while (await reader.ReadAsync())
                 {
-                    if (DateTime.TryParse(reader.GetString(0), null, System.Globalization.DateTimeStyles.RoundtripKind, out var dbTime))
+                    if (TimestampDisplayHelper.TryParseStoredUtc(reader.GetString(0), out var dbTime))
                     {
-                        if (Math.Abs((dbTime.ToUniversalTime() - timestamp.ToUniversalTime()).TotalSeconds) <= 60)
+                        if (Math.Abs((dbTime - TimestampDisplayHelper.ToUtcStorageTime(timestamp)).TotalSeconds) <= 60)
                             return true;
                     }
                     else

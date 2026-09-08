@@ -12,8 +12,8 @@
   d:DesignHeight="720"
   d:DesignWidth="1100"
   ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
-  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
-  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  ui:Design.Foreground="{DynamicResource AppTextPrimaryBrush}"
+  Foreground="{DynamicResource AppTextPrimaryBrush}"
   mc:Ignorable="d"
 >
   <Page.Resources>
@@ -36,7 +36,10 @@
         <ColumnDefinition Width="Auto" />
       </Grid.ColumnDefinitions>
 
-      <TextBlock Grid.Column="0" FontSize="24" FontWeight="SemiBold" VerticalAlignment="Center" Text="代理分流" />
+      <StackPanel Grid.Column="0" VerticalAlignment="Center">
+        <TextBlock Style="{DynamicResource AppPageTitleStyle}" Text="代理分流" />
+        <TextBlock Style="{DynamicResource AppPageSubtitleStyle}" Text="按国家、号码与节点状态智能选择网络路径" />
+      </StackPanel>
 
       <ui:Button
         Grid.Column="1"
@@ -53,8 +56,8 @@
       Grid.Row="1"
       Margin="0,0,0,12"
       Padding="14,8"
-      Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+      Background="{DynamicResource AppCardBrush}"
+      BorderBrush="{DynamicResource AppCardBorderBrush}"
       BorderThickness="1"
       CornerRadius="8"
     >
@@ -67,9 +70,9 @@
           <ColumnDefinition Width="Auto" />
           <ColumnDefinition Width="*" />
         </Grid.ColumnDefinitions>
-        <ui:SymbolIcon Grid.Column="0" Symbol="Info24" FontSize="15" Margin="0,0,10,0" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Visibility="{Binding IsTesting, Converter={StaticResource InvertBoolToVis}}" />
+        <ui:SymbolIcon Grid.Column="0" Symbol="Info24" FontSize="15" Margin="0,0,10,0" Foreground="{DynamicResource AppAccentBrush}" Visibility="{Binding IsTesting, Converter={StaticResource InvertBoolToVis}}" />
         <ui:ProgressRing Grid.Column="1" Width="15" Height="15" Margin="0,0,10,0" IsIndeterminate="True" Visibility="{Binding IsTesting, Converter={StaticResource BoolToVis}}" />
-        <TextBlock Grid.Column="2" VerticalAlignment="Center" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding StatusMessage, Mode=OneWay}" />
+        <TextBlock Grid.Column="2" VerticalAlignment="Center" FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding StatusMessage, Mode=OneWay}" />
       </Grid>
     </Border>
 
@@ -88,8 +91,8 @@
           <Border
             Grid.Row="0"
             Margin="0,0,0,12"
-            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            Background="{DynamicResource AppCardBrush}"
+            BorderBrush="{DynamicResource AppCardBorderBrush}"
             BorderThickness="1"
             CornerRadius="12"
             Padding="16,14"
@@ -111,10 +114,10 @@
                   <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                  <ui:SymbolIcon Symbol="GlobeSearch24" Foreground="{DynamicResource AccentFillColorDefaultBrush}" FontSize="18" Margin="0,0,8,0" />
+                  <ui:SymbolIcon Symbol="GlobeSearch24" Foreground="{DynamicResource AppAccentBrush}" FontSize="18" Margin="0,0,8,0" />
                   <TextBlock Text="添加国家 / 地区出站分流规则" FontWeight="SemiBold" FontSize="14" VerticalAlignment="Center" />
                 </StackPanel>
-                <TextBlock Grid.Column="1" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Text="自动关联电信 MCC 编码 · 即刻生效" VerticalAlignment="Center" />
+                <TextBlock Grid.Column="1" FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Text="自动关联电信 MCC 编码 · 即刻生效" VerticalAlignment="Center" />
               </Grid>
 
               <!-- Search & Select Row -->
@@ -146,11 +149,11 @@
                             <ColumnDefinition Width="Auto" />
                           </Grid.ColumnDefinitions>
                           <TextBlock Grid.Column="0" Text="{Binding Flag}" FontSize="18" VerticalAlignment="Center" />
-                          <TextBlock Grid.Column="1" Text="{Binding Name}" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource TextFillColorPrimaryBrush}" VerticalAlignment="Center" Margin="4,0,8,0" />
-                          <Border Grid.Column="2" Padding="6,1" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="4" VerticalAlignment="Center">
-                            <TextBlock Text="{Binding Code}" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" />
+                          <TextBlock Grid.Column="1" Text="{Binding Name}" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource AppTextPrimaryBrush}" VerticalAlignment="Center" Margin="4,0,8,0" />
+                          <Border Grid.Column="2" Padding="6,1" Background="{DynamicResource AppInputBrush}" CornerRadius="4" VerticalAlignment="Center">
+                            <TextBlock Text="{Binding Code}" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource AppAccentBrush}" />
                           </Border>
-                          <TextBlock Grid.Column="3" Text="{Binding MccSummary}" Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontSize="11" Margin="8,0,0,0" VerticalAlignment="Center" />
+                          <TextBlock Grid.Column="3" Text="{Binding MccSummary}" Foreground="{DynamicResource AppTextTertiaryBrush}" FontSize="11" Margin="8,0,0,0" VerticalAlignment="Center" />
                         </Grid>
                       </DataTemplate>
                     </ComboBox.ItemTemplate>
@@ -184,7 +187,7 @@
                 Grid.Row="2"
                 Margin="2,8,0,0"
                 FontSize="11"
-                Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                Foreground="{DynamicResource AppAccentBrush}"
                 Text="{Binding QuickAddHintText, Mode=OneWay}"
                 TextTrimming="CharacterEllipsis"
               />
@@ -194,8 +197,8 @@
           <!-- Middle: Rules List Card -->
           <Border
             Grid.Row="1"
-            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            Background="{DynamicResource AppCardBrush}"
+            BorderBrush="{DynamicResource AppCardBorderBrush}"
             BorderThickness="1"
             CornerRadius="12"
             Padding="16"
@@ -218,7 +221,7 @@
                   <ColumnDefinition Width="240" />
                 </Grid.ColumnDefinitions>
 
-                <TextBlock Grid.Column="0" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextFillColorPrimaryBrush}" VerticalAlignment="Center" Text="国家 / 地区分流策略映射表" />
+                <TextBlock Grid.Column="0" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource AppTextPrimaryBrush}" VerticalAlignment="Center" Text="国家 / 地区分流策略映射表" />
 
                 <Border
                   Grid.Column="1"
@@ -230,7 +233,7 @@
                   CornerRadius="4"
                   VerticalAlignment="Center"
                 >
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding RulesSummaryText}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding RulesSummaryText}" />
                 </Border>
 
                 <!-- Filter Search Box for existing rules -->
@@ -267,9 +270,9 @@
                         <ControlTemplate TargetType="ListViewItem">
                           <Border
                             x:Name="ItemBorder"
-                            Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                            Background="{DynamicResource AppInputBrush}"
                             BorderThickness="1"
-                            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                            BorderBrush="{DynamicResource AppCardBorderBrush}"
                             CornerRadius="8"
                             Padding="12,10"
                           >
@@ -285,7 +288,7 @@
                             </Trigger>
                             <Trigger Property="IsSelected" Value="True">
                               <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource SubtleFillColorTertiaryBrush}" />
-                              <Setter TargetName="ItemBorder" Property="BorderBrush" Value="{DynamicResource AccentFillColorDefaultBrush}" />
+                              <Setter TargetName="ItemBorder" Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" />
                             </Trigger>
                           </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -309,12 +312,12 @@
                       <!-- Country Info & MCC -->
                       <StackPanel Grid.Column="1" VerticalAlignment="Center">
                         <StackPanel Orientation="Horizontal">
-                          <TextBlock FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextFillColorPrimaryBrush}" Text="{Binding CountryName, Mode=OneWay}" />
-                          <Border Margin="8,0,0,0" Padding="6,1" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="4" VerticalAlignment="Center">
-                            <TextBlock Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" FontWeight="Bold" FontSize="10" Text="{Binding CountryCode, Mode=OneWay}" />
+                          <TextBlock FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource AppTextPrimaryBrush}" Text="{Binding CountryName, Mode=OneWay}" />
+                          <Border Margin="8,0,0,0" Padding="6,1" Background="{DynamicResource AppInputBrush}" CornerRadius="4" VerticalAlignment="Center">
+                            <TextBlock Foreground="{DynamicResource AppAccentBrush}" FontWeight="Bold" FontSize="10" Text="{Binding CountryCode, Mode=OneWay}" />
                           </Border>
                         </StackPanel>
-                        <TextBlock Foreground="{DynamicResource TextFillColorTertiaryBrush}" FontSize="11" Margin="0,3,0,0" Text="{Binding MccDisplay, Mode=OneWay}" />
+                        <TextBlock Foreground="{DynamicResource AppTextTertiaryBrush}" FontSize="11" Margin="0,3,0,0" Text="{Binding MccDisplay, Mode=OneWay}" />
                       </StackPanel>
 
                       <!-- Egress Result Badge (Neutral for DIRECT, Emerald for Proxy) -->
@@ -328,8 +331,8 @@
                       >
                         <Border.Style>
                           <Style TargetType="Border">
-                            <Setter Property="Background" Value="#1F10B981" />
-                            <Setter Property="BorderBrush" Value="#4D10B981" />
+                            <Setter Property="Background" Value="{DynamicResource AppSuccessSoftBrush}" />
+                            <Setter Property="BorderBrush" Value="{DynamicResource AppSuccessBrush}" />
                             <Style.Triggers>
                               <DataTrigger Binding="{Binding IsDirect}" Value="True">
                                 <Setter Property="Background" Value="{DynamicResource ControlFillColorDefaultBrush}" />
@@ -341,11 +344,11 @@
                         <TextBlock FontSize="12" FontWeight="Medium">
                           <TextBlock.Style>
                             <Style TargetType="TextBlock">
-                              <Setter Property="Foreground" Value="#10B981" />
+                              <Setter Property="Foreground" Value="{DynamicResource AppSuccessBrush}" />
                               <Setter Property="Text" Value="{Binding ProxyNodeName, Mode=OneWay, StringFormat='代理 · {0}'}" />
                               <Style.Triggers>
                                 <DataTrigger Binding="{Binding IsDirect}" Value="True">
-                                  <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
+                                  <Setter Property="Foreground" Value="{DynamicResource AppTextSecondaryBrush}" />
                                   <Setter Property="Text" Value="直连 (DIRECT)" />
                                 </DataTrigger>
                               </Style.Triggers>
@@ -372,7 +375,7 @@
                         <ui:Button
                           Appearance="Transparent"
                           Padding="6,5"
-                          Foreground="#DC2626"
+                          Foreground="{DynamicResource AppDangerBrush}"
                           Command="{Binding DataContext.DeleteCountryRuleCommand, RelativeSource={RelativeSource AncestorType=ListView}}"
                           CommandParameter="{Binding}"
                           Icon="{ui:SymbolIcon Symbol=Delete24}"
@@ -400,8 +403,8 @@
           <!-- Left: Presets List -->
           <Border
             Grid.Column="0"
-            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            Background="{DynamicResource AppCardBrush}"
+            BorderBrush="{DynamicResource AppCardBorderBrush}"
             BorderThickness="1"
             CornerRadius="12"
             Padding="14"
@@ -421,9 +424,9 @@
                   <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
 
-                <TextBlock Grid.Column="0" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextFillColorPrimaryBrush}" VerticalAlignment="Center" Text="已登记的 SOCKS5 / HTTP 代理节点" />
+                <TextBlock Grid.Column="0" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource AppTextPrimaryBrush}" VerticalAlignment="Center" Text="已登记的 SOCKS5 / HTTP 代理节点" />
                 <Border Grid.Column="1" Background="{DynamicResource ControlFillColorDefaultBrush}" BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1" Padding="8,3" CornerRadius="4" VerticalAlignment="Center">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding NodePoolSummaryText}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding NodePoolSummaryText}" />
                 </Border>
               </Grid>
 
@@ -448,9 +451,9 @@
                         <ControlTemplate TargetType="ListViewItem">
                           <Border
                             x:Name="NodeBorder"
-                            Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                            Background="{DynamicResource AppInputBrush}"
                             BorderThickness="1"
-                            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                            BorderBrush="{DynamicResource AppCardBorderBrush}"
                             CornerRadius="8"
                             Padding="12,10"
                           >
@@ -466,7 +469,7 @@
                             </Trigger>
                             <Trigger Property="IsSelected" Value="True">
                               <Setter TargetName="NodeBorder" Property="Background" Value="{DynamicResource SubtleFillColorTertiaryBrush}" />
-                              <Setter TargetName="NodeBorder" Property="BorderBrush" Value="{DynamicResource AccentFillColorDefaultBrush}" />
+                              <Setter TargetName="NodeBorder" Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" />
                             </Trigger>
                           </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -486,8 +489,8 @@
 
                       <!-- Node Name & Address -->
                       <StackPanel Grid.Column="0" VerticalAlignment="Center">
-                        <TextBlock FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource TextFillColorPrimaryBrush}" Text="{Binding Name, Mode=OneWay}" />
-                        <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,2,0,0" Text="{Binding Url, Mode=OneWay}" TextTrimming="CharacterEllipsis" MaxWidth="280" />
+                        <TextBlock FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource AppTextPrimaryBrush}" Text="{Binding Name, Mode=OneWay}" />
+                        <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="0,2,0,0" Text="{Binding Url, Mode=OneWay}" TextTrimming="CharacterEllipsis" MaxWidth="280" />
                       </StackPanel>
 
                       <!-- Latency Badge -->
@@ -499,7 +502,7 @@
                         Background="{DynamicResource ControlFillColorDefaultBrush}"
                         CornerRadius="4"
                       >
-                        <TextBlock FontSize="11" FontWeight="Medium" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding LatencyDisplay, Mode=OneWay}" />
+                        <TextBlock FontSize="11" FontWeight="Medium" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding LatencyDisplay, Mode=OneWay}" />
                       </Border>
 
                       <!-- Inline Quick Test Button -->
@@ -536,8 +539,8 @@
           <StackPanel Grid.Column="2">
             <!-- Add Preset Card -->
             <Border
-              Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              Background="{DynamicResource AppCardBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
               BorderThickness="1"
               CornerRadius="12"
               Padding="16"
@@ -547,10 +550,10 @@
                 <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="#000000" />
               </Border.Effect>
               <StackPanel>
-                <TextBlock FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextFillColorPrimaryBrush}" Text="➕ 添加代理节点" Margin="0,0,0,8" />
+                <TextBlock FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource AppTextPrimaryBrush}" Text="➕ 添加代理节点" Margin="0,0,0,8" />
 
                 <!-- URL Quick Add -->
-                <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="方式 1: 通过 URL 快速导入" Margin="0,0,0,4" />
+                <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="方式 1: 通过 URL 快速导入" Margin="0,0,0,4" />
                 <Grid Margin="0,0,0,14">
                   <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
@@ -573,9 +576,9 @@
                 <Separator Margin="0,0,0,12" />
 
                 <!-- Manual Add Form -->
-                <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="方式 2: 手动配置节点参数" Margin="0,0,0,6" />
+                <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="方式 2: 手动配置节点参数" Margin="0,0,0,6" />
                 
-                <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="节点名称：" Margin="0,0,0,2" />
+                <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="节点名称：" Margin="0,0,0,2" />
                 <ui:TextBox Margin="0,0,0,8" Text="{Binding NewPresetName, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="例如: 专用香港节点" />
 
                 <Grid Margin="0,0,0,8">
@@ -585,11 +588,11 @@
                     <ColumnDefinition Width="80" />
                   </Grid.ColumnDefinitions>
                   <StackPanel Grid.Column="0">
-                    <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="服务器 IP / 域名：" Margin="0,0,0,2" />
+                    <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="服务器 IP / 域名：" Margin="0,0,0,2" />
                     <ui:TextBox Text="{Binding NewPresetHost, UpdateSourceTrigger=PropertyChanged}" PlaceholderText="127.0.0.1" />
                   </StackPanel>
                   <StackPanel Grid.Column="2">
-                    <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="端口：" Margin="0,0,0,2" />
+                    <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="端口：" Margin="0,0,0,2" />
                     <ui:TextBox Text="{Binding NewPresetPort, UpdateSourceTrigger=PropertyChanged}" />
                   </StackPanel>
                 </Grid>
@@ -601,11 +604,11 @@
                     <ColumnDefinition Width="*" />
                   </Grid.ColumnDefinitions>
                   <StackPanel Grid.Column="0">
-                    <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="用户名 (可选)：" Margin="0,0,0,2" />
+                    <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="用户名 (可选)：" Margin="0,0,0,2" />
                     <ui:TextBox Text="{Binding NewPresetUsername, UpdateSourceTrigger=PropertyChanged}" />
                   </StackPanel>
                   <StackPanel Grid.Column="2">
-                    <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="密码 (可选)：" Margin="0,0,0,2" />
+                    <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="密码 (可选)：" Margin="0,0,0,2" />
                     <ui:PasswordBox Password="{Binding NewPresetPassword, UpdateSourceTrigger=PropertyChanged}" />
                   </StackPanel>
                 </Grid>
@@ -621,8 +624,8 @@
 
             <!-- Slot Binding Quick Card -->
             <Border
-              Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              Background="{DynamicResource AppCardBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
               BorderThickness="1"
               CornerRadius="12"
               Padding="16"
@@ -631,8 +634,8 @@
                 <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="#000000" />
               </Border.Effect>
               <StackPanel>
-                <TextBlock FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextFillColorPrimaryBrush}" Text="卡槽全局代理绑定" Margin="0,0,0,4" />
-                <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="将代理直接绑定到指定硬件 SIM 卡槽：" Margin="0,0,0,10" TextWrapping="Wrap" />
+                <TextBlock FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource AppTextPrimaryBrush}" Text="卡槽全局代理绑定" Margin="0,0,0,4" />
+                <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="将代理直接绑定到指定硬件 SIM 卡槽：" Margin="0,0,0,10" TextWrapping="Wrap" />
 
                 <ComboBox
                   ItemsSource="{Binding Slots}"
@@ -680,7 +683,7 @@
       x:Name="EditDialogOverlay"
       Grid.RowSpan="3"
       Margin="-24,-18,-24,-24"
-      Background="#99000000"
+      Background="{DynamicResource AppOverlayBrush}"
       Visibility="{Binding IsEditingRoute, Converter={StaticResource BoolToVis}}"
       HorizontalAlignment="Stretch"
       VerticalAlignment="Stretch"
@@ -692,8 +695,8 @@
         MaxHeight="600"
         VerticalAlignment="Center"
         HorizontalAlignment="Center"
-        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+        Background="{DynamicResource AppCardBrush}"
+        BorderBrush="{DynamicResource AppCardBorderBrush}"
         BorderThickness="1"
         CornerRadius="16"
         Padding="24,20"
@@ -719,8 +722,8 @@
               <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
             <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-              <ui:SymbolIcon Symbol="Edit24" Foreground="{DynamicResource AccentFillColorDefaultBrush}" FontSize="18" Margin="0,0,8,0" />
-              <TextBlock Text="编辑国家分流策略" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" VerticalAlignment="Center" />
+              <ui:SymbolIcon Symbol="Edit24" Foreground="{DynamicResource AppAccentBrush}" FontSize="18" Margin="0,0,8,0" />
+              <TextBlock Text="编辑国家分流策略" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" VerticalAlignment="Center" />
             </StackPanel>
             <ui:Button
               Grid.Column="1"
@@ -737,7 +740,7 @@
             Grid.Row="1"
             Padding="14,12"
             Background="{DynamicResource ControlFillColorDefaultBrush}"
-            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            BorderBrush="{DynamicResource AppCardBorderBrush}"
             BorderThickness="1"
             CornerRadius="10"
             Margin="0,0,0,16"
@@ -750,26 +753,26 @@
               <TextBlock Grid.Column="0" Text="{Binding EditingRoute.FlagEmoji, FallbackValue='🌐'}" FontSize="32" VerticalAlignment="Center" Margin="0,0,12,0" />
               <StackPanel Grid.Column="1" VerticalAlignment="Center">
                 <StackPanel Orientation="Horizontal">
-                  <TextBlock Text="{Binding EditingRoute.CountryName, FallbackValue='--'}" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
-                  <Border Margin="8,0,0,0" Padding="6,1" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="4">
-                    <TextBlock Text="{Binding EditingRoute.CountryCode, FallbackValue='--'}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" />
+                  <TextBlock Text="{Binding EditingRoute.CountryName, FallbackValue='--'}" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" />
+                  <Border Margin="8,0,0,0" Padding="6,1" Background="{DynamicResource AppInputBrush}" CornerRadius="4">
+                    <TextBlock Text="{Binding EditingRoute.CountryCode, FallbackValue='--'}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource AppAccentBrush}" />
                   </Border>
                 </StackPanel>
-                <TextBlock Text="{Binding EditingRoute.MccDisplay, FallbackValue='--', Mode=OneWay}" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,4,0,0" />
+                <TextBlock Text="{Binding EditingRoute.MccDisplay, FallbackValue='--', Mode=OneWay}" FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="0,4,0,0" />
               </StackPanel>
             </Grid>
           </Border>
 
           <!-- Egress Mode Radio Selection -->
           <StackPanel Grid.Row="2" Margin="0,0,0,12">
-            <TextBlock Text="出站分流策略：" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" Margin="0,0,0,10" />
+            <TextBlock Text="出站分流策略：" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" Margin="0,0,0,10" />
 
             <!-- Option 1: Direct -->
             <Border
               Padding="12,10"
               Margin="0,0,0,8"
-              Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              Background="{DynamicResource AppInputBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
               BorderThickness="1"
               CornerRadius="8"
             >
@@ -778,8 +781,8 @@
                 IsChecked="{Binding EditDialogIsDirect, Mode=TwoWay}"
               >
                 <StackPanel Margin="6,0,0,0">
-                  <TextBlock Text="直连模式 (DIRECT)" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
-                  <TextBlock Text="通过默认物理网卡直连运营商核心网，不走代理隧道" FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,2,0,0" />
+                  <TextBlock Text="直连模式 (DIRECT)" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource AppTextPrimaryBrush}" />
+                  <TextBlock Text="通过默认物理网卡直连运营商核心网，不走代理隧道" FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="0,2,0,0" />
                 </StackPanel>
               </RadioButton>
             </Border>
@@ -787,8 +790,8 @@
             <!-- Option 2: Proxy -->
             <Border
               Padding="12,10"
-              Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              Background="{DynamicResource AppInputBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
               BorderThickness="1"
               CornerRadius="8"
             >
@@ -797,8 +800,8 @@
                 IsChecked="{Binding EditDialogIsProxy, Mode=TwoWay}"
               >
                 <StackPanel Margin="6,0,0,0">
-                  <TextBlock Text="代理节点 (Proxy)" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
-                  <TextBlock Text="经由指定 SOCKS5 / HTTP 代理隧道转发流量" FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,2,0,0" />
+                  <TextBlock Text="代理节点 (Proxy)" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource AppTextPrimaryBrush}" />
+                  <TextBlock Text="经由指定 SOCKS5 / HTTP 代理隧道转发流量" FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="0,2,0,0" />
                 </StackPanel>
               </RadioButton>
             </Border>
@@ -806,7 +809,7 @@
 
           <!-- Node Selector (Enabled when Proxy is selected) -->
           <StackPanel Grid.Row="3" Margin="0,0,0,18" IsEnabled="{Binding EditDialogIsProxy}">
-            <TextBlock Text="选择出站代理节点：" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,6" />
+            <TextBlock Text="选择出站代理节点：" FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="0,0,0,6" />
             <ComboBox
               ItemsSource="{Binding Presets}"
               SelectedItem="{Binding EditDialogSelectedNode, Mode=TwoWay}"
@@ -817,7 +820,7 @@
           </StackPanel>
 
           <!-- Separator -->
-          <Separator Grid.Row="4" Margin="0,0,0,16" Background="{DynamicResource CardStrokeColorDefaultBrush}" />
+          <Separator Grid.Row="4" Margin="0,0,0,16" Background="{DynamicResource AppCardBorderBrush}" />
 
           <!-- Action Footer -->
           <Grid Grid.Row="5">
@@ -832,7 +835,7 @@
             <ui:Button
               Grid.Column="0"
               Appearance="Transparent"
-              Foreground="#DC2626"
+              Foreground="{DynamicResource AppDangerBrush}"
               Icon="{ui:SymbolIcon Symbol=Delete24}"
               Command="{Binding DeleteCountryRuleCommand}"
               CommandParameter="{Binding EditingRoute}"

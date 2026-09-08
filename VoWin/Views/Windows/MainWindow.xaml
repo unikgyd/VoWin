@@ -8,16 +8,20 @@
   xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
   Title="{Binding ViewModel.ApplicationTitle, Mode=OneWay}"
   Icon="pack://application:,,,/Assets/vowin.png"
-  Width="1200"
-  Height="780"
+  Width="1280"
+  Height="820"
+  MinWidth="1024"
+  MinHeight="680"
   d:DataContext="{d:DesignInstance local:MainWindow,
                                      IsDesignTimeCreatable=True}"
   d:DesignHeight="450"
   d:DesignWidth="800"
   ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
-  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  ui:Design.Foreground="{DynamicResource AppTextPrimaryBrush}"
   ExtendsContentIntoTitleBar="True"
-  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  Foreground="{DynamicResource AppTextPrimaryBrush}"
+  FontFamily="Segoe UI Variable Text, Segoe UI"
+  FontSize="13"
   WindowBackdropType="Mica"
   WindowCornerPreference="Round"
   WindowStartupLocation="CenterScreen"
@@ -184,7 +188,7 @@
     </Style>
   </ui:FluentWindow.Resources>
 
-  <Grid>
+  <Grid Background="{DynamicResource AppSurfaceBrush}">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
@@ -200,6 +204,7 @@
       IsPaneToggleVisible="True"
       MenuItemsSource="{Binding ViewModel.MenuItems, Mode=OneWay}"
       PaneDisplayMode="LeftFluent"
+      Background="{DynamicResource AppNavigationBrush}"
     >
       <ui:NavigationView.ContentOverlay>
         <Grid>
@@ -213,6 +218,7 @@
       Title="{Binding ViewModel.ApplicationTitle}"
       Grid.Row="0"
       Height="38"
+      Background="{DynamicResource AppNavigationBrush}"
       CloseWindowByDoubleClickOnIcon="True"
     >
       <ui:TitleBar.Icon>
@@ -227,7 +233,7 @@
       </ui:TitleBar.Icon>
     </ui:TitleBar>
     <Border Grid.Row="0" Grid.RowSpan="2" Panel.ZIndex="100"
-            Background="#D9202020" IsHitTestVisible="True">
+            Background="{DynamicResource AppOverlayBrush}" IsHitTestVisible="True">
       <Border.Style>
         <Style TargetType="Border">
           <Setter Property="Visibility" Value="Collapsed" />
@@ -238,14 +244,16 @@
           </Style.Triggers>
         </Style>
       </Border.Style>
-      <Border Width="360" Padding="32" CornerRadius="12"
+      <Border Width="380" Padding="34" CornerRadius="18"
               HorizontalAlignment="Center" VerticalAlignment="Center"
-              Background="{DynamicResource CardBackgroundFillColorDefaultBrush}">
+              Background="{DynamicResource AppCardElevatedBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
+              BorderThickness="1">
         <StackPanel HorizontalAlignment="Center">
           <ui:ProgressRing Width="52" Height="52" IsIndeterminate="True" Margin="0,0,0,20" />
           <TextBlock Text="正在发现蜂窝设备" HorizontalAlignment="Center" FontSize="18" FontWeight="SemiBold" />
           <TextBlock Text="{Binding KernelService.InitialScanStatus}" HorizontalAlignment="Center" Margin="0,10,0,0"
-                     Foreground="{DynamicResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" TextAlignment="Center" />
+                     Foreground="{DynamicResource AppTextSecondaryBrush}" TextWrapping="Wrap" TextAlignment="Center" />
         </StackPanel>
       </Border>
     </Border>

@@ -1,0 +1,153 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml">
+
+    <!-- VoWin visual language: calm blue surfaces, crisp typography and
+         semantic colors with sufficient contrast in both app themes. Values
+         are refreshed by App.ApplyBrandTheme whenever the theme changes. -->
+    <SolidColorBrush x:Key="AppSurfaceBrush" Color="#F3F8FF" />
+    <SolidColorBrush x:Key="AppNavigationBrush" Color="#EAF3FF" />
+    <SolidColorBrush x:Key="AppCardBrush" Color="#FCFEFF" />
+    <SolidColorBrush x:Key="AppCardElevatedBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="AppCardBorderBrush" Color="#CFE0F5" />
+    <SolidColorBrush x:Key="AppDividerBrush" Color="#D9E6F5" />
+    <SolidColorBrush x:Key="AppInputBrush" Color="#F8FBFF" />
+    <SolidColorBrush x:Key="AppHoverBrush" Color="#E7F0FF" />
+    <SolidColorBrush x:Key="AppSelectedBrush" Color="#DCEBFF" />
+    <SolidColorBrush x:Key="AppOverlayBrush" Color="#66081220" />
+
+    <SolidColorBrush x:Key="AppTextPrimaryBrush" Color="#142033" />
+    <SolidColorBrush x:Key="AppTextSecondaryBrush" Color="#52657A" />
+    <SolidColorBrush x:Key="AppTextTertiaryBrush" Color="#71839A" />
+    <SolidColorBrush x:Key="AppTextOnAccentBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="AppTextOnAccentSecondaryBrush" Color="#DCE8FF" />
+
+    <SolidColorBrush x:Key="AppAccentBrush" Color="#2563EB" />
+    <SolidColorBrush x:Key="AppAccentHoverBrush" Color="#1D4ED8" />
+    <SolidColorBrush x:Key="AppAccentPressedBrush" Color="#1E40AF" />
+    <SolidColorBrush x:Key="AppAccentSoftBrush" Color="#E7F0FF" />
+    <SolidColorBrush x:Key="AppAccentSoftBorderBrush" Color="#AFC9F3" />
+    <SolidColorBrush x:Key="AppSuccessBrush" Color="#0F9F75" />
+    <SolidColorBrush x:Key="AppSuccessSoftBrush" Color="#E7F8F2" />
+    <SolidColorBrush x:Key="AppWarningBrush" Color="#C66A08" />
+    <SolidColorBrush x:Key="AppWarningSoftBrush" Color="#FFF5E6" />
+    <SolidColorBrush x:Key="AppDangerBrush" Color="#D92D4C" />
+    <SolidColorBrush x:Key="AppDangerSoftBrush" Color="#FFF0F3" />
+    <SolidColorBrush x:Key="AppInfoBrush" Color="#0284C7" />
+    <SolidColorBrush x:Key="AppInfoSoftBrush" Color="#E8F6FD" />
+
+    <!-- Floating call/SMS alerts intentionally remain dark in both themes so
+         they are immediately recognizable above arbitrary desktop content. -->
+    <SolidColorBrush x:Key="AppFloatingSurfaceBrush" Color="#F2141D2C" />
+    <SolidColorBrush x:Key="AppFloatingBorderBrush" Color="#52FFFFFF" />
+    <SolidColorBrush x:Key="AppFloatingTextPrimaryBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="AppFloatingTextSecondaryBrush" Color="#CAD5E3" />
+    <SolidColorBrush x:Key="AppFloatingTextTertiaryBrush" Color="#94A3B8" />
+    <SolidColorBrush x:Key="AppFloatingTrackBrush" Color="#334155" />
+    <SolidColorBrush x:Key="AppFloatingSuccessSoftBrush" Color="#2634D399" />
+    <SolidColorBrush x:Key="AppFloatingAccentSoftBrush" Color="#2660A5FA" />
+
+    <!-- Adapt the WPF-UI primitives so third-party controls and native VoWin
+         cards participate in the same surface hierarchy. -->
+    <SolidColorBrush x:Key="ApplicationBackgroundBrush" Color="#F3F8FF" />
+    <SolidColorBrush x:Key="CardBackgroundFillColorDefaultBrush" Color="#FCFEFF" />
+    <SolidColorBrush x:Key="CardBackgroundFillColorSecondaryBrush" Color="#F8FBFF" />
+    <SolidColorBrush x:Key="CardStrokeColorDefaultBrush" Color="#CFE0F5" />
+
+    <Style TargetType="{x:Type Page}">
+        <Setter Property="Background" Value="{DynamicResource AppSurfaceBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource AppTextPrimaryBrush}" />
+        <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+        <Setter Property="TextOptions.TextRenderingMode" Value="ClearType" />
+        <Setter Property="UseLayoutRounding" Value="True" />
+        <Setter Property="SnapsToDevicePixels" Value="True" />
+    </Style>
+
+    <Style x:Key="AppPageTitleStyle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="26" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource AppTextPrimaryBrush}" />
+        <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+    </Style>
+
+    <Style x:Key="AppPageSubtitleStyle" TargetType="TextBlock">
+        <Setter Property="Margin" Value="0,5,0,0" />
+        <Setter Property="FontSize" Value="13" />
+        <Setter Property="LineHeight" Value="20" />
+        <Setter Property="Foreground" Value="{DynamicResource AppTextSecondaryBrush}" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+
+    <Style x:Key="AppSectionTitleStyle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="16" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource AppTextPrimaryBrush}" />
+    </Style>
+
+    <Style x:Key="AppCaptionStyle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="Foreground" Value="{DynamicResource AppTextSecondaryBrush}" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+
+    <Style x:Key="AppInputLabelStyle" TargetType="TextBlock">
+        <Setter Property="Margin" Value="0,0,0,7" />
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource AppTextSecondaryBrush}" />
+    </Style>
+
+    <Style x:Key="AppCardStyle" TargetType="Border">
+        <Setter Property="Padding" Value="20" />
+        <Setter Property="Background" Value="{DynamicResource AppCardBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource AppCardBorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="16" />
+        <Setter Property="SnapsToDevicePixels" Value="True" />
+    </Style>
+
+    <Style x:Key="AppCompactCardStyle" TargetType="Border">
+        <Setter Property="Padding" Value="14" />
+        <Setter Property="Background" Value="{DynamicResource AppCardBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource AppCardBorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="12" />
+    </Style>
+
+    <Style x:Key="AppSoftPanelStyle" TargetType="Border">
+        <Setter Property="Padding" Value="14" />
+        <Setter Property="Background" Value="{DynamicResource AppInputBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource AppDividerBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="10" />
+    </Style>
+
+    <Style x:Key="AppAccentPanelStyle" TargetType="Border">
+        <Setter Property="Padding" Value="14" />
+        <Setter Property="Background" Value="{DynamicResource AppAccentSoftBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource AppAccentSoftBorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="10" />
+    </Style>
+
+    <Style x:Key="AppStatusPillStyle" TargetType="Border">
+        <Setter Property="Padding" Value="9,4" />
+        <Setter Property="CornerRadius" Value="12" />
+        <Setter Property="Background" Value="{DynamicResource AppAccentSoftBrush}" />
+    </Style>
+
+    <Style x:Key="AppDividerStyle" TargetType="Separator">
+        <Setter Property="Margin" Value="0,12" />
+        <Setter Property="Background" Value="{DynamicResource AppDividerBrush}" />
+        <Setter Property="Height" Value="1" />
+    </Style>
+
+    <Style TargetType="{x:Type ToolTip}">
+        <Setter Property="Padding" Value="10,7" />
+        <Setter Property="Background" Value="{DynamicResource AppCardElevatedBrush}" />
+        <Setter Property="Foreground" Value="{DynamicResource AppTextPrimaryBrush}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource AppCardBorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+</ResourceDictionary>

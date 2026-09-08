@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.Security;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -16,23 +17,53 @@ internal sealed class EuiccProfileDownloader
     private const int StoreDataMss = 120;
     private readonly IEuiccTransport _transport;
     private readonly HttpClient _http;
+    private readonly bool _allowUntrustedTls;
+    private string? _lastTlsValidationFailure;
 
-    public EuiccProfileDownloader(IEuiccTransport transport)
+    public EuiccProfileDownloader(IEuiccTransport transport, bool allowUntrustedTls = false)
     {
         _transport = transport;
-        _http = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(20) }) { Timeout = TimeSpan.FromSeconds(90) };
+        _allowUntrustedTls = allowUntrustedTls;
+        var handler = new SocketsHttpHandler { AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(20) };
+        handler.SslOptions.RemoteCertificateValidationCallback = (_, certificate, chain, errors) =>
+        {
+            if (errors == SslPolicyErrors.None)
+            {
+                _lastTlsValidationFailure = null;
+                return true;
+            }
+
+            var chainStatuses = chain?.ChainStatus
+                .Where(status => status.Status != System.Security.Cryptography.X509Certificates.X509ChainStatusFlags.NoError)
+                .Select(status => status.Status)
+                .Distinct()
+                .ToArray() ?? [];
+            var chainErrors = chainStatuses.Select(status => status.ToString()).ToArray();
+            var subject = certificate?.Subject ?? "未知证书";
+            _lastTlsValidationFailure = chainErrors.Length > 0
+                ? $"{errors}；证书链={string.Join(", ", chainErrors)}；Subject={subject}"
+                : $"{errors}；Subject={subject}";
+            var isOnlyUntrustedRoot = errors == SslPolicyErrors.RemoteCertificateChainErrors &&
+                                      chainStatuses.Length > 0 &&
+                                      chainStatuses.All(status => status == System.Security.Cryptography.X509Certificates.X509ChainStatusFlags.UntrustedRoot);
+            return _allowUntrustedTls && isOnlyUntrustedRoot;
+        };
+        _http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(90) };
     }
 
     public async Task<EuiccWorkerDownloadResult> DownloadAsync(EuiccActivationCode code, string imei, string? confirmationCode, IProgress<EuiccDownloadProgress>? progress, CancellationToken ct)
     {
         var transactionStarted = false; var installStarted = false; var channel = 0; string? transactionId = null; byte[]? cardTransactionId = null;
+        var currentStage = "校验 SM-DP+ 地址";
         try
         {
             ValidateSmdpAddress(code.SmdpAddress);
+            currentStage = "打开 eUICC 逻辑通道并读取挑战值";
             progress?.Report(new(10, "正在连接 SM-DP+ 并读取 eUICC 挑战值"));
             channel = await _transport.OpenLogicalChannelAsync(Sgp22Client.IsdrAidStandard, ct).ConfigureAwait(false);
             var challenge = FirstValue(await Es10Async(channel, [0xBF, 0x2E, 0x00], ct).ConfigureAwait(false), 0x80) ?? throw new InvalidDataException("eUICC 未返回挑战值。");
             var info1 = await Es10Async(channel, [0xBF, 0x20, 0x00], ct).ConfigureAwait(false);
+            currentStage = "向 SM-DP+ 发起下载认证";
             progress?.Report(new(25, "正在向 SM-DP+ 发起下载认证"));
             var initiated = await Es9Async(code.SmdpAddress, "initiateAuthentication", new()
             {
@@ -42,15 +73,18 @@ internal sealed class EuiccProfileDownloader
             cardTransactionId = FirstValue(GetB64(initiated, "serverSigned1"), 0x80)
                 ?? throw new InvalidDataException("SM-DP+ 的 ServerSigned1 缺少 transactionId。");
             transactionStarted = true;
+            currentStage = "由 eUICC 验证 SM-DP+ 证书";
             progress?.Report(new(40, "正在由 eUICC 验证 SM-DP+ 证书"));
             var authResponse = await Es10Async(channel, BuildAuthenticateServer(initiated, code.MatchingId, imei), ct).ConfigureAwait(false);
             ThrowIfAuthenticateFailed(authResponse);
+            currentStage = "请求 Profile 下载授权";
             progress?.Report(new(52, "正在请求 Profile 下载授权"));
             var authenticated = await Es9Async(code.SmdpAddress, "authenticateClient", new()
             {
                 ["transactionId"] = transactionId, ["authenticateServerResponse"] = Convert.ToBase64String(authResponse)
             }, ["profileMetadata", "smdpSigned2", "smdpSignature2", "smdpCertificate"], ct).ConfigureAwait(false);
             var prepareResponse = await Es10Async(channel, BuildPrepareDownload(authenticated, confirmationCode), ct).ConfigureAwait(false);
+            currentStage = "下载已绑定的 Profile 包";
             progress?.Report(new(65, "正在下载已绑定的 Profile 包"));
             var bppReply = await Es9Async(code.SmdpAddress, "getBoundProfilePackage", new()
             {
@@ -58,16 +92,20 @@ internal sealed class EuiccProfileDownloader
             }, ["boundProfilePackage"], ct).ConfigureAwait(false);
             var segments = SegmentBoundProfilePackage(GetB64(bppReply, "boundProfilePackage"));
             installStarted = true;
+            currentStage = "向 eUICC 写入 Profile 包";
             for (var i = 0; i < segments.Count; i++)
             {
                 var response = await Es10Async(channel, segments[i], ct).ConfigureAwait(false);
                 if (i == segments.Count - 1)
                 {
                     var iccid = ReadInstallationResult(response);
+                    currentStage = "向运营商确认安装通知";
                     progress?.Report(new(90, "Profile 已写入，正在确认运营商通知"));
                     return new EuiccWorkerDownloadResult(iccid, false, await DeliverInstallNotificationAsync(channel, response, ct).ConfigureAwait(false));
                 }
-                progress?.Report(new(70 + Math.Min(18, (i + 1) * 18 / segments.Count), "正在写入 Profile 包"));
+                progress?.Report(new(
+                    70 + Math.Min(18, (i + 1) * 18 / segments.Count),
+                    $"正在写入 Profile 包（分片 {i + 1}/{segments.Count}）"));
             }
             throw new InvalidDataException("eUICC 未返回 Profile 安装结果。");
         }
@@ -76,7 +114,7 @@ internal sealed class EuiccProfileDownloader
         catch (Exception ex)
         {
             if (transactionStarted && !installStarted) await CancelSafelyAsync(channel, code.SmdpAddress, transactionId, cardTransactionId).ConfigureAwait(false);
-            throw new EuiccProfileDownloaderException(Translate(ex.Message), !transactionStarted, installStarted, ex);
+            throw new EuiccProfileDownloaderException($"{currentStage}失败：{Translate(ex)}", !transactionStarted, installStarted, ex);
         }
         finally
         {
@@ -109,7 +147,25 @@ internal sealed class EuiccProfileDownloader
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = JsonContent.Create(body) };
         request.Headers.UserAgent.ParseAdd("gsma-rsp-lpad"); request.Headers.TryAddWithoutValidation("X-Admin-Protocol", "gsma/rsp/v2.2.2");
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
-        var text = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false); using var document = JsonDocument.Parse(text); var root = document.RootElement.Clone();
+        // A completed HTTP exchange means any explicitly accepted UntrustedRoot
+        // applied only to that handshake. Do not let it contaminate later APDU errors.
+        _lastTlsValidationFailure = null;
+        var text = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        JsonElement root;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                throw new JsonException("响应正文为空");
+            using var document = JsonDocument.Parse(text);
+            root = document.RootElement.Clone();
+        }
+        catch (JsonException ex)
+        {
+            var mediaType = response.Content.Headers.ContentType?.MediaType ?? "未知类型";
+            throw new InvalidDataException(
+                $"SM-DP+ {function} 返回的不是有效 JSON（HTTP {(int)response.StatusCode}，{mediaType}）。请检查地址、网络代理或服务端状态。",
+                ex);
+        }
         var status = root.TryGetProperty("header", out var h) && h.TryGetProperty("functionExecutionStatus", out var f) && f.TryGetProperty("status", out var s) ? s.GetString() : null;
         if (!response.IsSuccessStatusCode || status is not (null or "" or "Executed-Success" or "Executed-WithWarning"))
             throw new InvalidOperationException(TryStatusMessage(root) ?? $"SM-DP+ {function} 失败（HTTP {(int)response.StatusCode}，{status ?? "无状态"}）。");
@@ -167,7 +223,7 @@ internal sealed class EuiccProfileDownloader
             await HandleNotificationAsync(System.Text.Encoding.UTF8.GetString(address), pending, ct).ConfigureAwait(false);
             await Es10Async(channel, Construct(0xBF30, Encode(0x80, sequence)), ct).ConfigureAwait(false); return null;
         }
-        catch (Exception ex) { return "Profile 已写入，但运营商安装通知未确认：" + Translate(ex.Message); }
+        catch (Exception ex) { return "Profile 已写入，但运营商安装通知未确认：" + Translate(ex); }
     }
 
     private async Task HandleNotificationAsync(string address, byte[] pending, CancellationToken ct)
@@ -175,7 +231,10 @@ internal sealed class EuiccProfileDownloader
         ValidateSmdpAddress(address);
         using var request = new HttpRequestMessage(HttpMethod.Post, new Uri($"https://{address}/gsma/rsp2/es9plus/handleNotification")) { Content = JsonContent.Create(new Dictionary<string, string> { ["pendingNotification"] = Convert.ToBase64String(pending) }) };
         request.Headers.UserAgent.ParseAdd("gsma-rsp-lpad"); request.Headers.TryAddWithoutValidation("X-Admin-Protocol", "gsma/rsp/v2.2.2");
-        using var response = await _http.SendAsync(request, ct).ConfigureAwait(false); if (response.StatusCode != HttpStatusCode.NoContent) throw new InvalidOperationException($"运营商通知确认返回 HTTP {(int)response.StatusCode}。");
+        // Installation notification remains strict even when the user opts into
+        // bypassing TLS validation for the one-time primary SM-DP+ download.
+        using var strictClient = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(20) }) { Timeout = TimeSpan.FromSeconds(90) };
+        using var response = await strictClient.SendAsync(request, ct).ConfigureAwait(false); if (response.StatusCode != HttpStatusCode.NoContent) throw new InvalidOperationException($"运营商通知确认返回 HTTP {(int)response.StatusCode}。");
     }
 
     private async Task CancelSafelyAsync(int channel, string smdp, string? transactionId, byte[]? cardTransactionId)
@@ -204,8 +263,56 @@ internal sealed class EuiccProfileDownloader
         value = value.PadRight(value.Length + (4 - value.Length % 4) % 4, '=');
         return Convert.FromBase64String(value);
     }
-    private static string? TryStatusMessage(JsonElement root) => root.TryGetProperty("header", out var h) && h.TryGetProperty("functionExecutionStatus", out var f) && f.TryGetProperty("statusCodeData", out var d) && d.TryGetProperty("message", out var m) ? m.GetString() : null;
-    private static string Translate(string text) => text.Replace("confirmation code", "确认码", StringComparison.OrdinalIgnoreCase).Replace("matchingID", "Matching ID", StringComparison.OrdinalIgnoreCase);
+    private static string? TryStatusMessage(JsonElement root)
+    {
+        if (!root.TryGetProperty("header", out var header) ||
+            !header.TryGetProperty("functionExecutionStatus", out var execution) ||
+            !execution.TryGetProperty("statusCodeData", out var data)) return null;
+
+        var parts = new List<string>();
+        foreach (var name in new[] { "subjectCode", "reasonCode", "message" })
+        {
+            if (data.TryGetProperty(name, out var value) && value.ValueKind is not JsonValueKind.Null and not JsonValueKind.Undefined)
+            {
+                var text = value.ToString().Trim();
+                if (!string.IsNullOrEmpty(text)) parts.Add($"{name}={text}");
+            }
+        }
+        return parts.Count == 0 ? null : string.Join("，", parts);
+    }
+
+    private string Translate(Exception exception)
+    {
+        var exceptionText = string.Join(" → ", EnumerateExceptionMessages(exception));
+        var isTlsFailure = exceptionText.Contains("SSL connection", StringComparison.OrdinalIgnoreCase) ||
+                           exceptionText.Contains("UntrustedRoot", StringComparison.OrdinalIgnoreCase) ||
+                           exceptionText.Contains("certificate", StringComparison.OrdinalIgnoreCase);
+        if (isTlsFailure)
+        {
+            return "SM-DP+ TLS 证书未通过 Windows 信任校验（" +
+                   (_lastTlsValidationFailure ?? exceptionText) +
+                   "）。请检查系统日期、Windows 根证书更新、HTTPS 检查代理及服务器证书链；不要直接关闭证书校验。";
+        }
+
+        var text = exception switch
+        {
+            TaskCanceledException => "连接 SM-DP+ 超时（最多等待 90 秒）。请检查网络、DNS 或代理设置。",
+            HttpRequestException => $"无法连接 SM-DP+：{exceptionText}",
+            _ => exception.Message
+        };
+        return text.Replace("confirmation code", "确认码", StringComparison.OrdinalIgnoreCase)
+            .Replace("matchingID", "Matching ID", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static IEnumerable<string> EnumerateExceptionMessages(Exception exception)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (Exception? current = exception; current != null; current = current.InnerException)
+        {
+            var message = current.Message.Trim();
+            if (!string.IsNullOrEmpty(message) && seen.Add(message)) yield return message;
+        }
+    }
     private static readonly Regex Smdp = new("^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\\[[0-9A-Fa-f:.]+\\])(?::[0-9]{1,5})?$", RegexOptions.Compiled);
     private static void ValidateSmdpAddress(string address) { if (!Smdp.IsMatch(address.Trim())) throw new InvalidOperationException("SM-DP+ 地址无效。"); }
     private static byte[] ToBcd(string value) { var result = new byte[value.Length / 2]; for (var i = 0; i < result.Length; i++) { var low = value[i * 2] == 'F' ? 15 : value[i * 2] - '0'; var high = value[i * 2 + 1] == 'F' ? 15 : value[i * 2 + 1] - '0'; result[i] = (byte)(low | high << 4); } return result; }

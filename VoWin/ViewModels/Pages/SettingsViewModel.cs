@@ -74,8 +74,9 @@ namespace VoWin.ViewModels.Pages
                         break;
 
                     ApplicationThemeManager.Apply(ApplicationTheme.Light);
-                    App.ApplyGreenToggleTheme();
+                    App.ApplyBrandTheme();
                     CurrentTheme = ApplicationTheme.Light;
+                    App.SaveThemePreference(CurrentTheme);
                     break;
 
                 default:
@@ -83,8 +84,9 @@ namespace VoWin.ViewModels.Pages
                         break;
 
                     ApplicationThemeManager.Apply(ApplicationTheme.Dark);
-                    App.ApplyGreenToggleTheme();
+                    App.ApplyBrandTheme();
                     CurrentTheme = ApplicationTheme.Dark;
+                    App.SaveThemePreference(CurrentTheme);
                     break;
             }
         }

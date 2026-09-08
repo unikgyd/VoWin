@@ -37,6 +37,21 @@ public sealed class EuiccDownloadJournalTests : IDisposable
         Assert.Equal("8901000000000000002", stored.InstalledIccid);
     }
 
+    [Fact]
+    public void ProviderAuthorizedRetryRemovesOnlyMatchingTransaction()
+    {
+        var authorized = EuiccDownloadJournal.Fingerprint("LPA:1$smdp.example.com$AUTHORIZED");
+        var unrelated = EuiccDownloadJournal.Fingerprint("LPA:1$smdp.example.com$KEEP");
+        EuiccDownloadJournal.Begin(authorized, []);
+        EuiccDownloadJournal.MarkUncertain(authorized);
+        EuiccDownloadJournal.Begin(unrelated, []);
+
+        Assert.True(EuiccDownloadJournal.ResetForAuthorizedRetry(authorized));
+        Assert.Null(EuiccDownloadJournal.Get(authorized));
+        Assert.NotNull(EuiccDownloadJournal.Get(unrelated));
+        Assert.False(EuiccDownloadJournal.ResetForAuthorizedRetry(authorized));
+    }
+
     public void Dispose()
     {
         EuiccDownloadJournal.PathOverride = null;

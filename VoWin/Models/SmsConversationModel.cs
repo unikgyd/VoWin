@@ -16,7 +16,7 @@ namespace VoWin.Models
         private string _lastMessageText = string.Empty;
 
         [ObservableProperty]
-        private DateTime _lastMessageTime = DateTime.Now;
+        private DateTime _lastMessageTime = DateTime.UtcNow;
 
         [ObservableProperty]
         private int _unreadCount;

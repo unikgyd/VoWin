@@ -5,16 +5,21 @@ public record SimIdentity(
     string Iccid,
     string Mcc,
     string Mnc,
-    string OperatorName
+    string OperatorName,
+    string? PhoneNumber = null
 )
 {
-    public static SimIdentity FromImsiAndIccid(string imsi, string iccid, string? opName = null)
+    public static SimIdentity FromImsiAndIccid(
+        string imsi,
+        string iccid,
+        string? opName = null,
+        string? phoneNumber = null)
     {
         imsi = imsi.Trim();
         iccid = iccid.Trim();
         var mcc = imsi.Length >= 3 ? imsi[..3] : "";
         var mnc = imsi.Length >= 5 ? imsi.Substring(3, Math.Min(2, imsi.Length - 3)) : "";
-        return new SimIdentity(imsi, iccid, mcc, mnc, opName ?? GuessOperator(mcc, mnc));
+        return new SimIdentity(imsi, iccid, mcc, mnc, opName ?? GuessOperator(mcc, mnc), phoneNumber);
     }
 
     private static string GuessOperator(string mcc, string mnc)

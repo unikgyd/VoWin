@@ -29,7 +29,7 @@ namespace VoWin.Services
         void OnUsbDeviceInserted();
         void OnUsbDeviceRemoved();
         Task ApplyPreferencesToSlotAsync(ModemSlot slot);
-        Task SaveModulePreferencesAsync(string slotId, bool flightMode, bool vowifi, bool cellularData, bool roaming, string? proxyUrl);
+        Task SaveModulePreferencesAsync(string slotId, bool flightMode, bool vowifi, bool cellularData, bool roaming, string? proxyUrl, string? customName = null);
         Task SaveSimPreferencesAsync(string iccid, bool flightMode, bool vowifi, bool cellularData, bool roaming, string? proxyUrl, string? nickname);
 
         // Telemetry
@@ -89,7 +89,7 @@ namespace VoWin.Services
         Task<bool> DeleteEuiccProfileAsync(string iccidOrAid, string? slotId = null);
         Task<bool> RenameEuiccProfileAsync(string iccidOrAid, string nickname, string? slotId = null);
         Task<string> GetEuiccEidAsync(string? slotId = null);
-        Task<EuiccDownloadResult> DownloadEuiccProfileAsync(string activationCode, string? confirmationCode = null, IProgress<EuiccDownloadProgress>? progress = null, string? slotId = null, CancellationToken cancellationToken = default);
+        Task<EuiccDownloadResult> DownloadEuiccProfileAsync(string activationCode, string? confirmationCode = null, IProgress<EuiccDownloadProgress>? progress = null, string? slotId = null, CancellationToken cancellationToken = default, bool allowUntrustedTls = false, bool allowRetryAfterUncertain = false);
 
         // Proxy & Country Dispatch Routing
         bool SetSlotProxy(string slotId, string? proxyUrl);

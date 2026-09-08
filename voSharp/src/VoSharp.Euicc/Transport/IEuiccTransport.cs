@@ -128,7 +128,7 @@ public class AtModemEuiccTransport : IEuiccTransport
         if (_useCcho)
         {
             var hexStr = HexUtils.ToHexString(framed);
-            var resp = await _modem.Session.ExecuteCommandAsync($"AT+CGLA={channel},{hexStr.Length},\"{hexStr}\"", timeoutMs: 10000, ct: ct).ConfigureAwait(false);
+            var resp = await _modem.Session.ExecuteCommandAsync($"AT+CGLA={channel},{hexStr.Length},\"{hexStr}\"", timeoutMs: 30000, ct: ct).ConfigureAwait(false);
             if (!resp.Success)
                 throw new InvalidOperationException($"Failed to transmit APDU over channel {channel}: {string.Join(" ", resp.Lines)}");
 
@@ -144,7 +144,9 @@ public class AtModemEuiccTransport : IEuiccTransport
         }
 
         // Over CSIM: Inject channel into CLA low 2 bits
-        var csimResp = await _modem.SendCsimApduAsync(framed, ct).ConfigureAwait(false);
+        // STORE DATA during profile installation can legitimately take longer
+        // than ordinary SIM APDUs while the eUICC verifies and commits a segment.
+        var csimResp = await _modem.SendCsimApduAsync(framed, ct, timeoutMs: 30000).ConfigureAwait(false);
         if (csimResp.Length < 2)
             throw new InvalidOperationException("eUICC APDU 响应数据过短");
 
@@ -157,7 +159,7 @@ public class AtModemEuiccTransport : IEuiccTransport
         {
             byte len = (byte)(sw & 0xFF);
             byte[] getResp = new byte[] { EncodeLogicalChannelCla(0x80, channel), 0xC0, 0x00, 0x00, len };
-            var frag = await _modem.SendCsimApduAsync(getResp, ct).ConfigureAwait(false);
+            var frag = await _modem.SendCsimApduAsync(getResp, ct, timeoutMs: 30000).ConfigureAwait(false);
             if (frag.Length < 2) break;
             sw = (frag[^2] << 8) | frag[^1];
             payload.AddRange(frag.Take(frag.Length - 2));

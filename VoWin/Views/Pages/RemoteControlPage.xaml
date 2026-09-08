@@ -8,15 +8,15 @@
   xmlns:vm="clr-namespace:VoWin.ViewModels.Pages"
   Title="远程控制"
   d:DataContext="{d:DesignInstance vm:RemoteControlViewModel, IsDesignTimeCreatable=False}"
-  Background="Transparent"
-  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  Background="{DynamicResource AppSurfaceBrush}"
+  Foreground="{DynamicResource AppTextPrimaryBrush}"
   PreviewMouseWheel="OnPreviewMouseWheel"
   mc:Ignorable="d">
   <Page.Resources>
     <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
   </Page.Resources>
 
-  <Grid Margin="32,24,32,32">
+  <Grid Margin="24,18,24,24">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
@@ -27,16 +27,16 @@
         <ColumnDefinition Width="Auto" />
       </Grid.ColumnDefinitions>
       <StackPanel>
-        <TextBlock FontSize="28" FontWeight="SemiBold" Text="远程控制" />
-        <TextBlock Margin="0,5,0,0" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+        <TextBlock Style="{DynamicResource AppPageTitleStyle}" Text="远程控制" />
+        <TextBlock Style="{DynamicResource AppPageSubtitleStyle}"
                    Text="直接连接腾讯微信 iLink 与 QQ 官方机器人协议；后台运行，不阻塞电话和短信界面。" />
       </StackPanel>
       <ui:Button Grid.Column="1" VerticalAlignment="Center" Appearance="Primary" Content="保存并重连"
                  Command="{Binding ViewModel.SaveCommand}" />
     </Grid>
 
-    <ScrollViewer x:Name="RemoteScrollViewer" Grid.Row="1" VerticalScrollBarVisibility="Auto">
-      <StackPanel MaxWidth="920" HorizontalAlignment="Left">
+    <ScrollViewer x:Name="RemoteScrollViewer" Grid.Row="1" HorizontalContentAlignment="Stretch" VerticalScrollBarVisibility="Auto">
+      <StackPanel MaxWidth="960" HorizontalAlignment="Center">
         <Grid>
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*" />
@@ -44,20 +44,20 @@
             <ColumnDefinition Width="*" />
           </Grid.ColumnDefinitions>
 
-          <Border Grid.Column="0" Padding="18" CornerRadius="12" Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-                  BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+          <Border Grid.Column="0" Padding="18" CornerRadius="12" Background="{DynamicResource AppCardBrush}"
+                  BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
             <StackPanel>
               <DockPanel>
                 <ui:ToggleSwitch DockPanel.Dock="Right" IsChecked="{Binding ViewModel.WeixinEnabled}" Content="启用" />
                 <StackPanel>
                   <TextBlock FontSize="19" FontWeight="SemiBold" Text="微信 ClawBot" />
-                  <TextBlock Margin="0,3,0,0" Foreground="#10B981" Text="腾讯官方 iLink 协议" />
+                  <TextBlock Margin="0,3,0,0" Foreground="{DynamicResource AppSuccessBrush}" Text="腾讯官方 iLink 协议" />
                 </StackPanel>
               </DockPanel>
-              <Border Margin="0,14,0,14" Padding="10" CornerRadius="8" Background="#1210B981">
+              <Border Margin="0,14,0,14" Padding="10" CornerRadius="8" Background="{DynamicResource AppSuccessSoftBrush}">
                 <StackPanel>
                   <TextBlock FontWeight="SemiBold" Text="{Binding ViewModel.WeixinStatus}" TextWrapping="Wrap" />
-                  <TextBlock Margin="0,3,0,0" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding ViewModel.WeixinAccount}" />
+                  <TextBlock Margin="0,3,0,0" FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding ViewModel.WeixinAccount}" />
                 </StackPanel>
               </Border>
               <TextBlock Margin="0,0,0,6" Text="API 地址" />
@@ -91,17 +91,17 @@
             </StackPanel>
           </Border>
 
-          <Border Grid.Column="2" Padding="18" CornerRadius="12" Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-                  BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+          <Border Grid.Column="2" Padding="18" CornerRadius="12" Background="{DynamicResource AppCardBrush}"
+                  BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
             <StackPanel>
               <DockPanel>
                 <ui:ToggleSwitch DockPanel.Dock="Right" IsChecked="{Binding ViewModel.QqEnabled}" Content="启用" />
                 <StackPanel>
                   <TextBlock FontSize="19" FontWeight="SemiBold" Text="QQ 机器人" />
-                  <TextBlock Margin="0,3,0,0" Foreground="#10B981" Text="腾讯官方 Bot API / Gateway" />
+                  <TextBlock Margin="0,3,0,0" Foreground="{DynamicResource AppSuccessBrush}" Text="腾讯官方 Bot API / Gateway" />
                 </StackPanel>
               </DockPanel>
-              <Border Margin="0,14,0,14" Padding="10" CornerRadius="8" Background="#1210B981">
+              <Border Margin="0,14,0,14" Padding="10" CornerRadius="8" Background="{DynamicResource AppSuccessSoftBrush}">
                 <TextBlock FontWeight="SemiBold" Text="{Binding ViewModel.QqStatus}" TextWrapping="Wrap" />
               </Border>
               <TextBlock Margin="0,0,0,6" Text="机器人 AppID" />
@@ -113,14 +113,14 @@
                        Text="{Binding ViewModel.QqAllowedUsers, UpdateSourceTrigger=PropertyChanged}" />
               <ui:Button HorizontalAlignment="Left" Content="验证官方凭据" Command="{Binding ViewModel.TestQqCommand}" />
               <TextBlock Margin="0,12,0,0" FontSize="12" TextWrapping="Wrap"
-                         Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                         Foreground="{DynamicResource AppTextSecondaryBrush}"
                          Text="在 QQ 开放平台创建机器人并开通 C2C/群消息事件。VoWin 主动连接官方 Gateway，无需公网回调地址。" />
             </StackPanel>
           </Border>
         </Grid>
 
-        <Border Margin="0,16,0,0" Padding="18" CornerRadius="12" Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-                BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+        <Border Margin="0,16,0,0" Padding="18" CornerRadius="12" Background="{DynamicResource AppCardBrush}"
+                BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
           <Grid>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="*" />
@@ -129,10 +129,10 @@
             </Grid.ColumnDefinitions>
             <StackPanel Grid.Column="0">
               <TextBlock FontSize="18" FontWeight="SemiBold" Text="授权与通知" />
-              <TextBlock Margin="0,4,0,14" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+              <TextBlock Margin="0,4,0,14" TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}"
                          Text="未授权用户无法查询短信、拨号或更改设备状态。可生成一次性配对码绑定新用户。" />
               <ui:Button HorizontalAlignment="Left" Content="生成一次性配对码" Command="{Binding ViewModel.CreatePairingCodeCommand}" />
-              <TextBlock Margin="0,10,0,0" FontWeight="SemiBold" Foreground="#10B981" Text="{Binding ViewModel.PairingStatus}" />
+              <TextBlock Margin="0,10,0,0" FontWeight="SemiBold" Foreground="{DynamicResource AppSuccessBrush}" Text="{Binding ViewModel.PairingStatus}" />
               <ui:ToggleSwitch Margin="0,16,0,0" IsChecked="{Binding ViewModel.NotifyIncomingSms}" Content="推送收到的短信" />
               <ui:ToggleSwitch Margin="0,10,0,0" IsChecked="{Binding ViewModel.NotifyOtpOnly}" Content="只推送含验证码的短信" />
               <ui:ToggleSwitch Margin="0,10,0,0" IsChecked="{Binding ViewModel.NotifyIncomingCalls}" Content="推送来电提醒" />
@@ -145,12 +145,12 @@
           </Grid>
         </Border>
 
-        <Border Margin="0,16,0,0" Padding="16" CornerRadius="10" Background="#1010B981"
-                BorderBrush="#4010B981" BorderThickness="1">
+        <Border Margin="0,16,0,0" Padding="16" CornerRadius="10" Background="{DynamicResource AppSuccessSoftBrush}"
+                BorderBrush="{DynamicResource AppSuccessBrush}" BorderThickness="1">
           <StackPanel>
             <TextBlock FontWeight="SemiBold" Text="运行状态" />
             <TextBlock Margin="0,6,0,0" TextWrapping="Wrap" Text="{Binding ViewModel.LastActivity}" />
-            <TextBlock Margin="0,6,0,0" TextWrapping="Wrap" Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+            <TextBlock Margin="0,6,0,0" TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}"
                        Text="{Binding ViewModel.OperationStatus}" />
           </StackPanel>
         </Border>

@@ -590,6 +590,9 @@ public class VoWifiManager : IDisposable
                 throw new InvalidOperationException(
                     "USIM modem is unavailable. The existing VoWiFi intent is preserved and registration will retry when the module returns.");
             IAkaProvider akaProvider = new Ec25AkaProvider(Modem.Session);
+            if (!await akaProvider.CheckReadyAsync(sim.Iccid, ct).ConfigureAwait(false))
+                throw new InvalidOperationException(
+                    "The live USIM ICCID does not match the identity selected for VoWiFi. Authentication was blocked before EAP-AKA; refresh the SIM identity after switching profiles.");
 
             // ── 3. IKEv2 / EAP-AKA Handshake & Child SA (C# Full Stack) ─────
             string? fallbackPcscf = null;

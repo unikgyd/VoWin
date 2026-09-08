@@ -10,6 +10,9 @@ public class ModemDriver : IAsyncDisposable
 {
     private readonly AtSession _session;
     private readonly AsyncEventBus? _eventBus;
+    private volatile bool _isRadioStateKnown;
+    private volatile bool _isRadioDisabled;
+    private volatile bool _radioStatusReportingEnabled;
 
     public event EventHandler<ModemConnectionChangedEventArgs>? ConnectionChanged;
     public event EventHandler<SignalChangedEventArgs>? SignalChanged;
@@ -21,6 +24,7 @@ public class ModemDriver : IAsyncDisposable
     public ModemDriver(string portName, int baudRate = 115200, AsyncEventBus? eventBus = null)
     {
         _session = new AtSession(portName, baudRate, eventBus);
+        _session.UrcPublicationFilter = ShouldPublishUrc;
         _eventBus = eventBus;
         _session.UrcReceived += (s, urc) =>
         {
@@ -135,12 +139,58 @@ public class ModemDriver : IAsyncDisposable
         return string.Empty;
     }
 
-    public async Task<bool> RefreshSimAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Reads the subscriber's own number from EF-MSISDN through the standard
+    /// 3GPP AT+CNUM command. Many data-only and prepaid profiles intentionally
+    /// leave this file empty; an empty result therefore means "not supplied by
+    /// the card", not a modem or parsing failure.
+    /// </summary>
+    public async Task<string> GetPhoneNumberAsync(CancellationToken ct = default)
     {
-        // Cycle radio to trigger full SIM & baseband reload
+        var resp = await _session.ExecuteCommandAsync("AT+CNUM", 3000, ct).ConfigureAwait(false);
+        return resp.Success ? ParseOwnPhoneNumber(resp.Lines) : string.Empty;
+    }
+
+    internal static string ParseOwnPhoneNumber(IEnumerable<string> lines)
+    {
+        foreach (var line in lines)
+        {
+            // 3GPP TS 27.007: +CNUM: [<alpha>],<number>,<type>[,...]
+            // Quectel firmware may omit <alpha>, but keeps the comma before the
+            // quoted number. Accept both forms without treating the alpha label
+            // itself as a phone number.
+            var match = Regex.Match(
+                line,
+                @"^\s*\+CNUM:\s*(?:""[^""]*""\s*)?,?\s*""?(?<number>\+?[0-9][0-9 ()-]*)""?\s*,\s*(?<type>\d+)",
+                RegexOptions.IgnoreCase);
+            if (!match.Success) continue;
+
+            var number = Regex.Replace(match.Groups["number"].Value, @"[\s()-]", "");
+            if (number.Length == 0) continue;
+
+            // TON 145 denotes an international number. Some cards omit the
+            // literal '+' even though the type says it is international.
+            if (match.Groups["type"].Value == "145" && number[0] != '+')
+                number = "+" + number;
+
+            return number;
+        }
+
+        return string.Empty;
+    }
+
+    public async Task<bool> RefreshSimAsync(CancellationToken ct = default, bool preserveFlightMode = false)
+    {
+        // Cycle the baseband so CIMI/QCCID/CNUM cannot return the previous
+        // profile from a modem cache. Restore CFUN=4 when the caller was in
+        // flight mode instead of accidentally enabling cellular RF.
         await _session.ExecuteCommandAsync("AT+CFUN=0", 3000, ct).ConfigureAwait(false);
         try { await Task.Delay(800, ct).ConfigureAwait(false); } catch { }
-        var resp = await _session.ExecuteCommandAsync("AT+CFUN=1", 3000, ct).ConfigureAwait(false);
+        var targetCfun = preserveFlightMode ? 4 : 1;
+        var resp = await _session.ExecuteCommandAsync($"AT+CFUN={targetCfun}", 3000, ct).ConfigureAwait(false);
+        _isRadioStateKnown = true;
+        _isRadioDisabled = preserveFlightMode;
+        _radioStatusReportingEnabled = !preserveFlightMode;
 
         // Wait for CPIN: READY (up to 6s)
         for (int i = 0; i < 12; i++)
@@ -159,14 +209,35 @@ public class ModemDriver : IAsyncDisposable
 
     public async Task<bool> SetFlightModeAsync(bool enable, CancellationToken ct = default)
     {
-        string cmd = enable ? "AT+CFUN=4" : "AT+CFUN=1";
-        var resp = await _session.ExecuteCommandAsync(cmd, 3000, ct).ConfigureAwait(false);
-        if (resp.Success)
+        var previousKnown = _isRadioStateKnown;
+        var previousDisabled = _isRadioDisabled;
+        var previousReportingEnabled = _radioStatusReportingEnabled;
+
+        // Some modems emit a transient registration status before CFUN returns OK.
+        _isRadioStateKnown = true;
+        _isRadioDisabled = enable;
+        _radioStatusReportingEnabled = !enable;
+        try
         {
-            _eventBus?.Publish("modem.flightmode", "Modem", enable ? "ON" : "OFF");
-            try { FlightModeChanged?.Invoke(this, new FlightModeChangedEventArgs(enable, enable ? 4 : 1)); } catch { }
-            return true;
+            string cmd = enable ? "AT+CFUN=4" : "AT+CFUN=1";
+            var resp = await _session.ExecuteCommandAsync(cmd, 3000, ct).ConfigureAwait(false);
+            if (resp.Success)
+            {
+                _eventBus?.Publish("modem.flightmode", "Modem", enable ? "ON" : "OFF");
+                try { FlightModeChanged?.Invoke(this, new FlightModeChangedEventArgs(enable, enable ? 4 : 1)); } catch { }
+                return true;
+            }
         }
+        catch
+        {
+            _isRadioStateKnown = previousKnown;
+            _isRadioDisabled = previousDisabled;
+            _radioStatusReportingEnabled = previousReportingEnabled;
+            throw;
+        }
+        _isRadioStateKnown = previousKnown;
+        _isRadioDisabled = previousDisabled;
+        _radioStatusReportingEnabled = previousReportingEnabled;
         return false;
     }
 
@@ -178,11 +249,25 @@ public class ModemDriver : IAsyncDisposable
             var match = Regex.Match(resp.FirstDataLine, @"\+CFUN:\s*(\d+)");
             if (match.Success && int.TryParse(match.Groups[1].Value, out var cfun))
             {
+                _isRadioDisabled = cfun is 0 or 4;
+                _isRadioStateKnown = true;
                 return cfun;
             }
         }
         return 1;
     }
+
+    private bool ShouldPublishUrc(string line)
+    {
+        if (!IsRadioStatusUrc(line)) return true;
+        return _isRadioStateKnown && !_isRadioDisabled && _radioStatusReportingEnabled;
+    }
+
+    internal static bool IsRadioStatusUrc(string line) =>
+        line.StartsWith("+CREG:", StringComparison.OrdinalIgnoreCase) ||
+        line.StartsWith("+CEREG:", StringComparison.OrdinalIgnoreCase) ||
+        line.StartsWith("+CGREG:", StringComparison.OrdinalIgnoreCase) ||
+        line.StartsWith("+CSQ:", StringComparison.OrdinalIgnoreCase);
 
     public async Task<bool> RebootBasebandAsync(CancellationToken ct = default)
     {
@@ -192,6 +277,10 @@ public class ModemDriver : IAsyncDisposable
 
     public async Task<SignalQuality> GetSignalAsync(CancellationToken ct = default)
     {
+        if (_isRadioStateKnown && !_isRadioDisabled)
+        {
+            _radioStatusReportingEnabled = true;
+        }
         var resp = await _session.ExecuteCommandAsync("AT+CSQ", 2000, ct).ConfigureAwait(false);
         if (resp.Success)
         {
@@ -228,6 +317,10 @@ public class ModemDriver : IAsyncDisposable
 
     public async Task<NetworkRegistration> GetRegistrationAsync(CancellationToken ct = default)
     {
+        if (_isRadioStateKnown && !_isRadioDisabled)
+        {
+            _radioStatusReportingEnabled = true;
+        }
         var resp = await _session.ExecuteCommandAsync("AT+CEREG?", 2000, ct).ConfigureAwait(false);
         if (!resp.Success)
             resp = await _session.ExecuteCommandAsync("AT+CREG?", 2000, ct).ConfigureAwait(false);
@@ -493,7 +586,7 @@ public class ModemDriver : IAsyncDisposable
         return false;
     }
 
-    public async Task<byte[]> SendCsimApduAsync(byte[] apdu, CancellationToken ct = default)
+    public async Task<byte[]> SendCsimApduAsync(byte[] apdu, CancellationToken ct = default, int timeoutMs = 10000)
     {
         var apduHex = HexUtils.ToHexString(apdu);
         AtResponse? resp = null;
@@ -501,7 +594,7 @@ public class ModemDriver : IAsyncDisposable
         // Retry up to 3 times for transient +CME ERROR: 0 (SIM busy / channel race per VoCat)
         for (int attempt = 0; attempt < 3; attempt++)
         {
-            resp = await _session.ExecuteCommandAsync($"AT+CSIM={apduHex.Length},\"{apduHex}\"", 10000, ct).ConfigureAwait(false);
+            resp = await _session.ExecuteCommandAsync($"AT+CSIM={apduHex.Length},\"{apduHex}\"", timeoutMs, ct).ConfigureAwait(false);
             if (resp.Success) break;
 
             bool isTransient = resp.Lines.Any(l => l.Contains("+CME ERROR: 0", StringComparison.OrdinalIgnoreCase));

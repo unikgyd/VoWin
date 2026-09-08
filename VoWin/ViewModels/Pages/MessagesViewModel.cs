@@ -315,7 +315,7 @@ namespace VoWin.ViewModels.Pages
             {
                 SenderOrRecipient = "10690007890",
                 Text = "【阿里云】您正在登录控制台，验证码为 839201，请在 5 分钟内完成验证。切勿告知他人！",
-                Timestamp = DateTime.Now,
+                Timestamp = DateTime.UtcNow,
                 IsOutgoing = false,
                 DeliveryState = SmsDeliveryState.Received
             };

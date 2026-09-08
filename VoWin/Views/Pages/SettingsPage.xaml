@@ -13,69 +13,139 @@
   d:DesignHeight="750"
   d:DesignWidth="900"
   ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
-  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
-  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
-  Background="Transparent"
+  ui:Design.Foreground="{DynamicResource AppTextPrimaryBrush}"
+  Foreground="{DynamicResource AppTextPrimaryBrush}"
+  Background="{DynamicResource AppSurfaceBrush}"
   PreviewMouseWheel="OnPagePreviewMouseWheel"
   mc:Ignorable="d"
 >
   <Page.Resources>
     <helpers:EnumToBooleanConverter x:Key="EnumToBooleanConverter" />
+    <Style x:Key="ThemeChoiceStyle" TargetType="RadioButton">
+      <Setter Property="Padding" Value="14,12" />
+      <Setter Property="Background" Value="{DynamicResource AppInputBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppDividerBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="Cursor" Value="Hand" />
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <Border
+              x:Name="ChoiceCard"
+              Padding="{TemplateBinding Padding}"
+              Background="{TemplateBinding Background}"
+              BorderBrush="{TemplateBinding BorderBrush}"
+              BorderThickness="{TemplateBinding BorderThickness}"
+              CornerRadius="10">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <ContentPresenter VerticalAlignment="Center" />
+                <Grid Grid.Column="1" Width="18" Height="18" Margin="12,0,0,0" VerticalAlignment="Center">
+                  <Ellipse x:Name="ChoiceRing" Stroke="{DynamicResource AppCardBorderBrush}" StrokeThickness="1.5" />
+                  <Ellipse x:Name="ChoiceDot" Width="8" Height="8" Fill="{DynamicResource AppAccentBrush}" Opacity="0" />
+                </Grid>
+              </Grid>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="ChoiceCard" Property="Background" Value="{DynamicResource AppHoverBrush}" />
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="ChoiceCard" Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" />
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="ChoiceCard" Property="Background" Value="{DynamicResource AppAccentSoftBrush}" />
+                <Setter TargetName="ChoiceCard" Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" />
+                <Setter TargetName="ChoiceRing" Property="Stroke" Value="{DynamicResource AppAccentBrush}" />
+                <Setter TargetName="ChoiceDot" Property="Opacity" Value="1" />
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="ChoiceCard" Property="Opacity" Value="0.5" />
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
   </Page.Resources>
 
-  <Grid Margin="32,24,32,32" Background="Transparent">
+  <Grid Margin="24,18,24,24" Background="Transparent">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
     </Grid.RowDefinitions>
 
     <!-- Header -->
-    <Grid Grid.Row="0" Margin="0,0,0,24" Background="Transparent">
-      <TextBlock
-        FontSize="28"
-        FontWeight="SemiBold"
-        Text="设置"
-      />
+    <Grid Grid.Row="0" Margin="0,0,0,20" Background="Transparent">
+      <StackPanel>
+        <TextBlock Style="{DynamicResource AppPageTitleStyle}" Text="设置" />
+        <TextBlock Style="{DynamicResource AppPageSubtitleStyle}" Text="调整外观、通话行为与应用偏好" />
+      </StackPanel>
     </Grid>
 
     <ScrollViewer
       x:Name="SettingsScrollViewer"
       Grid.Row="1"
       Background="Transparent"
+      HorizontalContentAlignment="Stretch"
       VerticalScrollBarVisibility="Auto"
     >
-      <StackPanel MaxWidth="800" HorizontalAlignment="Left" Background="Transparent">
+      <StackPanel MaxWidth="920" HorizontalAlignment="Center" Background="Transparent">
         
         <!-- Section 1: Personalization -->
         <Border
           Margin="0,0,0,16"
           Padding="16,14"
-          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          Background="{DynamicResource AppCardBrush}"
+          BorderBrush="{DynamicResource AppCardBorderBrush}"
           BorderThickness="1"
           CornerRadius="12"
         >
           <StackPanel>
-            <TextBlock FontSize="18" FontWeight="SemiBold" Text="界面与个性化" />
-            <TextBlock Margin="0,4,0,20" FontSize="13" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="选择应用的主题外观模式" />
+            <TextBlock Style="{DynamicResource AppSectionTitleStyle}" Text="界面与个性化" />
+            <TextBlock Style="{DynamicResource AppPageSubtitleStyle}" Margin="0,4,0,16" Text="主题选择会立即生效，并在下次启动时保留" />
 
-            <StackPanel Orientation="Horizontal">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="12" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
               <RadioButton
-                Margin="0,0,32,0"
-                Command="{Binding ViewModel.ChangeThemeCommand, Mode=OneWay}"
-                CommandParameter="theme_light"
-                Content="浅色主题 (Light)"
-                GroupName="themeSelect"
-                IsChecked="{Binding ViewModel.CurrentTheme, Converter={StaticResource EnumToBooleanConverter}, ConverterParameter=Light, Mode=OneWay}"
-              />
+                  Grid.Column="0"
+                  Style="{StaticResource ThemeChoiceStyle}"
+                  Command="{Binding ViewModel.ChangeThemeCommand, Mode=OneWay}"
+                  CommandParameter="theme_light"
+                  GroupName="themeSelect"
+                  IsChecked="{Binding ViewModel.CurrentTheme, Converter={StaticResource EnumToBooleanConverter}, ConverterParameter=Light, Mode=OneWay}">
+                  <StackPanel Orientation="Horizontal">
+                    <ui:SymbolIcon Symbol="WeatherSunny24" FontSize="20" Margin="0,0,10,0" Foreground="{DynamicResource AppWarningBrush}" />
+                    <StackPanel>
+                      <TextBlock FontWeight="SemiBold" Text="浅色主题" />
+                      <TextBlock Style="{DynamicResource AppCaptionStyle}" Margin="0,2,0,0" Text="淡蓝画布 · 明亮清晰" />
+                    </StackPanel>
+                  </StackPanel>
+              </RadioButton>
               <RadioButton
-                Command="{Binding ViewModel.ChangeThemeCommand, Mode=OneWay}"
-                CommandParameter="theme_dark"
-                Content="深色主题 (Dark)"
-                GroupName="themeSelect"
-                IsChecked="{Binding ViewModel.CurrentTheme, Converter={StaticResource EnumToBooleanConverter}, ConverterParameter=Dark, Mode=OneWay}"
-              />
-            </StackPanel>
+                  Grid.Column="2"
+                  Style="{StaticResource ThemeChoiceStyle}"
+                  Command="{Binding ViewModel.ChangeThemeCommand, Mode=OneWay}"
+                  CommandParameter="theme_dark"
+                  GroupName="themeSelect"
+                  IsChecked="{Binding ViewModel.CurrentTheme, Converter={StaticResource EnumToBooleanConverter}, ConverterParameter=Dark, Mode=OneWay}">
+                  <StackPanel Orientation="Horizontal">
+                    <ui:SymbolIcon Symbol="WeatherMoon24" FontSize="20" Margin="0,0,10,0" Foreground="{DynamicResource AppAccentBrush}" />
+                    <StackPanel>
+                      <TextBlock FontWeight="SemiBold" Text="深色主题" />
+                      <TextBlock Style="{DynamicResource AppCaptionStyle}" Margin="0,2,0,0" Text="海军蓝黑 · 低眩光" />
+                    </StackPanel>
+                  </StackPanel>
+              </RadioButton>
+            </Grid>
           </StackPanel>
         </Border>
 
@@ -83,14 +153,14 @@
         <Border
           Margin="0,0,0,16"
           Padding="16,14"
-          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          Background="{DynamicResource AppCardBrush}"
+          BorderBrush="{DynamicResource AppCardBorderBrush}"
           BorderThickness="1"
           CornerRadius="12"
         >
           <StackPanel>
             <TextBlock FontSize="18" FontWeight="SemiBold" Text="策略" />
-            <TextBlock Margin="0,4,0,20" FontSize="13" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="全局行为设置" />
+            <TextBlock Margin="0,4,0,20" FontSize="13" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="全局行为设置" />
 
             <ui:ToggleSwitch
               Margin="0,0,0,16"
@@ -104,13 +174,13 @@
           </StackPanel>
         </Border>
 
-        <Border Margin="0,0,0,16" Padding="16,14" Background="{DynamicResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="12">
+        <Border Margin="0,0,0,16" Padding="16,14" Background="{DynamicResource AppCardBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="12">
           <StackPanel>
             <TextBlock FontSize="18" FontWeight="SemiBold" Text="通话音频与自动接听" />
-            <TextBlock Margin="0,4,0,16" FontSize="13" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="设置 VoLTE 音频启动速度、来电响铃和超时自动接听。" />
+            <TextBlock Margin="0,4,0,16" FontSize="13" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="设置 VoLTE 音频启动速度、来电响铃和超时自动接听。" />
             <ui:ToggleSwitch Margin="0,0,0,8" IsChecked="{Binding ViewModel.VolteAudioPrewarmEnabled}" Content="启用 VoLTE 音频预热" />
-            <Border Margin="0,0,0,18" Padding="12,9" Background="#18FFB900" BorderBrush="#66FFB900" BorderThickness="1" CornerRadius="6">
-              <TextBlock Foreground="{DynamicResource TextFillColorPrimaryBrush}" TextWrapping="Wrap" Text="注意：开启 VoLTE 音频预热后，VoWin 会长期占用麦克风，以缩短接通后的音频启动时间。关闭后，麦克风只在实际通话时启用。" />
+            <Border Margin="0,0,0,18" Padding="12,9" Background="{DynamicResource AppWarningSoftBrush}" BorderBrush="{DynamicResource AppWarningBrush}" BorderThickness="1" CornerRadius="8">
+              <TextBlock Foreground="{DynamicResource AppTextPrimaryBrush}" TextWrapping="Wrap" Text="注意：开启 VoLTE 音频预热后，VoWin 会长期占用麦克风，以缩短接通后的音频启动时间。关闭后，麦克风只在实际通话时启用。" />
             </Border>
             <ui:ToggleSwitch Margin="0,0,0,12" IsChecked="{Binding ViewModel.AutoAnswerEnabled}" Content="30 秒无人接听时自动接听" />
             <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
@@ -123,7 +193,7 @@
               <TextBox Margin="0,0,12,0" Text="{Binding ViewModel.AutoAnswerMessagePath, UpdateSourceTrigger=PropertyChanged}" />
             </DockPanel>
             <ui:Button HorizontalAlignment="Left" Appearance="Primary" Content="保存通话设置" Command="{Binding ViewModel.SaveCallSettingsCommand}" />
-            <TextBlock Margin="0,10,0,0" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding ViewModel.CallSettingsStatus}" />
+            <TextBlock Margin="0,10,0,0" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding ViewModel.CallSettingsStatus}" />
           </StackPanel>
         </Border>
       </StackPanel>

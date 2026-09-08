@@ -23,31 +23,18 @@ namespace VoWin.ViewModels.Pages
         private readonly IVoKernelService _kernelService;
         private int _refreshSummaryScheduled;
 
-        // UI Design Token Colors (Frozen for performance & thread safety)
-        public static readonly Brush TokenPrimary = new SolidColorBrush(Color.FromRgb(0x25, 0x63, 0xEB));   // #2563EB 选中 / 主操作 / 进行中
-        public static readonly Brush TokenPrimaryBg = new SolidColorBrush(Color.FromArgb(0x1E, 0x25, 0x63, 0xEB));
-        public static readonly Brush TokenSuccess = new SolidColorBrush(Color.FromRgb(0x16, 0xA3, 0x4A));   // #16A34A 就绪 / 在线 / 已连接
-        public static readonly Brush TokenSuccessBg = new SolidColorBrush(Color.FromArgb(0x1E, 0x16, 0xA3, 0x4A));
-        public static readonly Brush TokenWarning = new SolidColorBrush(Color.FromRgb(0xF5, 0x9E, 0x0B));   // #F59E0B 较弱 / 警告 / 重试
-        public static readonly Brush TokenWarningBg = new SolidColorBrush(Color.FromArgb(0x1E, 0xF5, 0x9E, 0x0B));
-        public static readonly Brush TokenDanger = new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26));    // #DC2626 错误 / 失败 / 危险操作
-        public static readonly Brush TokenDangerBg = new SolidColorBrush(Color.FromArgb(0x1E, 0xDC, 0x26, 0x26));
-        public static readonly Brush TokenMuted = new SolidColorBrush(Color.FromRgb(0x66, 0x70, 0x85));     // #667085 离线 / 未连接 / 次要
-        public static readonly Brush TokenMutedBg = new SolidColorBrush(Color.FromArgb(0x14, 0x66, 0x70, 0x85));
-
-        static ModemManagerViewModel()
-        {
-            TokenPrimary.Freeze();
-            TokenPrimaryBg.Freeze();
-            TokenSuccess.Freeze();
-            TokenSuccessBg.Freeze();
-            TokenWarning.Freeze();
-            TokenWarningBg.Freeze();
-            TokenDanger.Freeze();
-            TokenDangerBg.Freeze();
-            TokenMuted.Freeze();
-            TokenMutedBg.Freeze();
-        }
+        // Semantic brushes resolve from the live theme so status cards update
+        // consistently when the user switches between light and dark mode.
+        public static Brush TokenPrimary => ThemeBrushes.Accent;
+        public static Brush TokenPrimaryBg => ThemeBrushes.Get("AppAccentSoftBrush", Color.FromRgb(0xE7, 0xF0, 0xFF));
+        public static Brush TokenSuccess => ThemeBrushes.Success;
+        public static Brush TokenSuccessBg => ThemeBrushes.Get("AppSuccessSoftBrush", Color.FromRgb(0xE7, 0xF8, 0xF2));
+        public static Brush TokenWarning => ThemeBrushes.Warning;
+        public static Brush TokenWarningBg => ThemeBrushes.Get("AppWarningSoftBrush", Color.FromRgb(0xFF, 0xF5, 0xE6));
+        public static Brush TokenDanger => ThemeBrushes.Danger;
+        public static Brush TokenDangerBg => ThemeBrushes.Get("AppDangerSoftBrush", Color.FromRgb(0xFF, 0xF0, 0xF3));
+        public static Brush TokenMuted => ThemeBrushes.Muted;
+        public static Brush TokenMutedBg => ThemeBrushes.Get("AppInputBrush", Color.FromRgb(0xF8, 0xFB, 0xFF));
         private CancellationTokenSource? _flightModeChangeCts;
         private bool _isLoadingPreferences;
         private int _preferenceLoadVersion;
@@ -127,10 +114,32 @@ namespace VoWin.ViewModels.Pages
         [ObservableProperty]
         private string _euiccDownloadStatus = "等待输入激活链接或选择二维码";
 
+        [ObservableProperty]
+        private string _euiccDownloadPhase = "尚未开始";
+
+        [ObservableProperty]
+        private bool _hasEuiccDownloadActivity;
+
+        [ObservableProperty]
+        private bool _hasEuiccDownloadError;
+
+        [ObservableProperty]
+        private string _euiccDownloadFailureDetails = string.Empty;
+
+        [ObservableProperty]
+        private bool _allowUntrustedEuiccTls;
+
+        [ObservableProperty]
+        private bool _allowUncertainEuiccRetry;
+
+        public ObservableCollection<string> EuiccDownloadLog { get; } = new();
+
         private CancellationTokenSource? _euiccDownloadCts;
         private readonly HashSet<string> _blockedEuiccActivationFingerprints = new(StringComparer.Ordinal);
+        private string _lastEuiccProgressEntry = string.Empty;
 
         partial void OnEuiccActivationCodeChanged(string value) => DownloadEuiccProfileCommand.NotifyCanExecuteChanged();
+        partial void OnAllowUncertainEuiccRetryChanged(bool value) => DownloadEuiccProfileCommand.NotifyCanExecuteChanged();
 
         partial void OnIsEuiccDownloadingChanged(bool value)
         {
@@ -190,6 +199,9 @@ namespace VoWin.ViewModels.Pages
         private bool _moduleVoWifi = true;
 
         [ObservableProperty]
+        private string _moduleName = string.Empty;
+
+        [ObservableProperty]
         private bool _moduleCellularData = true;
 
         [ObservableProperty]
@@ -246,7 +258,25 @@ namespace VoWin.ViewModels.Pages
             _kernelService.Kernel.VoWifiStateChanged += (s, e) => RefreshSummaryProperties();
             _kernelService.Kernel.SignalQualityChanged += (s, e) => RefreshSummaryProperties();
             _kernelService.Kernel.NetworkRegistrationChanged += (s, e) => RefreshSummaryProperties();
-            _kernelService.Kernel.SimStateChanged += (s, e) => RefreshSummaryProperties();
+            _kernelService.Kernel.SimStateChanged += (s, e) =>
+            {
+                RefreshSummaryProperties();
+                var slot = SelectedSlot;
+                if (slot == null || (!string.IsNullOrEmpty(e.SlotId) &&
+                    !string.Equals(e.SlotId, slot.Id, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return;
+                }
+
+                App.Current?.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (ReferenceEquals(SelectedSlot, slot))
+                    {
+                        _ = LoadPreferencesForSlotAsync(slot);
+                    }
+                }), System.Windows.Threading.DispatcherPriority.DataBind);
+            };
+            _kernelService.Kernel.FlightModeChanged += (s, e) => RefreshSummaryProperties();
         }
 
         [RelayCommand]
@@ -426,21 +456,27 @@ namespace VoWin.ViewModels.Pages
             var loadVersion = Interlocked.Increment(ref _preferenceLoadVersion);
             try
             {
-                // Align directly with actual modem hardware state
                 _isLoadingPreferences = true;
-                ModuleFlightMode = slot.IsFlightMode;
 
                 var modPref = await _kernelService.Preferences.GetModulePreferenceAsync(slot.Id, slot.Imei);
                 if (loadVersion != Volatile.Read(ref _preferenceLoadVersion)) return;
                 if (modPref != null)
                 {
+                    ModuleName = string.IsNullOrWhiteSpace(modPref.CustomName) ? slot.Name : modPref.CustomName;
+                    ModuleFlightMode = modPref.DefaultFlightMode;
                     ModuleVoWifi = modPref.DefaultVoWifi;
                     ModuleCellularData = modPref.DefaultCellularData;
                     ModuleDataRoaming = modPref.DefaultDataRoaming;
                     ModuleProxyUrl = modPref.DefaultProxyUrl ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(modPref.CustomName))
+                    {
+                        slot.Name = modPref.CustomName.Trim();
+                    }
                 }
                 else
                 {
+                    ModuleName = slot.Name;
+                    ModuleFlightMode = slot.IsFlightMode;
                     ModuleVoWifi = true;
                     ModuleCellularData = true;
                     ModuleDataRoaming = true;
@@ -459,16 +495,28 @@ namespace VoWin.ViewModels.Pages
                         SimCellularData = simPref.DefaultCellularData;
                         SimDataRoaming = simPref.DefaultDataRoaming;
                         SimProxyUrl = simPref.DedicatedProxyUrl ?? string.Empty;
+                        slot.CardNickname = simPref.CardNickname;
                     }
                     else
                     {
-                        SimCardNickname = slot.Sim.OperatorName ?? string.Empty;
-                        SimFlightMode = false;
-                        SimVoWifi = true;
-                        SimCellularData = true;
-                        SimDataRoaming = true;
+                        SimCardNickname = string.Empty;
+                        SimFlightMode = ModuleFlightMode;
+                        SimVoWifi = ModuleVoWifi;
+                        SimCellularData = ModuleCellularData;
+                        SimDataRoaming = ModuleDataRoaming;
                         SimProxyUrl = string.Empty;
+                        slot.CardNickname = null;
                     }
+                }
+                else
+                {
+                    SimCardNickname = string.Empty;
+                    SimFlightMode = ModuleFlightMode;
+                    SimVoWifi = ModuleVoWifi;
+                    SimCellularData = ModuleCellularData;
+                    SimDataRoaming = ModuleDataRoaming;
+                    SimProxyUrl = string.Empty;
+                    slot.CardNickname = null;
                 }
                 PreferenceStatusMessage = $"已同步 [{slot.Name}] 的 SQLite 偏好。";
             }
@@ -497,7 +545,8 @@ namespace VoWin.ViewModels.Pages
                     ModuleVoWifi,
                     ModuleCellularData,
                     ModuleDataRoaming,
-                    string.IsNullOrWhiteSpace(ModuleProxyUrl) ? null : ModuleProxyUrl.Trim()
+                    string.IsNullOrWhiteSpace(ModuleProxyUrl) ? null : ModuleProxyUrl.Trim(),
+                    string.IsNullOrWhiteSpace(ModuleName) ? null : ModuleName.Trim()
                 );
                 PreferenceStatusMessage = $"模块 [{SelectedSlot.Name}] 偏好已持久化至 SQLite。";
                 StatusMessage = PreferenceStatusMessage;
@@ -505,6 +554,7 @@ namespace VoWin.ViewModels.Pages
             catch (Exception ex)
             {
                 PreferenceStatusMessage = $"保存模块偏好失败: {ex.Message}";
+                StatusMessage = PreferenceStatusMessage;
             }
         }
 
@@ -514,31 +564,27 @@ namespace VoWin.ViewModels.Pages
             if (SelectedSlot?.Sim == null || string.IsNullOrEmpty(SelectedSlot.Sim.Iccid))
             {
                 PreferenceStatusMessage = "当前卡槽未插入或未识别 SIM 卡 ICCID。";
+                StatusMessage = PreferenceStatusMessage;
                 return;
             }
 
             try
             {
-                var pref = new SimPreferenceModel
-                {
-                    Iccid = SelectedSlot.Sim.Iccid,
-                    Imsi = SelectedSlot.Sim.Imsi,
-                    CardNickname = string.IsNullOrWhiteSpace(SimCardNickname) ? null : SimCardNickname.Trim(),
-                    DefaultFlightMode = SimFlightMode,
-                    DefaultVoWifi = SimVoWifi,
-                    DefaultCellularData = SimCellularData,
-                    DefaultDataRoaming = SimDataRoaming,
-                    DedicatedProxyUrl = string.IsNullOrWhiteSpace(SimProxyUrl) ? null : SimProxyUrl.Trim(),
-                    LastSeenAt = DateTime.Now
-                };
-
-                await _kernelService.Preferences.SaveSimPreferenceAsync(pref);
+                await _kernelService.SaveSimPreferencesAsync(
+                    SelectedSlot.Sim.Iccid,
+                    SimFlightMode,
+                    SimVoWifi,
+                    SimCellularData,
+                    SimDataRoaming,
+                    string.IsNullOrWhiteSpace(SimProxyUrl) ? null : SimProxyUrl.Trim(),
+                    string.IsNullOrWhiteSpace(SimCardNickname) ? null : SimCardNickname.Trim());
                 PreferenceStatusMessage = $"SIM 卡 [{SelectedSlot.Sim.Iccid}] 偏好已持久化至 SQLite。";
                 StatusMessage = PreferenceStatusMessage;
             }
             catch (Exception ex)
             {
                 PreferenceStatusMessage = $"保存 SIM 偏好失败: {ex.Message}";
+                StatusMessage = PreferenceStatusMessage;
             }
         }
 
@@ -546,8 +592,19 @@ namespace VoWin.ViewModels.Pages
         private async Task SaveAllPreferencesAsync()
         {
             await SaveModulePreferenceAsync();
+            if (PreferenceStatusMessage.StartsWith("保存模块偏好失败", StringComparison.Ordinal)) return;
+
+            if (SelectedSlot?.Sim == null || string.IsNullOrEmpty(SelectedSlot.Sim.Iccid))
+            {
+                PreferenceStatusMessage = "模组偏好已保存；当前未识别到 SIM，未写入卡片偏好。";
+                StatusMessage = PreferenceStatusMessage;
+                return;
+            }
+
             await SaveSimPreferenceAsync();
-            StatusMessage = "卡槽与 SIM 卡偏好已成功保存至 SQLite。";
+            if (PreferenceStatusMessage.StartsWith("保存 SIM 偏好失败", StringComparison.Ordinal)) return;
+            PreferenceStatusMessage = "模组与当前 SIM 卡偏好已成功保存至 SQLite。";
+            StatusMessage = PreferenceStatusMessage;
         }
 
         [RelayCommand]
@@ -786,7 +843,9 @@ namespace VoWin.ViewModels.Pages
             try
             {
                 bool ok = await _kernelService.SwitchEuiccProfileAsync(target.ICCID, SelectedSlot?.Id);
-                StatusMessage = ok ? "Profile 切换成功！正在刷新基带注册..." : "Profile 切换失败。";
+                StatusMessage = ok
+                    ? "Profile 切换成功，新卡 ICCID / IMSI / 号码已重新读取并校验。"
+                    : "Profile 切换失败；VoWiFi 已保持停止。";
                 await LoadEuiccDataAsync();
             }
             catch (Exception ex)
@@ -871,7 +930,7 @@ namespace VoWin.ViewModels.Pages
                !IsEuiccDownloading &&
                SelectedSlot != null &&
                !string.IsNullOrWhiteSpace(EuiccActivationCode) &&
-               !IsEuiccActivationBlocked(EuiccActivationCode);
+               (!IsEuiccActivationBlocked(EuiccActivationCode) || AllowUncertainEuiccRetry);
 
         [RelayCommand(CanExecute = nameof(CanStartEuiccDownload))]
         private async Task DownloadEuiccProfileAsync()
@@ -879,9 +938,10 @@ namespace VoWin.ViewModels.Pages
             var slot = SelectedSlot;
             if (slot == null) return;
 
+            ActivationCodeModel parsed;
             try
             {
-                var parsed = ActivationCodeModel.Parse(EuiccActivationCode);
+                parsed = ActivationCodeModel.Parse(EuiccActivationCode);
                 EuiccActivationCode = parsed.CanonicalCode;
             }
             catch (Exception ex)
@@ -891,20 +951,47 @@ namespace VoWin.ViewModels.Pages
                 return;
             }
 
+            var allowUntrustedTlsForThisDownload = AllowUntrustedEuiccTls;
+            var allowAuthorizedRetryForThisDownload = AllowUncertainEuiccRetry;
+            if (allowUntrustedTlsForThisDownload)
+            {
+                var confirmation = System.Windows.MessageBox.Show(
+                    $"即将允许 {parsed.SmdpAddress} 使用 Windows 不信任的根证书。\n\n" +
+                    "这可能让中间人截获或篡改一次性 eSIM 下载事务。该设置只对本次下载生效；域名不匹配、过期或撤销的证书仍会被拒绝。\n\n仍要继续吗？",
+                    "危险：允许未受信任的根证书",
+                    System.Windows.MessageBoxButton.YesNo,
+                    System.Windows.MessageBoxImage.Warning);
+                if (confirmation != System.Windows.MessageBoxResult.Yes) return;
+            }
+
+            if (allowAuthorizedRetryForThisDownload)
+            {
+                var confirmation = System.Windows.MessageBox.Show(
+                    "只有在已经重新读取卡片、确认没有新增 Profile，并且卡商明确允许重新安装时才能继续。\n\n" +
+                    "继续会清除该激活码的 VoWin 本地事务锁定，并向 SM-DP+ 建立新的下载事务。仍要继续吗？",
+                    "服务商授权重新安装",
+                    System.Windows.MessageBoxButton.YesNo,
+                    System.Windows.MessageBoxImage.Warning);
+                if (confirmation != System.Windows.MessageBoxResult.Yes) return;
+            }
+
             _euiccDownloadCts?.Dispose();
             _euiccDownloadCts = new CancellationTokenSource();
             IsBusy = true;
             IsEuiccDownloading = true;
-            EuiccDownloadProgress = 1;
-            EuiccDownloadStatus = "正在启动安全下载流程";
+            HasEuiccDownloadActivity = true;
+            HasEuiccDownloadError = false;
+            EuiccDownloadFailureDetails = string.Empty;
+            EuiccDownloadLog.Clear();
+            _lastEuiccProgressEntry = string.Empty;
+            RecordEuiccProgress(new EuiccDownloadProgress(1, "正在启动安全下载流程"));
+            if (allowUntrustedTlsForThisDownload)
+                AddEuiccLog($"警告 · 本次下载将允许 {parsed.SmdpAddress} 使用未受信任的根证书");
+            if (allowAuthorizedRetryForThisDownload)
+                AddEuiccLog("警告 · 服务商已授权重新安装，本次将清除匹配的本地事务锁定");
             StatusMessage = $"正在向 [{slot.Name}] 写入 eSIM Profile，请勿拔卡或断电。";
 
-            var progress = new Progress<EuiccDownloadProgress>(value =>
-            {
-                EuiccDownloadProgress = value.Percent;
-                EuiccDownloadStatus = value.Status;
-                CancelEuiccDownloadCommand.NotifyCanExecuteChanged();
-            });
+            var progress = new Progress<EuiccDownloadProgress>(RecordEuiccProgress);
 
             try
             {
@@ -913,16 +1000,18 @@ namespace VoWin.ViewModels.Pages
                     EuiccConfirmationCode,
                     progress,
                     slot.Id,
-                    _euiccDownloadCts.Token);
+                    _euiccDownloadCts.Token,
+                    allowUntrustedTlsForThisDownload,
+                    allowAuthorizedRetryForThisDownload);
 
                 var profiles = await _kernelService.GetEuiccProfilesAsync(slot.Id);
                 EuiccProfiles.Clear();
                 foreach (var profile in profiles) EuiccProfiles.Add(profile);
 
-                EuiccDownloadProgress = 100;
-                EuiccDownloadStatus = result.InstalledWithWarning
+                RecordEuiccProgress(new EuiccDownloadProgress(100, result.InstalledWithWarning
                     ? result.Warning ?? "Profile 已写入，但运营商确认有警告。"
-                    : $"下载完成并已核验，ICCID：{result.Iccid}";
+                    : $"下载完成并已核验，ICCID：{result.Iccid}"));
+                EuiccDownloadPhase = result.InstalledWithWarning ? "写入完成（有警告）" : "写入完成";
                 StatusMessage = result.InstalledWithWarning
                     ? $"eSIM 已写入，需留意确认警告：{result.Warning}"
                     : $"eSIM Profile 已安全写入，ICCID：{result.Iccid}";
@@ -935,18 +1024,23 @@ namespace VoWin.ViewModels.Pages
             {
                 BlockCurrentEuiccActivation();
                 EuiccDownloadStatus = "下载被取消，事务结果需要重新核验；已禁止重复使用当前激活码";
+                EuiccDownloadPhase = "操作已取消";
+                SetEuiccFailure("用户取消了下载。请先重新读取 Profile，确认卡片状态后再继续。", "OperationCanceledException");
                 StatusMessage = "eSIM 下载已取消。请先重新读取 Profile，不能直接再次使用同一二维码。";
             }
             catch (EuiccDownloadUncertainException ex)
             {
                 BlockCurrentEuiccActivation();
                 EuiccDownloadStatus = ex.Message;
+                SetEuiccFailure(ex.Message, ex.GetType().Name);
                 StatusMessage = "eSIM 写卡结果不确定，已锁定当前激活码以防重复消耗。请重新读取卡片。";
             }
             catch (Exception ex)
             {
-                EuiccDownloadStatus = ex.Message;
-                StatusMessage = $"eSIM 下载失败：{ex.Message}";
+                var details = FlattenExceptionMessages(ex);
+                EuiccDownloadStatus = $"失败于 {GetEuiccPhase(EuiccDownloadProgress)}：{details}";
+                SetEuiccFailure(details, ex.GetType().Name);
+                StatusMessage = $"eSIM 下载失败（{EuiccDownloadProgress}% · {GetEuiccPhase(EuiccDownloadProgress)}）：{details}";
             }
             finally
             {
@@ -954,6 +1048,8 @@ namespace VoWin.ViewModels.Pages
                 IsBusy = false;
                 _euiccDownloadCts?.Dispose();
                 _euiccDownloadCts = null;
+                AllowUntrustedEuiccTls = false;
+                AllowUncertainEuiccRetry = false;
             }
         }
 
@@ -964,8 +1060,72 @@ namespace VoWin.ViewModels.Pages
         private void CancelEuiccDownload()
         {
             EuiccDownloadStatus = "正在安全取消下载会话...";
+            AddEuiccLog("正在请求安全取消；取消后会重新核验卡片状态");
             _euiccDownloadCts?.Cancel();
         }
+
+        [RelayCommand]
+        private void CopyEuiccDiagnostics()
+        {
+            if (string.IsNullOrWhiteSpace(EuiccDownloadFailureDetails)) return;
+            Clipboard.SetText(EuiccDownloadFailureDetails);
+            StatusMessage = "eSIM 失败诊断已复制到剪贴板。";
+        }
+
+        private void RecordEuiccProgress(EuiccDownloadProgress value)
+        {
+            EuiccDownloadProgress = Math.Clamp(value.Percent, 0, 100);
+            EuiccDownloadPhase = GetEuiccPhase(EuiccDownloadProgress);
+            EuiccDownloadStatus = value.Status;
+            AddEuiccLog($"{EuiccDownloadProgress}% · {EuiccDownloadPhase} · {value.Status}");
+            CancelEuiccDownloadCommand.NotifyCanExecuteChanged();
+        }
+
+        private void AddEuiccLog(string message)
+        {
+            if (string.Equals(message, _lastEuiccProgressEntry, StringComparison.Ordinal)) return;
+            _lastEuiccProgressEntry = message;
+            EuiccDownloadLog.Add($"[{DateTime.Now:HH:mm:ss}] {message}");
+            while (EuiccDownloadLog.Count > 16) EuiccDownloadLog.RemoveAt(0);
+        }
+
+        private void SetEuiccFailure(string message, string exceptionType)
+        {
+            HasEuiccDownloadError = true;
+            var phase = GetEuiccPhase(EuiccDownloadProgress);
+            EuiccDownloadFailureDetails =
+                $"失败位置：{EuiccDownloadProgress}% · {phase}\n" +
+                $"错误信息：{message}\n" +
+                $"诊断类型：{exceptionType}\n" +
+                "处理建议：先点击“读取 eUICC 芯片”核对 Profile 列表；如果提示结果不确定，不要重复扫描或提交同一激活码。";
+            AddEuiccLog($"失败 · {phase} · {message}");
+        }
+
+        private static string FlattenExceptionMessages(Exception exception)
+        {
+            var messages = new List<string>();
+            for (Exception? current = exception; current != null; current = current.InnerException)
+            {
+                var message = current.Message.Trim();
+                if (!string.IsNullOrEmpty(message) && !messages.Contains(message, StringComparer.Ordinal))
+                    messages.Add(message);
+            }
+            return messages.Count == 0 ? "未返回具体错误信息" : string.Join(" → ", messages);
+        }
+
+        private static string GetEuiccPhase(int percent) => percent switch
+        {
+            < 5 => "准备下载",
+            < 10 => "读取卡片并执行写入前检查",
+            < 25 => "连接 eUICC 与 SM-DP+",
+            < 40 => "SM-DP+ 下载认证",
+            < 52 => "eUICC 验证服务器证书",
+            < 65 => "请求 Profile 下载授权",
+            < 70 => "下载 Profile 包",
+            < 90 => "向 eUICC 写入 Profile",
+            < 100 => "重新读取并核验写入结果",
+            _ => "写入完成"
+        };
 
         private void BlockCurrentEuiccActivation()
         {
@@ -1071,8 +1231,12 @@ namespace VoWin.ViewModels.Pages
         public Brush SelectedSlotSimBrush => !string.IsNullOrEmpty(SelectedSlot?.Sim?.Imsi) ? TokenSuccess : TokenMuted;
         public Brush SelectedSlotSimBg => !string.IsNullOrEmpty(SelectedSlot?.Sim?.Imsi) ? TokenSuccessBg : TokenMutedBg;
 
-        public string SelectedSlotRatText => !string.IsNullOrEmpty(SelectedSlot?.Signal?.Rat) ? SelectedSlot.Signal.Rat : "LTE/NR";
-        public string SelectedSlotRegStatusText => SelectedSlot?.Registration?.StatusDisplay ?? "已在网 (归属地)";
+        public string SelectedSlotRatText => SelectedSlot?.IsFlightMode == true
+            ? "射频关闭"
+            : (!string.IsNullOrEmpty(SelectedSlot?.Signal?.Rat) ? SelectedSlot.Signal.Rat : "--");
+        public string SelectedSlotRegStatusText => SelectedSlot?.IsFlightMode == true
+            ? "飞行模式（未搜索网络）"
+            : (SelectedSlot?.Registration?.StatusDisplay ?? "网络状态未知");
 
         public string SelectedSlotCountryDisplay
         {

@@ -81,7 +81,7 @@
         <!-- Track 1: Top-Right (Stage 1) -->
         <Path
           Data="M 45.21,10.46 A 30,30 0 0 1 69.54,34.79"
-          Stroke="#1A888888"
+          Stroke="{DynamicResource AppDividerBrush}"
           StrokeThickness="6"
           StrokeStartLineCap="Round"
           StrokeEndLineCap="Round"
@@ -90,7 +90,7 @@
         <!-- Track 2: Bottom-Right (Stage 2) -->
         <Path
           Data="M 69.54,45.21 A 30,30 0 0 1 45.21,69.54"
-          Stroke="#1A888888"
+          Stroke="{DynamicResource AppDividerBrush}"
           StrokeThickness="6"
           StrokeStartLineCap="Round"
           StrokeEndLineCap="Round"
@@ -99,7 +99,7 @@
         <!-- Track 3: Bottom-Left (Stage 3) -->
         <Path
           Data="M 34.79,69.54 A 30,30 0 0 1 10.46,45.21"
-          Stroke="#1A888888"
+          Stroke="{DynamicResource AppDividerBrush}"
           StrokeThickness="6"
           StrokeStartLineCap="Round"
           StrokeEndLineCap="Round"
@@ -108,7 +108,7 @@
         <!-- Track 4: Top-Left (Stage 4) -->
         <Path
           Data="M 10.46,34.79 A 30,30 0 0 1 34.79,10.46"
-          Stroke="#1A888888"
+          Stroke="{DynamicResource AppDividerBrush}"
           StrokeThickness="6"
           StrokeStartLineCap="Round"
           StrokeEndLineCap="Round"
@@ -119,7 +119,7 @@
         <Path
           x:Name="Seg1Path"
           Data="M 45.21,10.46 A 30,30 0 0 1 69.54,34.79"
-          Stroke="#EF4444"
+          Stroke="{DynamicResource AppDangerBrush}"
           StrokeThickness="6"
           StrokeStartLineCap="Round"
           StrokeEndLineCap="Round"
@@ -135,7 +135,7 @@
         <Path
           x:Name="Seg2Path"
           Data="M 69.54,45.21 A 30,30 0 0 1 45.21,69.54"
-          Stroke="#EF4444"
+          Stroke="{DynamicResource AppDangerBrush}"
           StrokeThickness="6"
           StrokeStartLineCap="Round"
           StrokeEndLineCap="Round"
@@ -151,7 +151,7 @@
         <Path
           x:Name="Seg3Path"
           Data="M 34.79,69.54 A 30,30 0 0 1 10.46,45.21"
-          Stroke="#EF4444"
+          Stroke="{DynamicResource AppDangerBrush}"
           StrokeThickness="6"
           StrokeStartLineCap="Round"
           StrokeEndLineCap="Round"
@@ -167,7 +167,7 @@
         <Path
           x:Name="Seg4Path"
           Data="M 10.46,34.79 A 30,30 0 0 1 34.79,10.46"
-          Stroke="#EF4444"
+          Stroke="{DynamicResource AppDangerBrush}"
           StrokeThickness="6"
           StrokeStartLineCap="Round"
           StrokeEndLineCap="Round"
@@ -187,7 +187,7 @@
           Canvas.Top="28"
           Width="24"
           Height="24"
-          Fill="#22C55E"
+          Fill="{DynamicResource AppSuccessBrush}"
           Opacity="0"
           RenderTransformOrigin="0.5,0.5"
           IsHitTestVisible="False"
@@ -204,7 +204,7 @@
           Canvas.Top="33"
           Width="14"
           Height="14"
-          Fill="#EF4444"
+          Fill="{DynamicResource AppDangerBrush}"
           Opacity="0.85"
           RenderTransformOrigin="0.5,0.5"
           Cursor="Hand"

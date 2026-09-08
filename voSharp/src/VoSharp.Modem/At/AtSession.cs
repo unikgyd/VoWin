@@ -46,6 +46,12 @@ public class AtSession : IAtSession, IAsyncDisposable
 
     public event EventHandler<string>? UrcReceived;
 
+    /// <summary>
+    /// Optional gate for publishing parsed URCs to the shared event bus. The raw
+    /// URC event is still raised so modem-specific consumers can handle it.
+    /// </summary>
+    public Func<string, bool>? UrcPublicationFilter { get; set; }
+
     public void Open()
     {
         if (!_port.IsOpen)
@@ -333,7 +339,10 @@ public class AtSession : IAtSession, IAsyncDisposable
     private void EmitUrc(string line)
     {
         try { UrcReceived?.Invoke(this, line); } catch { }
-        UrcParser.Parse(line, _eventBus);
+        if (UrcPublicationFilter?.Invoke(line) != false)
+        {
+            UrcParser.Parse(line, _eventBus);
+        }
     }
 
     public async ValueTask DisposeAsync()

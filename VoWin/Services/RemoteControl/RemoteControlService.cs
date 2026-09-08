@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Hosting;
+using VoWin.Helpers;
 using VoWin.Models;
 
 namespace VoWin.Services.RemoteControl;
@@ -233,8 +234,8 @@ public sealed class RemoteControlService : IRemoteControlService, IHostedService
         if (!settings.NotifyIncomingSms || (settings.NotifyOtpOnly && !sms.HasOtpCode)) return;
         var code = sms.ExtractedOtpCode;
         var text = code == null
-            ? $"收到短信\n来自：{sms.SenderOrRecipient}\n时间：{sms.Timestamp:yyyy-MM-dd HH:mm:ss}\n内容：{sms.Text}"
-            : $"收到验证码：{code}\n来自：{sms.SenderOrRecipient}\n时间：{sms.Timestamp:yyyy-MM-dd HH:mm:ss}\n内容：{sms.Text}";
+            ? $"收到短信\n来自：{sms.SenderOrRecipient}\n时间：{TimestampDisplayHelper.ToLocalDisplayTime(sms.Timestamp):yyyy-MM-dd HH:mm:ss}\n内容：{sms.Text}"
+            : $"收到验证码：{code}\n来自：{sms.SenderOrRecipient}\n时间：{TimestampDisplayHelper.ToLocalDisplayTime(sms.Timestamp):yyyy-MM-dd HH:mm:ss}\n内容：{sms.Text}";
         await BroadcastAsync(text).ConfigureAwait(false);
     }
 

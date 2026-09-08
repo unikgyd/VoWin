@@ -31,6 +31,9 @@ public enum SlotState
 /// </summary>
 public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 {
+    private readonly SemaphoreSlim _profileSwitchGate = new(1, 1);
+    private int _profileSwitchInProgress;
+
     public event PropertyChangedEventHandler? PropertyChanged;
     protected void OnPropertyChanged([CallerMemberName] string? propertyName = null)
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
@@ -41,7 +44,31 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     public string Name
     {
         get => _name;
-        set { if (_name != value) { _name = value; OnPropertyChanged(); } }
+        set
+        {
+            if (_name != value)
+            {
+                _name = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(DisplayTitle));
+            }
+        }
+    }
+
+    private string? _cardNickname;
+    public string? CardNickname
+    {
+        get => _cardNickname;
+        set
+        {
+            var normalized = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+            if (_cardNickname != normalized)
+            {
+                _cardNickname = normalized;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(DisplayTitle));
+            }
+        }
     }
 
     private string _portName = string.Empty;
@@ -94,7 +121,12 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         {
             if (_sim != value)
             {
+                var oldIccid = _sim?.Iccid;
                 _sim = value;
+                if (!string.Equals(oldIccid, value?.Iccid, StringComparison.Ordinal))
+                {
+                    CardNickname = null;
+                }
                 OnPropertyChanged();
                 OnPropertyChanged(nameof(DisplayTitle));
             }
@@ -105,9 +137,16 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     {
         get
         {
-            var op = !string.IsNullOrWhiteSpace(Sim?.OperatorName) ? Sim.OperatorName : null;
-            var title = op ?? (!string.IsNullOrWhiteSpace(Name) ? Name : $"模组 ({PortName})");
-            return $"{title} ({PortName})";
+            var moduleName = !string.IsNullOrWhiteSpace(Name) ? Name : "模组";
+            var cardName = !string.IsNullOrWhiteSpace(CardNickname)
+                ? CardNickname
+                : !string.IsNullOrWhiteSpace(Sim?.OperatorName)
+                    ? Sim.OperatorName
+                    : null;
+            return !string.IsNullOrWhiteSpace(cardName) &&
+                   !string.Equals(cardName, moduleName, StringComparison.OrdinalIgnoreCase)
+                ? $"{cardName} · {moduleName} ({PortName})"
+                : $"{moduleName} ({PortName})";
         }
     }
 
@@ -480,11 +519,13 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
             driver.SignalChanged += (s, e) =>
             {
+                if (IsFlightMode) return;
                 Signal = e.Signal;
                 try { SignalChanged?.Invoke(this, new SignalChangedEventArgs(e.Signal, Id)); } catch { }
             };
             driver.RegistrationChanged += (s, e) =>
             {
+                if (IsFlightMode) return;
                 Registration = e.Registration;
                 try { RegistrationChanged?.Invoke(this, new NetworkRegistrationChangedEventArgs(e.Registration, e.OldStatus, e.NewStatus, Id)); } catch { }
             };
@@ -522,10 +563,11 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             Imei = await driver.GetImeiAsync(ct).ConfigureAwait(false);
             var imsi = await driver.GetImsiAsync(ct).ConfigureAwait(false);
             var iccid = await driver.GetIccidAsync(ct).ConfigureAwait(false);
+            var phoneNumber = await driver.GetPhoneNumberAsync(ct).ConfigureAwait(false);
 
             if (!string.IsNullOrEmpty(imsi))
             {
-                Sim = SimIdentity.FromImsiAndIccid(imsi, iccid);
+                Sim = SimIdentity.FromImsiAndIccid(imsi, iccid, phoneNumber: phoneNumber);
                 try { SimChanged?.Invoke(this, new SimStateChangedEventArgs(Sim, 1, "READY", Id)); } catch { }
                 _eventBus.Publish(EventTopics.ModemSim, Id, "READY");
             }
@@ -545,13 +587,13 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             }
             catch { }
 
-            // Probe radio metrics
-            try
+            // Radio metrics are meaningless while RF is disabled. They are
+            // otherwise refreshed by the background telemetry loop after the
+            // application has restored persisted preferences.
+            if (IsFlightMode)
             {
-                Signal = await driver.GetSignalAsync(ct).ConfigureAwait(false);
-                Registration = await driver.GetRegistrationAsync(ct).ConfigureAwait(false);
+                ClearRadioMetrics();
             }
-            catch { }
 
             SetState(SlotState.Online);
             LastSeen = DateTime.UtcNow;
@@ -614,6 +656,12 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         {
             var cfun = await Modem.GetFlightModeAsync(ct).ConfigureAwait(false);
             IsFlightMode = (cfun == 4 || cfun == 0);
+            if (IsFlightMode)
+            {
+                ClearRadioMetrics();
+                LastSeen = DateTime.UtcNow;
+                return;
+            }
             Signal = await Modem.GetSignalAsync(ct).ConfigureAwait(false);
             Registration = await Modem.GetRegistrationAsync(ct).ConfigureAwait(false);
             LastSeen = DateTime.UtcNow;
@@ -630,16 +678,15 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
         try
         {
-            await Modem.RefreshSimAsync(ct).ConfigureAwait(false);
-            var imsi = await Modem.GetImsiAsync(ct).ConfigureAwait(false);
-            var iccid = await Modem.GetIccidAsync(ct).ConfigureAwait(false);
-            if (!string.IsNullOrEmpty(imsi))
+            await Modem.RefreshSimAsync(ct, preserveFlightMode: IsFlightMode).ConfigureAwait(false);
+            var identity = await ReadSimIdentityUntilReadyAsync(expectedIccid: null, previousIccid: null, ct: ct)
+                .ConfigureAwait(false);
+            SetVerifiedSimIdentity(identity);
+            if (!IsFlightMode)
             {
-                Sim = SimIdentity.FromImsiAndIccid(imsi, iccid);
-                _eventBus.Publish(EventTopics.ModemSim, Id, "READY");
+                Signal = await Modem.GetSignalAsync(ct).ConfigureAwait(false);
+                Registration = await Modem.GetRegistrationAsync(ct).ConfigureAwait(false);
             }
-            Signal = await Modem.GetSignalAsync(ct).ConfigureAwait(false);
-            Registration = await Modem.GetRegistrationAsync(ct).ConfigureAwait(false);
             LastSeen = DateTime.UtcNow;
         }
         catch { }
@@ -650,11 +697,17 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     /// </summary>
     public async Task<bool> StartVoWifiAsync(string? customEpdg = null, IkeProposalSuite suite = IkeProposalSuite.Auto, CancellationToken ct = default)
     {
+        if (Volatile.Read(ref _profileSwitchInProgress) != 0)
+            throw new InvalidOperationException($"Slot {Id} is switching eSIM profiles; VoWiFi cannot start until the new SIM identity is verified.");
+
         if (Sim == null)
             throw new InvalidOperationException($"Slot {Id} has no active SIM identity.");
 
         VoWifi.ProxyUrl = ProxyUrl;
         var voWifiIdentity = VoWifiIdentityOverride ?? Sim;
+        if (!await Aka.CheckReadyAsync(voWifiIdentity.Iccid, ct).ConfigureAwait(false))
+            throw new InvalidOperationException(
+                $"Slot {Id} live USIM does not match the refreshed VoWiFi identity. Registration was blocked before EAP-AKA.");
         if (VoWifiIdentityOverride != null)
             _eventBus.Publish(EventTopics.SystemLog, "VoWiFi", $"Slot {Id} is using its validated home identity for EAP-AKA.");
         bool started = await VoWifi.StartVoWifiAsync(voWifiIdentity, customEpdg, suite, proxyUrl: ProxyUrl, ct: ct).ConfigureAwait(false);
@@ -1030,13 +1083,50 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         if (ok)
         {
             IsFlightMode = enabled;
-            await RefreshMetricsAsync(ct).ConfigureAwait(false);
-            if (!enabled)
+            if (enabled)
+            {
+                ClearRadioMetrics();
+            }
+            else
             {
                 await RefreshSimAsync(ct).ConfigureAwait(false);
+                await RefreshMetricsAsync(ct).ConfigureAwait(false);
             }
         }
         return ok;
+    }
+
+    /// <summary>
+    /// Enables or disables packet-domain attachment for cellular data.
+    /// </summary>
+    public async Task<bool> SetCellularDataEnabledAsync(bool enabled, CancellationToken ct = default)
+    {
+        if (Modem == null || !Modem.IsOpen || IsFlightMode) return false;
+        var response = await Modem.SendRawAtCommandAsync(
+            $"AT+CGATT={(enabled ? 1 : 0)}", 10000, ct).ConfigureAwait(false);
+        return response.Success;
+    }
+
+    /// <summary>
+    /// Applies the Quectel roaming policy used by the supported modem family.
+    /// Firmware variants expose either QCFG or QNWCFG, so success from either
+    /// command is accepted.
+    /// </summary>
+    public async Task<bool> SetDataRoamingEnabledAsync(bool enabled, CancellationToken ct = default)
+    {
+        if (Modem == null || !Modem.IsOpen || IsFlightMode) return false;
+        var value = enabled ? 1 : 0;
+        var qcfg = await Modem.SendRawAtCommandAsync(
+            $"AT+QCFG=\"roamsvc\",{value}", 3000, ct).ConfigureAwait(false);
+        var qnwcfg = await Modem.SendRawAtCommandAsync(
+            $"AT+QNWCFG=\"roaming\",{value}", 3000, ct).ConfigureAwait(false);
+        return qcfg.Success || qnwcfg.Success;
+    }
+
+    private void ClearRadioMetrics()
+    {
+        Signal = null;
+        Registration = null;
     }
 
     /// <summary>
@@ -1093,11 +1183,119 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
     public async Task<bool> SwitchEuiccProfileAsync(string iccidOrAid, bool refresh = true, CancellationToken ct = default)
     {
-        var mgr = GetOrCreateEuiccManager();
-        if (mgr == null) throw new InvalidOperationException("当前卡槽模组未就绪。");
-        await mgr.SwitchProfileAsync(iccidOrAid, refresh, ct).ConfigureAwait(false);
-        await RefreshSimAsync(ct).ConfigureAwait(false);
-        return true;
+        await _profileSwitchGate.WaitAsync(ct).ConfigureAwait(false);
+        Interlocked.Exchange(ref _profileSwitchInProgress, 1);
+        try
+        {
+            var mgr = GetOrCreateEuiccManager();
+            if (mgr == null || Modem == null || !Modem.IsOpen)
+                throw new InvalidOperationException("当前卡槽模组未就绪。");
+
+            // Stop the old tunnel and its automatic recovery loop before the
+            // eUICC changes which USIM application is active.
+            await VoWifi.StopVoWifiAsync(ct).ConfigureAwait(false);
+
+            var previousIccid = Sim?.Iccid;
+            VoWifiIdentityOverride = null;
+            Sim = null;
+            ClearRadioMetrics();
+            try { SimChanged?.Invoke(this, new SimStateChangedEventArgs(null, 1, "SWITCHING", Id)); } catch { }
+            _eventBus.Publish(EventTopics.SystemLog, "eSIM", $"Slot {Id}: old VoWiFi identity cleared before profile switch.");
+
+            await mgr.SwitchProfileAsync(iccidOrAid, refresh, ct).ConfigureAwait(false);
+
+            var expectedIccid = NormalizeIccidCandidate(iccidOrAid);
+            if (expectedIccid == null)
+            {
+                try
+                {
+                    expectedIccid = NormalizeIccidCandidate(
+                        (await mgr.GetActiveProfileAsync(ct).ConfigureAwait(false))?.ICCID);
+                }
+                catch { }
+            }
+
+            // Force a baseband/SIM reload even in flight mode, then reject any
+            // stale CIMI/QCCID result. A failed verification deliberately leaves
+            // Sim=null so no caller can authenticate using the previous card.
+            await Modem.RefreshSimAsync(ct, preserveFlightMode: IsFlightMode).ConfigureAwait(false);
+            var identity = await ReadSimIdentityUntilReadyAsync(expectedIccid, previousIccid, ct)
+                .ConfigureAwait(false);
+            SetVerifiedSimIdentity(identity);
+            LastSeen = DateTime.UtcNow;
+
+            _eventBus.Publish(EventTopics.SystemLog, "eSIM",
+                $"Slot {Id}: new SIM identity verified after profile switch (ICCID ****{identity.Iccid[^Math.Min(4, identity.Iccid.Length)..]}). VoWiFi may now restart.");
+            return true;
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _profileSwitchInProgress, 0);
+            _profileSwitchGate.Release();
+        }
+    }
+
+    private async Task<SimIdentity> ReadSimIdentityUntilReadyAsync(
+        string? expectedIccid,
+        string? previousIccid,
+        CancellationToken ct)
+    {
+        if (Modem == null || !Modem.IsOpen)
+            throw new InvalidOperationException("模组已断开，无法验证切卡后的 SIM 身份。");
+
+        var normalizedExpected = NormalizeIccidCandidate(expectedIccid);
+        var normalizedPrevious = NormalizeIccidCandidate(previousIccid);
+        string? lastIccid = null;
+
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var iccid = await Modem.GetIccidAsync(ct).ConfigureAwait(false);
+            var normalizedIccid = NormalizeIccidCandidate(iccid);
+            lastIccid = normalizedIccid;
+
+            var isExpectedCard = normalizedIccid != null &&
+                (normalizedExpected != null
+                    ? normalizedIccid.Equals(normalizedExpected, StringComparison.Ordinal)
+                    : normalizedPrevious == null || !normalizedIccid.Equals(normalizedPrevious, StringComparison.Ordinal));
+
+            if (isExpectedCard)
+            {
+                var imsi = await Modem.GetImsiAsync(ct).ConfigureAwait(false);
+                if (imsi.Length is >= 5 and <= 16 && imsi.All(char.IsAsciiDigit))
+                {
+                    var phoneNumber = await Modem.GetPhoneNumberAsync(ct).ConfigureAwait(false);
+                    return SimIdentity.FromImsiAndIccid(imsi, normalizedIccid!, phoneNumber: phoneNumber);
+                }
+            }
+
+            await Task.Delay(500, ct).ConfigureAwait(false);
+        }
+
+        var expectedText = normalizedExpected != null
+            ? $"目标 ICCID ****{normalizedExpected[^Math.Min(4, normalizedExpected.Length)..]}"
+            : "新的活动 ICCID";
+        var actualText = lastIccid != null
+            ? $"****{lastIccid[^Math.Min(4, lastIccid.Length)..]}"
+            : "未读取到";
+        throw new InvalidOperationException(
+            $"Profile 已切换，但未能验证新 SIM 身份（{expectedText}，当前读取 {actualText}）。已保持 VoWiFi 停止，避免使用旧卡身份注册。");
+    }
+
+    private void SetVerifiedSimIdentity(SimIdentity identity)
+    {
+        Sim = identity;
+        try { SimChanged?.Invoke(this, new SimStateChangedEventArgs(identity, 1, "READY", Id)); } catch { }
+        _eventBus.Publish(EventTopics.ModemSim, Id, "READY");
+    }
+
+    private static string? NormalizeIccidCandidate(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var candidate = value.Trim();
+        return candidate.Length is >= 18 and <= 22 && candidate.All(char.IsAsciiDigit)
+            ? candidate
+            : null;
     }
 
     public async Task<bool> DisableEuiccProfileAsync(string iccidOrAid, bool refresh = true, CancellationToken ct = default)
@@ -1121,13 +1319,15 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         string activationCode,
         string? confirmationCode = null,
         IProgress<EuiccDownloadProgress>? progress = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool allowUntrustedTls = false,
+        bool allowRetryAfterUncertain = false)
     {
         var mgr = GetOrCreateEuiccManager();
         if (mgr == null) throw new InvalidOperationException("当前卡槽模组未就绪。");
         if (string.IsNullOrWhiteSpace(Imei))
             throw new InvalidOperationException("当前卡槽尚未读取到 IMEI，无法下载 eSIM Profile。");
-        return await mgr.DownloadProfileAsync(activationCode, Imei, confirmationCode, progress, ct).ConfigureAwait(false);
+        return await mgr.DownloadProfileAsync(activationCode, Imei, confirmationCode, progress, ct, allowUntrustedTls, allowRetryAfterUncertain).ConfigureAwait(false);
     }
 
     private void SetError(string msg)
@@ -1153,6 +1353,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             {
                 Sim.Imsi,
                 Sim.Iccid,
+                Sim.PhoneNumber,
                 Sim.Mcc,
                 Sim.Mnc,
                 Sim.OperatorName

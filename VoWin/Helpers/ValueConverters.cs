@@ -9,6 +9,18 @@ using Wpf.Ui.Controls;
 
 namespace VoWin.Helpers
 {
+    internal static class ThemeBrushes
+    {
+        public static Brush Get(string key, Color fallback) =>
+            Application.Current?.TryFindResource(key) as Brush ?? new SolidColorBrush(fallback);
+
+        public static Brush Accent => Get("AppAccentBrush", Color.FromRgb(0x25, 0x63, 0xEB));
+        public static Brush Success => Get("AppSuccessBrush", Color.FromRgb(0x0F, 0x9F, 0x75));
+        public static Brush Warning => Get("AppWarningBrush", Color.FromRgb(0xC6, 0x6A, 0x08));
+        public static Brush Danger => Get("AppDangerBrush", Color.FromRgb(0xD9, 0x2D, 0x4C));
+        public static Brush Muted => Get("AppTextTertiaryBrush", Color.FromRgb(0x71, 0x83, 0x9A));
+    }
+
     public class BoolToVisibilityConverter : IValueConverter
     {
         public bool Invert { get; set; }
@@ -99,11 +111,11 @@ namespace VoWin.Helpers
 
             if (isOutgoing)
             {
-                return new SolidColorBrush(Color.FromRgb(0x25, 0x63, 0xEB)); // Modern Blue 600
+                return ThemeBrushes.Accent;
             }
 
             // In Dark Mode, resolve to dark card background; in Light Mode, resolve to light card background
-            return Application.Current?.TryFindResource("CardBackgroundFillColorDefaultBrush") as Brush
+            return Application.Current?.TryFindResource("AppCardBrush") as Brush
                 ?? Application.Current?.TryFindResource("ControlFillColorDefaultBrush") as Brush
                 ?? new SolidColorBrush(Color.FromRgb(0xF1, 0xF5, 0xF9));
         }
@@ -125,7 +137,7 @@ namespace VoWin.Helpers
             }
 
             // In Dark Mode, resolve to light/white text; in Light Mode, resolve to dark text
-            return Application.Current?.TryFindResource("TextFillColorPrimaryBrush") as Brush
+            return Application.Current?.TryFindResource("AppTextPrimaryBrush") as Brush
                 ?? new SolidColorBrush(Color.FromRgb(0x0F, 0x17, 0x2A));
         }
 
@@ -153,10 +165,10 @@ namespace VoWin.Helpers
             if (value is CallDirection dir)
             {
                 return dir == CallDirection.Incoming
-                    ? new SolidColorBrush(Color.FromRgb(0x25, 0x63, 0xEB)) // Blue
-                    : new SolidColorBrush(Color.FromRgb(0x05, 0x96, 0x69)); // Emerald
+                    ? ThemeBrushes.Accent
+                    : ThemeBrushes.Success;
             }
-            return new SolidColorBrush(Color.FromRgb(0x64, 0x74, 0x8B));
+            return ThemeBrushes.Muted;
         }
 
         public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => throw new NotImplementedException();
@@ -184,14 +196,14 @@ namespace VoWin.Helpers
             {
                 return state switch
                 {
-                    CallState.Active => new SolidColorBrush(Color.FromRgb(0x05, 0x96, 0x69)), // Emerald
-                    CallState.Dialing or CallState.Ringing or CallState.Incoming => new SolidColorBrush(Color.FromRgb(0x25, 0x63, 0xEB)), // Blue
-                    CallState.Held => new SolidColorBrush(Color.FromRgb(0xD9, 0x77, 0x06)), // Amber
-                    CallState.Ended => new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26)), // Red
-                    _ => new SolidColorBrush(Color.FromRgb(0x94, 0xA3, 0xB8))
+                    CallState.Active => ThemeBrushes.Success,
+                    CallState.Dialing or CallState.Ringing or CallState.Incoming => ThemeBrushes.Accent,
+                    CallState.Held => ThemeBrushes.Warning,
+                    CallState.Ended => ThemeBrushes.Danger,
+                    _ => ThemeBrushes.Muted
                 };
             }
-            return new SolidColorBrush(Color.FromRgb(0x94, 0xA3, 0xB8));
+            return ThemeBrushes.Muted;
         }
 
         public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => throw new NotImplementedException();
@@ -205,14 +217,14 @@ namespace VoWin.Helpers
             {
                 return state switch
                 {
-                    VoWifiState.ImsRegistered => new SolidColorBrush(Color.FromRgb(0x05, 0x96, 0x69)), // Emerald
-                    VoWifiState.IpsecTunnelEstablished or VoWifiState.ImsRegistering => new SolidColorBrush(Color.FromRgb(0x25, 0x63, 0xEB)), // Blue
-                    VoWifiState.ResolvingEpdg or VoWifiState.ConnectingIkev2 or VoWifiState.AuthenticatingEapAka => new SolidColorBrush(Color.FromRgb(0xD9, 0x77, 0x06)), // Amber
-                    VoWifiState.Failed => new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26)), // Red
-                    _ => new SolidColorBrush(Color.FromRgb(0x94, 0xA3, 0xB8))
+                    VoWifiState.ImsRegistered => ThemeBrushes.Success,
+                    VoWifiState.IpsecTunnelEstablished or VoWifiState.ImsRegistering => ThemeBrushes.Accent,
+                    VoWifiState.ResolvingEpdg or VoWifiState.ConnectingIkev2 or VoWifiState.AuthenticatingEapAka => ThemeBrushes.Warning,
+                    VoWifiState.Failed => ThemeBrushes.Danger,
+                    _ => ThemeBrushes.Muted
                 };
             }
-            return new SolidColorBrush(Color.FromRgb(0x94, 0xA3, 0xB8));
+            return ThemeBrushes.Muted;
         }
 
         public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => throw new NotImplementedException();
@@ -226,13 +238,13 @@ namespace VoWin.Helpers
             {
                 return state switch
                 {
-                    SlotState.Online => new SolidColorBrush(Color.FromRgb(0x05, 0x96, 0x69)), // Emerald
-                    SlotState.Busy => new SolidColorBrush(Color.FromRgb(0xD9, 0x77, 0x06)),   // Amber
-                    SlotState.Error => new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26)),  // Red
-                    _ => new SolidColorBrush(Color.FromRgb(0x94, 0xA3, 0xB8))
+                    SlotState.Online => ThemeBrushes.Success,
+                    SlotState.Busy => ThemeBrushes.Warning,
+                    SlotState.Error => ThemeBrushes.Danger,
+                    _ => ThemeBrushes.Muted
                 };
             }
-            return new SolidColorBrush(Color.FromRgb(0x94, 0xA3, 0xB8));
+            return ThemeBrushes.Muted;
         }
 
         public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => throw new NotImplementedException();
@@ -261,9 +273,7 @@ namespace VoWin.Helpers
         public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
         {
             bool ok = value is bool b && b;
-            return ok
-                ? new SolidColorBrush(Color.FromRgb(0x05, 0x96, 0x69)) // Emerald 600
-                : new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26)); // Red 600
+            return ok ? ThemeBrushes.Success : ThemeBrushes.Danger;
         }
 
         public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => throw new NotImplementedException();
@@ -275,8 +285,8 @@ namespace VoWin.Helpers
         {
             bool ok = value is bool b && b;
             return ok
-                ? new SolidColorBrush(Color.FromRgb(0xEC, 0xFD, 0xF5)) // Soft Emerald 50
-                : new SolidColorBrush(Color.FromRgb(0xFE, 0xF2, 0xF2)); // Soft Red 50
+                ? ThemeBrushes.Get("AppSuccessSoftBrush", Color.FromRgb(0xE7, 0xF8, 0xF2))
+                : ThemeBrushes.Get("AppDangerSoftBrush", Color.FromRgb(0xFF, 0xF0, 0xF3));
         }
 
         public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => throw new NotImplementedException();
@@ -320,14 +330,14 @@ namespace VoWin.Helpers
             if (value is CallRecordModel record)
             {
                 if (record.Direction == CallDirection.Missed)
-                    return new SolidColorBrush(Color.FromRgb(0xDC, 0x26, 0x26)); // Red 600
+                    return ThemeBrushes.Danger;
                 if (record.Duration == TimeSpan.Zero && record.Direction == CallDirection.Outgoing)
-                    return new SolidColorBrush(Color.FromRgb(0xF5, 0x9E, 0x0B)); // Amber/Orange 500
+                    return ThemeBrushes.Warning;
                 return record.Direction == CallDirection.Incoming
-                    ? new SolidColorBrush(Color.FromRgb(0x25, 0x63, 0xEB)) // Blue 600
-                    : new SolidColorBrush(Color.FromRgb(0x16, 0xA3, 0x4A)); // Green 600
+                    ? ThemeBrushes.Accent
+                    : ThemeBrushes.Success;
             }
-            return new SolidColorBrush(Color.FromRgb(0x64, 0x74, 0x8B));
+            return ThemeBrushes.Muted;
         }
 
         public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => throw new NotImplementedException();

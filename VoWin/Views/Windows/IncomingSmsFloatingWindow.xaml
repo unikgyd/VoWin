@@ -31,8 +31,8 @@
 
   <Border
     Margin="10"
-    Background="#F2141724"
-    BorderBrush="#4060A5FA"
+    Background="{DynamicResource AppFloatingSurfaceBrush}"
+    BorderBrush="{DynamicResource AppAccentSoftBorderBrush}"
     BorderThickness="1.2"
     CornerRadius="16"
     Effect="{StaticResource FloatingShadow}"
@@ -66,8 +66,8 @@
             Width="38"
             Height="38"
             VerticalAlignment="Center"
-            Background="#252563EB"
-            BorderBrush="#3B82F6"
+            Background="{DynamicResource AppFloatingAccentSoftBrush}"
+            BorderBrush="{DynamicResource AppAccentBrush}"
             BorderThickness="1.2"
             CornerRadius="19"
             Margin="0,0,12,0"
@@ -75,7 +75,7 @@
             <ui:SymbolIcon
               x:Name="IconBadge"
               FontSize="18"
-              Foreground="#60A5FA"
+              Foreground="{DynamicResource AppAccentBrush}"
               Symbol="Key24"
             />
           </Border>
@@ -86,7 +86,7 @@
               <Border
                 x:Name="BorderOtpBadge"
                 Padding="6,1.5"
-                Background="#2563EB"
+                Background="{DynamicResource AppAccentBrush}"
                 CornerRadius="4"
                 Margin="0,0,6,0"
               >
@@ -101,7 +101,7 @@
 
               <Border
                 Padding="6,1.5"
-                Background="#2038BDF8"
+                Background="{DynamicResource AppInfoSoftBrush}"
                 CornerRadius="4"
                 Margin="0,0,6,0"
               >
@@ -109,7 +109,7 @@
                   x:Name="TxtSlotBadge"
                   FontSize="10"
                   FontWeight="SemiBold"
-                  Foreground="#38BDF8"
+                  Foreground="{DynamicResource AppInfoBrush}"
                   Text="SIM 1"
                 />
               </Border>
@@ -117,7 +117,7 @@
               <TextBlock
                 x:Name="TxtTime"
                 FontSize="10"
-                Foreground="#94A3B8"
+                Foreground="{DynamicResource AppFloatingTextTertiaryBrush}"
                 VerticalAlignment="Center"
                 Text="刚刚"
               />
@@ -152,7 +152,7 @@
             <Button.Template>
               <ControlTemplate TargetType="Button">
                 <Border x:Name="b" Background="{TemplateBinding Background}" CornerRadius="13">
-                  <ui:SymbolIcon Symbol="Dismiss16" FontSize="13" Foreground="#94A3B8" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                  <ui:SymbolIcon Symbol="Dismiss16" FontSize="13" Foreground="{DynamicResource AppFloatingTextTertiaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </Border>
                 <ControlTemplate.Triggers>
                   <Trigger Property="IsMouseOver" Value="True">
@@ -170,7 +170,7 @@
           x:Name="TxtMessageBody"
           Margin="0,6,0,8"
           FontSize="12"
-          Foreground="#CBD5E1"
+          Foreground="{DynamicResource AppFloatingTextSecondaryBrush}"
           LineHeight="17"
           MaxHeight="34"
           TextTrimming="CharacterEllipsis"
@@ -195,7 +195,7 @@
           >
             <TextBlock
               FontSize="12"
-              Foreground="#94A3B8"
+              Foreground="{DynamicResource AppFloatingTextTertiaryBrush}"
               VerticalAlignment="Center"
               Text="验证码："
             />
@@ -203,7 +203,7 @@
               x:Name="TxtOtpCode"
               FontSize="18"
               FontWeight="Bold"
-              Foreground="#38BDF8"
+              Foreground="{DynamicResource AppInfoBrush}"
               FontFamily="Consolas, Segoe UI"
               VerticalAlignment="Center"
               Text="------"
@@ -216,7 +216,7 @@
             x:Name="BtnCopyAction"
             Height="30"
             Padding="12,0"
-            Background="#2563EB"
+            Background="{DynamicResource AppAccentBrush}"
             BorderThickness="0"
             Cursor="Hand"
             Click="BtnCopyAction_Click"
@@ -250,12 +250,12 @@
       </Grid>
 
       <!-- Bottom Progress Bar (10s Countdown) -->
-      <Grid Grid.Row="1" Height="3" Background="#1E293B">
+      <Grid Grid.Row="1" Height="3" Background="{DynamicResource AppFloatingTrackBrush}">
         <Border
           x:Name="ProgressBarTimeout"
           Height="3"
           HorizontalAlignment="Left"
-          Background="#2563EB"
+          Background="{DynamicResource AppAccentBrush}"
           Width="400"
         />
       </Grid>

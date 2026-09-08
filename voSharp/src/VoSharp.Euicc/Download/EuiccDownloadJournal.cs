@@ -70,6 +70,17 @@ internal static class EuiccDownloadJournal
         }
     }
 
+    public static bool ResetForAuthorizedRetry(string fingerprint)
+    {
+        lock (Sync)
+        {
+            var entries = Load();
+            var removed = entries.RemoveAll(entry => entry.Fingerprint.Equals(fingerprint, StringComparison.Ordinal)) > 0;
+            if (removed) Save(entries);
+            return removed;
+        }
+    }
+
     private static void Update(string fingerprint, Func<EuiccDownloadJournalEntry, EuiccDownloadJournalEntry> update)
     {
         lock (Sync)

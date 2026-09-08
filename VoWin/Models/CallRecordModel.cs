@@ -1,4 +1,5 @@
 using VoSharp.Telephony.Calls;
+using VoWin.Helpers;
 
 namespace VoWin.Models
 {
@@ -16,7 +17,7 @@ namespace VoWin.Models
         public string? DisplayName { get; set; }
         public CallDirection Direction { get; set; }
         public CallState FinalState { get; set; }
-        public DateTime Timestamp { get; set; } = DateTime.Now;
+        public DateTime Timestamp { get; set; } = DateTime.UtcNow;
         public TimeSpan Duration { get; set; } = TimeSpan.Zero;
         public string? Codec { get; set; }
         public string? SlotId { get; set; }
@@ -26,8 +27,10 @@ namespace VoWin.Models
             ? $"{(int)Duration.TotalMinutes:D2}:{Duration.Seconds:D2}"
             : (Direction == CallDirection.Missed ? "未接通" : "已挂断");
 
-        public string FormattedTime => Timestamp.Date == DateTime.Today
-            ? Timestamp.ToString("HH:mm")
-            : Timestamp.ToString("MM/dd HH:mm");
+        private DateTime LocalTimestamp => TimestampDisplayHelper.ToLocalDisplayTime(Timestamp);
+
+        public string FormattedTime => LocalTimestamp.Date == DateTime.Today
+            ? LocalTimestamp.ToString("HH:mm")
+            : LocalTimestamp.ToString("MM/dd HH:mm");
     }
 }

@@ -89,7 +89,7 @@ public interface IVoKernel : IAsyncDisposable
     Task<bool> DisableEuiccProfileAsync(string iccidOrAid, bool refresh = true, CancellationToken ct = default);
     Task<bool> DeleteEuiccProfileAsync(string iccidOrAid, CancellationToken ct = default);
     Task<bool> RenameEuiccProfileAsync(string iccidOrAid, string nickname, CancellationToken ct = default);
-    Task<EuiccDownloadResult> DownloadEuiccProfileAsync(string activationCode, string? confirmationCode = null, IProgress<EuiccDownloadProgress>? progress = null, CancellationToken ct = default);
+    Task<EuiccDownloadResult> DownloadEuiccProfileAsync(string activationCode, string? confirmationCode = null, IProgress<EuiccDownloadProgress>? progress = null, CancellationToken ct = default, bool allowUntrustedTls = false, bool allowRetryAfterUncertain = false);
 
     // ── Direct Metrics & Telemetry Operations ────────────────────────────────
     Task<SignalQuality?> RefreshSignalAsync(string? slotId = null, CancellationToken ct = default);

@@ -15,8 +15,8 @@
       <Setter Property="Width" Value="44" />
       <Setter Property="Height" Value="44" />
       <Setter Property="CornerRadius" Value="22" />
-      <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}" />
+      <Setter Property="Background" Value="{DynamicResource AppCardBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppCardBorderBrush}" />
       <Setter Property="BorderThickness" Value="1.5" />
       <Setter Property="Cursor" Value="Hand" />
       <Setter Property="Effect">
@@ -27,7 +27,7 @@
       <Style.Triggers>
         <Trigger Property="IsMouseOver" Value="True">
           <Setter Property="Background" Value="{DynamicResource SubtleFillColorSecondaryBrush}" />
-          <Setter Property="BorderBrush" Value="{DynamicResource AccentFillColorDefaultBrush}" />
+          <Setter Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" />
           <Setter Property="BorderThickness" Value="2" />
         </Trigger>
       </Style.Triggers>
@@ -40,8 +40,8 @@
       Width="280"
       Height="280"
       CornerRadius="140"
-      Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+      Background="{DynamicResource AppCardBrush}"
+      BorderBrush="{DynamicResource AppCardBorderBrush}"
       BorderThickness="2"
     >
       <Border.Effect>
@@ -71,8 +71,8 @@
       Width="256"
       Height="256"
       CornerRadius="128"
-      Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+      Background="{DynamicResource AppInputBrush}"
+      BorderBrush="{DynamicResource AppCardBorderBrush}"
       BorderThickness="1"
     />
 
@@ -106,9 +106,9 @@
         Width="252"
         Height="252"
         CornerRadius="126"
-        BorderBrush="#2594A3B8"
+        BorderBrush="{DynamicResource AppCardBorderBrush}"
         BorderThickness="1.5"
-        Background="#05000000"
+        Background="{DynamicResource AppInputBrush}"
         IsHitTestVisible="False"
       />
 
@@ -123,7 +123,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="1" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="1" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
 
       <!-- Hole 2 (Angle: 43 deg) -->
@@ -136,7 +136,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="2" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="2" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
 
       <!-- Hole 3 (Angle: 18 deg) -->
@@ -149,7 +149,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="3" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="3" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
 
       <!-- Hole 4 (Angle: 353 deg) -->
@@ -162,7 +162,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="4" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="4" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
 
       <!-- Hole 5 (Angle: 328 deg) -->
@@ -175,7 +175,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="5" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="5" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
 
       <!-- Hole 6 (Angle: 303 deg) -->
@@ -188,7 +188,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="6" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="6" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
 
       <!-- Hole 7 (Angle: 278 deg) -->
@@ -201,7 +201,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="7" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="7" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
 
       <!-- Hole 8 (Angle: 253 deg) -->
@@ -214,7 +214,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="8" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="8" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
 
       <!-- Hole 9 (Angle: 228 deg) -->
@@ -227,7 +227,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="9" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="9" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
 
       <!-- Hole 0 (Angle: 203 deg) -->
@@ -240,7 +240,7 @@
         MouseEnter="OnHoleMouseEnter"
         MouseLeave="OnHoleMouseLeave"
       >
-        <TextBlock Text="0" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <TextBlock Text="0" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
       </Border>
     </Canvas>
 
@@ -249,8 +249,8 @@
       <!-- Metallic Finger Stop Bracket -->
       <Path
         Data="M 238,206 Q 212,220 196,208 L 200,218 Q 216,228 242,212 Z"
-        Fill="#64748B"
-        Stroke="#475569"
+        Fill="{DynamicResource AppTextSecondaryBrush}"
+        Stroke="{DynamicResource AppTextSecondaryBrush}"
         StrokeThickness="1"
       >
         <Path.Effect>
@@ -263,8 +263,8 @@
         Canvas.Top="204"
         Width="12"
         Height="12"
-        Fill="#E2E8F0"
-        Stroke="#DC2626"
+        Fill="{DynamicResource AppCardBorderBrush}"
+        Stroke="{DynamicResource AppDangerBrush}"
         StrokeThickness="1.5"
       >
         <Ellipse.Effect>
@@ -278,8 +278,8 @@
       Width="84"
       Height="84"
       CornerRadius="42"
-      Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-      BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+      Background="{DynamicResource AppCardBrush}"
+      BorderBrush="{DynamicResource AppCardBorderBrush}"
       BorderThickness="2"
       IsHitTestVisible="False"
     >
@@ -292,7 +292,7 @@
           Width="70"
           Height="70"
           CornerRadius="35"
-          Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+          Background="{DynamicResource AppInputBrush}"
           BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}"
           BorderThickness="1"
         >
@@ -302,14 +302,14 @@
               <ui:SymbolIcon
                 Symbol="Call24"
                 FontSize="20"
-                Foreground="{DynamicResource AccentFillColorDefaultBrush}"
+                Foreground="{DynamicResource AppAccentBrush}"
                 HorizontalAlignment="Center"
               />
               <TextBlock
                 Text="VoWin"
                 FontSize="10"
                 FontWeight="Bold"
-                Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                Foreground="{DynamicResource AppTextSecondaryBrush}"
                 HorizontalAlignment="Center"
                 Margin="0,2,0,0"
               />
@@ -322,7 +322,7 @@
                 Text="8"
                 FontSize="30"
                 FontWeight="Bold"
-                Foreground="{DynamicResource AccentFillColorDefaultBrush}"
+                Foreground="{DynamicResource AppAccentBrush}"
                 HorizontalAlignment="Center"
                 Margin="0,-4,0,-2"
               />
@@ -330,7 +330,7 @@
                 Text="旋拨中"
                 FontSize="9"
                 FontWeight="SemiBold"
-                Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                Foreground="{DynamicResource AppTextTertiaryBrush}"
                 HorizontalAlignment="Center"
               />
             </StackPanel>

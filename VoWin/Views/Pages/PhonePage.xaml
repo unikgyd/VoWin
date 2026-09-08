@@ -13,8 +13,8 @@
   d:DesignHeight="780"
   d:DesignWidth="1140"
   ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
-  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
-  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  ui:Design.Foreground="{DynamicResource AppTextPrimaryBrush}"
+  Foreground="{DynamicResource AppTextPrimaryBrush}"
   ScrollViewer.VerticalScrollBarVisibility="Disabled"
   ScrollViewer.HorizontalScrollBarVisibility="Disabled"
   mc:Ignorable="d"
@@ -31,10 +31,10 @@
       <Setter Property="Width" Value="68" />
       <Setter Property="Height" Value="68" />
       <Setter Property="Margin" Value="10,0" />
-      <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorSecondaryBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}" />
+      <Setter Property="Background" Value="{DynamicResource AppInputBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppCardBorderBrush}" />
       <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource AppTextPrimaryBrush}" />
       <Setter Property="Cursor" Value="Hand" />
       <Setter Property="Template">
         <Setter.Value>
@@ -67,10 +67,10 @@
       <Setter Property="Width" Value="58" />
       <Setter Property="Height" Value="48" />
       <Setter Property="Margin" Value="4" />
-      <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorSecondaryBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}" />
+      <Setter Property="Background" Value="{DynamicResource AppInputBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppCardBorderBrush}" />
       <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource AppTextPrimaryBrush}" />
       <Setter Property="Cursor" Value="Hand" />
       <Setter Property="Template">
         <Setter.Value>
@@ -89,7 +89,7 @@
                 <Setter TargetName="border" Property="Background" Value="{DynamicResource SubtleFillColorSecondaryBrush}" />
               </Trigger>
               <Trigger Property="IsPressed" Value="True">
-                <Setter TargetName="border" Property="Background" Value="{DynamicResource AccentFillColorDefaultBrush}" />
+                <Setter TargetName="border" Property="Background" Value="{DynamicResource AppAccentBrush}" />
                 <Setter Property="Foreground" Value="White" />
               </Trigger>
             </ControlTemplate.Triggers>
@@ -99,7 +99,7 @@
     </Style>
   </Page.Resources>
 
-  <Grid Margin="32,24,32,28">
+  <Grid Margin="24,18,24,24">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
@@ -109,8 +109,7 @@
     <Grid Grid.Row="0" Margin="0,0,0,20">
       <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
         <TextBlock
-          FontSize="26"
-          FontWeight="SemiBold"
+          Style="{DynamicResource AppPageTitleStyle}"
           Text="电话"
           VerticalAlignment="Center"
         />
@@ -124,7 +123,7 @@
           <TextBlock
             Text="{Binding VoWifiStateText}"
             FontSize="12"
-            Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+            Foreground="{DynamicResource AppTextSecondaryBrush}"
           />
         </Border>
       </StackPanel>
@@ -141,8 +140,8 @@
       <!-- Left Column: Dialer / In-Call Card -->
       <Border
         Grid.Column="0"
-        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+        Background="{DynamicResource AppCardBrush}"
+        BorderBrush="{DynamicResource AppCardBorderBrush}"
         BorderThickness="1"
         CornerRadius="24"
         Padding="24,20"
@@ -313,7 +312,7 @@
                 <Button
                   Width="220"
                   Height="48"
-                  Background="#16A34A"
+                  Background="{DynamicResource AppSuccessBrush}"
                   BorderThickness="0"
                   Cursor="Hand"
                   Command="{Binding DialCommand}"
@@ -348,10 +347,10 @@
                       </Border>
                       <ControlTemplate.Triggers>
                         <Trigger Property="IsMouseOver" Value="True">
-                          <Setter TargetName="callBtn" Property="Background" Value="#15803D" />
+                          <Setter TargetName="callBtn" Property="Background" Value="{DynamicResource AppSuccessBrush}" />
                         </Trigger>
                         <Trigger Property="IsPressed" Value="True">
-                          <Setter TargetName="callBtn" Property="Background" Value="#166534" />
+                          <Setter TargetName="callBtn" Property="Background" Value="{DynamicResource AppSuccessBrush}" />
                           <Setter TargetName="callBtn" Property="RenderTransform">
                             <Setter.Value>
                               <ScaleTransform ScaleX="0.97" ScaleY="0.97" CenterX="110" CenterY="24" />
@@ -380,8 +379,8 @@
 
               <!-- Line / Slot Selector under the Call Button -->
               <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
-                <ui:SymbolIcon Symbol="Sim24" FontSize="14" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,6,0" VerticalAlignment="Center" />
-                <TextBlock Text="拨打卡槽:" FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" Margin="0,0,6,0" />
+                <ui:SymbolIcon Symbol="Sim24" FontSize="14" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,6,0" VerticalAlignment="Center" />
+                <TextBlock Text="拨打卡槽:" FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" VerticalAlignment="Center" Margin="0,0,6,0" />
                 <ComboBox
                   Width="180"
                   Height="30"
@@ -409,7 +408,7 @@
               <Border
                 Width="108"
                 Height="108"
-                Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                Background="{DynamicResource AppInputBrush}"
                 BorderBrush="{Binding CurrentCallState, Converter={StaticResource CallStateColor}}"
                 BorderThickness="3"
                 CornerRadius="54"
@@ -430,7 +429,7 @@
               <TextBlock
                 FontSize="28"
                 FontWeight="SemiBold"
-                Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                Foreground="{DynamicResource AppTextPrimaryBrush}"
                 HorizontalAlignment="Center"
                 Text="{Binding ActiveCallNumber, FallbackValue='未知号码'}"
               />
@@ -451,7 +450,7 @@
                 FontSize="38"
                 FontFamily="Consolas, Segoe UI"
                 FontWeight="Light"
-                Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                Foreground="{DynamicResource AppTextPrimaryBrush}"
                 HorizontalAlignment="Center"
                 Text="{Binding CallDurationText}"
                 Visibility="{Binding IsCallTimerVisible, Converter={StaticResource BoolToVis}}"
@@ -461,7 +460,7 @@
               <TextBlock
                 Margin="0,6,0,0"
                 FontSize="13"
-                Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                Foreground="{DynamicResource AppTextSecondaryBrush}"
                 HorizontalAlignment="Center"
                 Text="{Binding CallStatusSubtitle}"
                 Visibility="{Binding IsCallTimerVisible, Converter={StaticResource InvertBoolToVis}}"
@@ -477,11 +476,11 @@
                 Visibility="{Binding IsCallConnected, Converter={StaticResource BoolToVis}}"
               >
                 <StackPanel Orientation="Horizontal">
-                  <ui:SymbolIcon Symbol="Voicemail24" FontSize="14" Foreground="#16A34A" Margin="0,0,6,0" VerticalAlignment="Center" />
+                  <ui:SymbolIcon Symbol="Voicemail24" FontSize="14" Foreground="{DynamicResource AppSuccessBrush}" Margin="0,0,6,0" VerticalAlignment="Center" />
                   <TextBlock
                     FontSize="12"
                     FontWeight="Medium"
-                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                    Foreground="{DynamicResource AppTextSecondaryBrush}"
                     Text="{Binding CodecInfo}"
                   />
                 </StackPanel>
@@ -504,7 +503,7 @@
                       <Grid>
                         <ui:SymbolIcon
                           FontSize="24"
-                          Foreground="#DC2626"
+                          Foreground="{DynamicResource AppDangerBrush}"
                           Symbol="MicOff24"
                           Visibility="{Binding IsMuted, Converter={StaticResource BoolToVis}}"
                         />
@@ -523,11 +522,11 @@
                       <TextBlock.Style>
                         <Style TargetType="TextBlock">
                           <Setter Property="Text" Value="静音" />
-                          <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
+                          <Setter Property="Foreground" Value="{DynamicResource AppTextSecondaryBrush}" />
                           <Style.Triggers>
                             <DataTrigger Binding="{Binding IsMuted}" Value="True">
                               <Setter Property="Text" Value="已静音" />
-                              <Setter Property="Foreground" Value="#DC2626" />
+                              <Setter Property="Foreground" Value="{DynamicResource AppDangerBrush}" />
                               <Setter Property="FontWeight" Value="SemiBold" />
                             </DataTrigger>
                           </Style.Triggers>
@@ -548,7 +547,7 @@
                     <TextBlock
                       Margin="0,6,0,0"
                       FontSize="12"
-                      Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                      Foreground="{DynamicResource AppTextSecondaryBrush}"
                       HorizontalAlignment="Center"
                       Text="键盘"
                     />
@@ -564,7 +563,7 @@
                       <Grid>
                         <ui:SymbolIcon
                           FontSize="24"
-                          Foreground="#D97706"
+                          Foreground="{DynamicResource AppWarningBrush}"
                           Symbol="Play24"
                           Visibility="{Binding IsHeld, Converter={StaticResource BoolToVis}}"
                         />
@@ -583,11 +582,11 @@
                       <TextBlock.Style>
                         <Style TargetType="TextBlock">
                           <Setter Property="Text" Value="保持" />
-                          <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}" />
+                          <Setter Property="Foreground" Value="{DynamicResource AppTextSecondaryBrush}" />
                           <Style.Triggers>
                             <DataTrigger Binding="{Binding IsHeld}" Value="True">
                               <Setter Property="Text" Value="恢复" />
-                              <Setter Property="Foreground" Value="#D97706" />
+                              <Setter Property="Foreground" Value="{DynamicResource AppWarningBrush}" />
                               <Setter Property="FontWeight" Value="SemiBold" />
                             </DataTrigger>
                           </Style.Triggers>
@@ -601,8 +600,8 @@
                 <Border
                   Width="340"
                   HorizontalAlignment="Center"
-                  Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-                  BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                  Background="{DynamicResource AppInputBrush}"
+                  BorderBrush="{DynamicResource AppCardBorderBrush}"
                   BorderThickness="1"
                   CornerRadius="12"
                   Padding="14,10"
@@ -630,7 +629,7 @@
                         <ui:SymbolIcon
                           Symbol="Speaker224"
                           FontSize="15"
-                          Foreground="{DynamicResource AccentFillColorDefaultBrush}"
+                          Foreground="{DynamicResource AppAccentBrush}"
                           HorizontalAlignment="Center"
                           VerticalAlignment="Center"
                         />
@@ -639,7 +638,7 @@
                         Text="声卡设备"
                         FontSize="12"
                         FontWeight="Medium"
-                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                        Foreground="{DynamicResource AppTextSecondaryBrush}"
                         VerticalAlignment="Center"
                       />
                     </StackPanel>
@@ -674,7 +673,7 @@
                 <TextBlock
                   Text="{Binding CallStatusSubtitle}"
                   FontSize="13"
-                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                  Foreground="{DynamicResource AppTextSecondaryBrush}"
                   HorizontalAlignment="Center"
                   Margin="0,0,0,16"
                 />
@@ -704,7 +703,7 @@
               <Button
                 Width="200"
                 Height="48"
-                Background="#DC2626"
+                Background="{DynamicResource AppDangerBrush}"
                 BorderThickness="0"
                 Cursor="Hand"
                 Command="{Binding HangupCommand}"
@@ -740,10 +739,10 @@
                     </Border>
                     <ControlTemplate.Triggers>
                       <Trigger Property="IsMouseOver" Value="True">
-                        <Setter TargetName="hangupBtn" Property="Background" Value="#B91C1C" />
+                        <Setter TargetName="hangupBtn" Property="Background" Value="{DynamicResource AppDangerBrush}" />
                       </Trigger>
                       <Trigger Property="IsPressed" Value="True">
-                        <Setter TargetName="hangupBtn" Property="Background" Value="#991B1B" />
+                        <Setter TargetName="hangupBtn" Property="Background" Value="{DynamicResource AppDangerBrush}" />
                         <Setter TargetName="hangupBtn" Property="RenderTransform">
                           <Setter.Value>
                             <ScaleTransform ScaleX="0.97" ScaleY="0.97" CenterX="100" CenterY="24" />
@@ -759,8 +758,8 @@
             <!-- 3. POPUP OVERLAY: Modern In-Call DTMF 3x4 Keypad -->
             <Border
               Grid.RowSpan="3"
-              Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              Background="{DynamicResource AppCardBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
               BorderThickness="1"
               CornerRadius="20"
               Padding="18,16"
@@ -794,7 +793,7 @@
                 <!-- Dialed DTMF History -->
                 <Border
                   Height="36"
-                  Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                  Background="{DynamicResource AppInputBrush}"
                   CornerRadius="8"
                   Padding="10,0"
                   Margin="0,0,0,12"
@@ -905,7 +904,7 @@
                 Text="{Binding CallHistory.Count}"
                 FontSize="11"
                 FontWeight="SemiBold"
-                Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                Foreground="{DynamicResource AppTextSecondaryBrush}"
               />
             </Border>
           </StackPanel>
@@ -931,13 +930,13 @@
             >
               <ui:SymbolIcon
                 FontSize="48"
-                Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                Foreground="{DynamicResource AppTextTertiaryBrush}"
                 Symbol="History24"
               />
               <TextBlock
                 Margin="0,16,0,0"
                 FontSize="15"
-                Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                Foreground="{DynamicResource AppTextSecondaryBrush}"
                 Text="暂无最近通话记录"
               />
             </StackPanel>
@@ -961,8 +960,8 @@
                     <Setter.Value>
                       <ControlTemplate TargetType="ListViewItem">
                         <Border
-                          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-                          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                          Background="{DynamicResource AppCardBrush}"
+                          BorderBrush="{DynamicResource AppCardBorderBrush}"
                           BorderThickness="1"
                           CornerRadius="12"
                           Padding="16,12"
@@ -990,7 +989,7 @@
                       Width="42"
                       Height="42"
                       CornerRadius="21"
-                      Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                      Background="{DynamicResource AppInputBrush}"
                       Margin="0,0,14,0"
                     >
                       <ui:SymbolIcon
@@ -1010,7 +1009,7 @@
                       />
                       <TextBlock
                         FontSize="12"
-                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                        Foreground="{DynamicResource AppTextSecondaryBrush}"
                       >
                         <Run Text="{Binding FormattedTime, Mode=OneWay}" />
                         <Run Text=" · " />
@@ -1052,7 +1051,7 @@
                             <Separator />
                             <MenuItem Header="删除此记录" Click="OnDeleteRecordClick">
                               <MenuItem.Icon>
-                                <ui:SymbolIcon Symbol="Delete24" FontSize="16" Foreground="#DC2626" />
+                                <ui:SymbolIcon Symbol="Delete24" FontSize="16" Foreground="{DynamicResource AppDangerBrush}" />
                               </MenuItem.Icon>
                             </MenuItem>
                           </ContextMenu>

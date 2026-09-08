@@ -4,7 +4,6 @@ using VoWin.Services;
 using VoWin.ViewModels.Windows;
 using Wpf.Ui;
 using Wpf.Ui.Abstractions;
-using Wpf.Ui.Appearance;
 using Wpf.Ui.Controls;
 
 namespace VoWin.Views.Windows
@@ -25,8 +24,6 @@ namespace VoWin.Views.Windows
             ViewModel = viewModel;
             KernelService = kernelService;
             DataContext = this;
-
-            SystemThemeWatcher.Watch(this);
 
             InitializeComponent();
             SetPageService(navigationViewPageProvider);

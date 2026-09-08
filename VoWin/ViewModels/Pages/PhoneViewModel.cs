@@ -165,7 +165,7 @@ namespace VoWin.ViewModels.Pages
             {
                 if (_callConnectedTime is { } connTime && CurrentCallState == CallState.Active)
                 {
-                    var span = DateTime.Now - connTime;
+                    var span = DateTime.UtcNow - connTime;
                     CallDurationText = $"{(int)span.TotalMinutes:D2}:{span.Seconds:D2}";
                     NotifyCallStateVisuals();
 
@@ -188,7 +188,7 @@ namespace VoWin.ViewModels.Pages
                     if (e.NewState == CallState.Active)
                     {
                         _isShowingEndedSummary = false;
-                        _callConnectedTime = DateTime.Now;
+                        _callConnectedTime = DateTime.UtcNow;
                         _durationTimer.Start();
                         CodecInfo = !string.IsNullOrEmpty(e.Codec) ? e.Codec : "VoWiFi AMR-WB 16kHz";
                     }

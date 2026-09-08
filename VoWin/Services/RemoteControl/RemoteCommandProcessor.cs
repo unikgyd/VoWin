@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 using VoSharp.Kernel.Pool;
+using VoWin.Helpers;
 using VoWin.Models;
 
 namespace VoWin.Services.RemoteControl;
@@ -55,8 +56,10 @@ internal sealed class RemoteCommandProcessor
         sb.AppendLine($"卡槽：{slot?.Name ?? "无"} ({slot?.Id ?? "-"})");
         sb.AppendLine($"模块：{slot?.State.ToString() ?? "离线"} / {slot?.PortName ?? "-"}");
         sb.AppendLine($"SIM：{MaskIccid(slot?.Sim?.Iccid)} / {slot?.Sim?.OperatorName ?? "未知运营商"}");
-        sb.AppendLine($"蜂窝：{reg?.StatusDisplay ?? "未知"} {reg?.AccessTechnology ?? string.Empty}");
-        sb.AppendLine($"信号：{(signal == null ? "未知" : $"{signal.Bars}/5 ({signal.RssiDbm} dBm, {signal.Rat})")}");
+        sb.AppendLine(slot?.IsFlightMode == true
+            ? "蜂窝：飞行模式（射频关闭，未搜索网络）"
+            : $"蜂窝：{reg?.StatusDisplay ?? "未知"} {reg?.AccessTechnology ?? string.Empty}");
+        sb.AppendLine($"信号：{(slot?.IsFlightMode == true ? "射频关闭" : signal == null ? "未知" : $"{signal.Bars}/5 ({signal.RssiDbm} dBm, {signal.Rat})")}");
         sb.AppendLine($"VoWiFi：{wifi?.State.ToString() ?? "未启动"}");
         sb.AppendLine($"通话：{_kernel.CurrentCallState}{(string.IsNullOrWhiteSpace(_kernel.CurrentCallNumber) ? "" : $" ({_kernel.CurrentCallNumber})")}");
         return sb.ToString().TrimEnd();
@@ -92,7 +95,7 @@ internal sealed class RemoteCommandProcessor
             .OrderByDescending(x => x.Timestamp).Take(count).ToList();
         if (rows.Count == 0) return "暂时没有找到验证码短信。";
         return "最近验证码\n" + string.Join("\n", rows.Select(x =>
-            $"{x.Timestamp:MM-dd HH:mm:ss} {x.SenderOrRecipient}：{x.ExtractedOtpCode}"));
+            $"{TimestampDisplayHelper.ToLocalDisplayTime(x.Timestamp):MM-dd HH:mm:ss} {x.SenderOrRecipient}：{x.ExtractedOtpCode}"));
     }
 
     private async Task<string> SendSmsAsync(string value)

@@ -11,8 +11,8 @@
   d:DesignHeight="850"
   d:DesignWidth="1100"
   ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
-  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
-  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  ui:Design.Foreground="{DynamicResource AppTextPrimaryBrush}"
+  Foreground="{DynamicResource AppTextPrimaryBrush}"
   mc:Ignorable="d"
 >
   <Grid Margin="24,18,24,24">
@@ -24,8 +24,8 @@
     <!-- Top Header -->
     <Grid Grid.Row="0" Margin="0,0,0,16">
       <StackPanel>
-        <TextBlock FontSize="24" FontWeight="SemiBold" Text="关于" />
-        <TextBlock FontSize="13" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="项目简介、开发者主页、说明与赞助支持" Margin="0,4,0,0" />
+        <TextBlock Style="{DynamicResource AppPageTitleStyle}" Text="关于" />
+        <TextBlock Style="{DynamicResource AppPageSubtitleStyle}" Text="项目简介、开发者主页、说明与赞助支持" />
       </StackPanel>
     </Grid>
 
@@ -34,14 +34,15 @@
       Grid.Row="1"
       VerticalScrollBarVisibility="Auto"
       HorizontalScrollBarVisibility="Disabled"
+      HorizontalContentAlignment="Stretch"
       Padding="0,0,12,0"
     >
-      <StackPanel MaxWidth="900" HorizontalAlignment="Left">
+      <StackPanel MaxWidth="920" HorizontalAlignment="Center">
 
         <!-- Card 1: 项目简介 (Project Introduction) -->
         <Border
-          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          Background="{DynamicResource AppCardBrush}"
+          BorderBrush="{DynamicResource AppCardBorderBrush}"
           BorderThickness="1"
           CornerRadius="14"
           Padding="24,20"
@@ -62,8 +63,8 @@
               Width="68"
               Height="68"
               CornerRadius="16"
-              Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              Background="{DynamicResource AppInputBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
               BorderThickness="1"
               VerticalAlignment="Top"
               Margin="0,0,20,0"
@@ -83,12 +84,12 @@
             <!-- Introduction Details -->
             <StackPanel Grid.Column="1" VerticalAlignment="Center">
               <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                <TextBlock Text="{Binding AppName}" FontSize="22" FontWeight="Bold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" VerticalAlignment="Center" />
+                <TextBlock Text="{Binding AppName}" FontSize="22" FontWeight="Bold" Foreground="{DynamicResource AppTextPrimaryBrush}" VerticalAlignment="Center" />
                 <Border Margin="12,0,0,0" Padding="8,3" Background="{DynamicResource ControlFillColorDefaultBrush}" BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="6" VerticalAlignment="Center">
-                  <TextBlock Text="{Binding AppVersion}" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" />
+                  <TextBlock Text="{Binding AppVersion}" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AppAccentBrush}" />
                 </Border>
-                <Border Margin="8,0,0,0" Padding="8,3" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="6" VerticalAlignment="Center">
-                  <TextBlock Text="{Binding BuildInfo}" FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                <Border Margin="8,0,0,0" Padding="8,3" Background="{DynamicResource AppInputBrush}" CornerRadius="6" VerticalAlignment="Center">
+                  <TextBlock Text="{Binding BuildInfo}" FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" />
                 </Border>
               </StackPanel>
 
@@ -97,7 +98,7 @@
                 FontSize="13"
                 LineHeight="22"
                 TextWrapping="Wrap"
-                Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                Foreground="{DynamicResource AppTextPrimaryBrush}"
                 Text="{Binding ProjectDescription}"
               />
             </StackPanel>
@@ -106,8 +107,8 @@
 
         <!-- Card 2: 开发者与项目页面 (Developer & Project Repository) -->
         <Border
-          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          Background="{DynamicResource AppCardBrush}"
+          BorderBrush="{DynamicResource AppCardBorderBrush}"
           BorderThickness="1"
           CornerRadius="14"
           Padding="20,18"
@@ -124,17 +125,17 @@
               </Grid.ColumnDefinitions>
 
               <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                <ui:SymbolIcon Symbol="Code24" Foreground="{DynamicResource AccentFillColorDefaultBrush}" FontSize="20" Margin="0,0,8,0" />
+                <ui:SymbolIcon Symbol="Code24" Foreground="{DynamicResource AppAccentBrush}" FontSize="20" Margin="0,0,8,0" />
                 <TextBlock Text="开发者与项目主页" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center" />
               </StackPanel>
 
-              <TextBlock Grid.Column="1" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Text="GitHub Open Source" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Text="GitHub Open Source" VerticalAlignment="Center" />
             </Grid>
 
             <!-- Repository Action Box -->
             <Border
-              Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              Background="{DynamicResource AppInputBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
               BorderThickness="1"
               CornerRadius="10"
               Padding="14,12"
@@ -157,17 +158,17 @@
                   VerticalAlignment="Center"
                   Margin="0,0,12,0"
                 >
-                  <ui:SymbolIcon Symbol="BranchFork24" FontSize="18" Foreground="{DynamicResource AccentFillColorDefaultBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                  <ui:SymbolIcon Symbol="BranchFork24" FontSize="18" Foreground="{DynamicResource AppAccentBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
                 </Border>
 
                 <!-- Repo Address -->
                 <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                  <TextBlock Text="GitHub 项目仓库链接" FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                  <TextBlock Text="GitHub 项目仓库链接" FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" />
                   <ui:TextBox
                     Margin="0,3,0,0"
                     FontSize="13"
                     FontWeight="SemiBold"
-                    Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                    Foreground="{DynamicResource AppAccentBrush}"
                     Text="{Binding GitHubUrl, Mode=OneWay}"
                     IsReadOnly="True"
                     BorderThickness="0"
@@ -227,8 +228,8 @@
 
         <!-- Card 3: 赞助与支持 (Sponsorship: USDT-TRON / USDT-BSC / USDT-Polygon) -->
         <Border
-          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          Background="{DynamicResource AppCardBrush}"
+          BorderBrush="{DynamicResource AppCardBorderBrush}"
           BorderThickness="1"
           CornerRadius="14"
           Padding="20,18"
@@ -246,27 +247,27 @@
               </Grid.ColumnDefinitions>
 
               <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                <ui:SymbolIcon Symbol="Heart24" Foreground="#E11D48" FontSize="20" Margin="0,0,8,0" />
+                <ui:SymbolIcon Symbol="Heart24" Foreground="{DynamicResource AppDangerBrush}" FontSize="20" Margin="0,0,8,0" />
                 <TextBlock Text="赞助与支持 (Sponsorship)" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center" />
               </StackPanel>
 
               <!-- Network Badges -->
               <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                <Border Background="#1AEF4444" BorderBrush="#50EF4444" BorderThickness="1" Padding="7,3" CornerRadius="5" Margin="0,0,6,0">
-                  <TextBlock Text="USDT · TRC-20" FontSize="11" FontWeight="Bold" Foreground="#EF4444" />
+                <Border Background="{DynamicResource AppDangerSoftBrush}" BorderBrush="{DynamicResource AppDangerBrush}" BorderThickness="1" Padding="7,3" CornerRadius="5" Margin="0,0,6,0">
+                  <TextBlock Text="USDT · TRC-20" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource AppDangerBrush}" />
                 </Border>
-                <Border Background="#1AF59E0B" BorderBrush="#50F59E0B" BorderThickness="1" Padding="7,3" CornerRadius="5" Margin="0,0,6,0">
-                  <TextBlock Text="USDT · BEP-20" FontSize="11" FontWeight="Bold" Foreground="#F59E0B" />
+                <Border Background="{DynamicResource AppWarningSoftBrush}" BorderBrush="{DynamicResource AppWarningBrush}" BorderThickness="1" Padding="7,3" CornerRadius="5" Margin="0,0,6,0">
+                  <TextBlock Text="USDT · BEP-20" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource AppWarningBrush}" />
                 </Border>
-                <Border Background="#1A8B5CF6" BorderBrush="#508B5CF6" BorderThickness="1" Padding="7,3" CornerRadius="5">
-                  <TextBlock Text="USDT · Polygon" FontSize="11" FontWeight="Bold" Foreground="#8B5CF6" />
+                <Border Background="{DynamicResource AppAccentSoftBrush}" BorderBrush="{DynamicResource AppAccentSoftBorderBrush}" BorderThickness="1" Padding="7,3" CornerRadius="5">
+                  <TextBlock Text="USDT · Polygon" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource AppAccentBrush}" />
                 </Border>
               </StackPanel>
             </Grid>
 
             <TextBlock
               FontSize="12"
-              Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+              Foreground="{DynamicResource AppTextSecondaryBrush}"
               Margin="0,0,0,14"
               Text="如果您觉得本项目对您的工作或研究有所帮助，欢迎通过区块链加密网络请作者喝杯咖啡 ☕，支持项目的持续维护与更新！"
             />
@@ -283,8 +284,8 @@
               <Border
                 Grid.Column="0"
                 Margin="0,0,6,0"
-                Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-                BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                Background="{DynamicResource AppInputBrush}"
+                BorderBrush="{DynamicResource AppCardBorderBrush}"
                 BorderThickness="1"
                 CornerRadius="12"
                 Padding="14,14"
@@ -297,20 +298,20 @@
                       <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                      <Border Width="22" Height="22" CornerRadius="11" Background="#1A26A17B" BorderBrush="#26A17B" BorderThickness="1" Margin="0,0,6,0" VerticalAlignment="Center">
+                      <Border Width="22" Height="22" CornerRadius="11" Background="{DynamicResource AppSuccessSoftBrush}" BorderBrush="#26A17B" BorderThickness="1" Margin="0,0,6,0" VerticalAlignment="Center">
                         <TextBlock Text="₮" FontSize="12" FontWeight="Bold" Foreground="#26A17B" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-1,0,0" />
                       </Border>
-                      <TextBlock Text="USDT-TRON" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" VerticalAlignment="Center" />
+                      <TextBlock Text="USDT-TRON" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" VerticalAlignment="Center" />
                     </StackPanel>
-                    <Border Grid.Column="1" Background="#1AEF4444" Padding="5,2" CornerRadius="4">
-                      <TextBlock Text="TRC-20" FontSize="10" FontWeight="Bold" Foreground="#EF4444" />
+                    <Border Grid.Column="1" Background="{DynamicResource AppDangerSoftBrush}" Padding="5,2" CornerRadius="4">
+                      <TextBlock Text="TRC-20" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource AppDangerBrush}" />
                     </Border>
                   </Grid>
 
                   <!-- QR Code Container -->
                   <Border
                     Background="#FFFFFF"
-                    BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                    BorderBrush="{DynamicResource AppCardBorderBrush}"
                     BorderThickness="1"
                     CornerRadius="10"
                     Padding="6"
@@ -332,8 +333,8 @@
                   </Border>
 
                   <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,8,0,6">
-                    <ui:SymbolIcon Symbol="QrCode24" FontSize="12" Foreground="#EF4444" Margin="0,0,4,0" VerticalAlignment="Center" />
-                    <TextBlock Text="扫码转账 (TRC-20)" FontSize="10.5" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                    <ui:SymbolIcon Symbol="QrCode24" FontSize="12" Foreground="{DynamicResource AppDangerBrush}" Margin="0,0,4,0" VerticalAlignment="Center" />
+                    <TextBlock Text="扫码转账 (TRC-20)" FontSize="10.5" Foreground="{DynamicResource AppTextSecondaryBrush}" VerticalAlignment="Center" />
                   </StackPanel>
 
                   <!-- Address Box -->
@@ -349,7 +350,7 @@
                       FontSize="10"
                       FontFamily="Consolas, Segoe UI"
                       FontWeight="SemiBold"
-                      Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                      Foreground="{DynamicResource AppTextPrimaryBrush}"
                       Text="{Binding TronAddress, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                       BorderThickness="0"
                       Background="Transparent"
@@ -386,7 +387,7 @@
                     TextWrapping="Wrap"
                     HorizontalAlignment="Center"
                     TextAlignment="Center"
-                    Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                    Foreground="{DynamicResource AppTextTertiaryBrush}"
                     Text="💡 仅限波场 TRON (TRC-20) 资产"
                   />
                 </StackPanel>
@@ -396,8 +397,8 @@
               <Border
                 Grid.Column="1"
                 Margin="3,0,3,0"
-                Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-                BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                Background="{DynamicResource AppInputBrush}"
+                BorderBrush="{DynamicResource AppCardBorderBrush}"
                 BorderThickness="1"
                 CornerRadius="12"
                 Padding="14,14"
@@ -410,20 +411,20 @@
                       <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                      <Border Width="22" Height="22" CornerRadius="11" Background="#1A26A17B" BorderBrush="#26A17B" BorderThickness="1" Margin="0,0,6,0" VerticalAlignment="Center">
+                      <Border Width="22" Height="22" CornerRadius="11" Background="{DynamicResource AppSuccessSoftBrush}" BorderBrush="#26A17B" BorderThickness="1" Margin="0,0,6,0" VerticalAlignment="Center">
                         <TextBlock Text="₮" FontSize="12" FontWeight="Bold" Foreground="#26A17B" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-1,0,0" />
                       </Border>
-                      <TextBlock Text="USDT-BSC" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" VerticalAlignment="Center" />
+                      <TextBlock Text="USDT-BSC" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" VerticalAlignment="Center" />
                     </StackPanel>
-                    <Border Grid.Column="1" Background="#1AF59E0B" Padding="5,2" CornerRadius="4">
-                      <TextBlock Text="BEP-20" FontSize="10" FontWeight="Bold" Foreground="#F59E0B" />
+                    <Border Grid.Column="1" Background="{DynamicResource AppWarningSoftBrush}" Padding="5,2" CornerRadius="4">
+                      <TextBlock Text="BEP-20" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource AppWarningBrush}" />
                     </Border>
                   </Grid>
 
                   <!-- QR Code Container -->
                   <Border
                     Background="#FFFFFF"
-                    BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                    BorderBrush="{DynamicResource AppCardBorderBrush}"
                     BorderThickness="1"
                     CornerRadius="10"
                     Padding="6"
@@ -445,8 +446,8 @@
                   </Border>
 
                   <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,8,0,6">
-                    <ui:SymbolIcon Symbol="QrCode24" FontSize="12" Foreground="#F59E0B" Margin="0,0,4,0" VerticalAlignment="Center" />
-                    <TextBlock Text="扫码转账 (BSC BEP-20)" FontSize="10.5" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                    <ui:SymbolIcon Symbol="QrCode24" FontSize="12" Foreground="{DynamicResource AppWarningBrush}" Margin="0,0,4,0" VerticalAlignment="Center" />
+                    <TextBlock Text="扫码转账 (BSC BEP-20)" FontSize="10.5" Foreground="{DynamicResource AppTextSecondaryBrush}" VerticalAlignment="Center" />
                   </StackPanel>
 
                   <!-- Address Box -->
@@ -462,7 +463,7 @@
                       FontSize="10"
                       FontFamily="Consolas, Segoe UI"
                       FontWeight="SemiBold"
-                      Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                      Foreground="{DynamicResource AppTextPrimaryBrush}"
                       Text="{Binding BscAddress, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                       BorderThickness="0"
                       Background="Transparent"
@@ -499,7 +500,7 @@
                     TextWrapping="Wrap"
                     HorizontalAlignment="Center"
                     TextAlignment="Center"
-                    Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                    Foreground="{DynamicResource AppTextTertiaryBrush}"
                     Text="💡 仅限 BNB Smart Chain (BEP-20)"
                   />
                 </StackPanel>
@@ -509,8 +510,8 @@
               <Border
                 Grid.Column="2"
                 Margin="6,0,0,0"
-                Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-                BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                Background="{DynamicResource AppInputBrush}"
+                BorderBrush="{DynamicResource AppCardBorderBrush}"
                 BorderThickness="1"
                 CornerRadius="12"
                 Padding="14,14"
@@ -523,20 +524,20 @@
                       <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                      <Border Width="22" Height="22" CornerRadius="11" Background="#1A26A17B" BorderBrush="#26A17B" BorderThickness="1" Margin="0,0,6,0" VerticalAlignment="Center">
+                      <Border Width="22" Height="22" CornerRadius="11" Background="{DynamicResource AppSuccessSoftBrush}" BorderBrush="#26A17B" BorderThickness="1" Margin="0,0,6,0" VerticalAlignment="Center">
                         <TextBlock Text="₮" FontSize="12" FontWeight="Bold" Foreground="#26A17B" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-1,0,0" />
                       </Border>
-                      <TextBlock Text="USDT-Polygon" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" VerticalAlignment="Center" />
+                      <TextBlock Text="USDT-Polygon" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" VerticalAlignment="Center" />
                     </StackPanel>
-                    <Border Grid.Column="1" Background="#1A8B5CF6" Padding="5,2" CornerRadius="4">
-                      <TextBlock Text="Polygon" FontSize="10" FontWeight="Bold" Foreground="#8B5CF6" />
+                    <Border Grid.Column="1" Background="{DynamicResource AppAccentSoftBrush}" Padding="5,2" CornerRadius="4">
+                      <TextBlock Text="Polygon" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource AppAccentBrush}" />
                     </Border>
                   </Grid>
 
                   <!-- QR Code Container -->
                   <Border
                     Background="#FFFFFF"
-                    BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                    BorderBrush="{DynamicResource AppCardBorderBrush}"
                     BorderThickness="1"
                     CornerRadius="10"
                     Padding="6"
@@ -558,8 +559,8 @@
                   </Border>
 
                   <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,8,0,6">
-                    <ui:SymbolIcon Symbol="QrCode24" FontSize="12" Foreground="#8B5CF6" Margin="0,0,4,0" VerticalAlignment="Center" />
-                    <TextBlock Text="扫码转账 (Polygon)" FontSize="10.5" Foreground="{DynamicResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" />
+                    <ui:SymbolIcon Symbol="QrCode24" FontSize="12" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,4,0" VerticalAlignment="Center" />
+                    <TextBlock Text="扫码转账 (Polygon)" FontSize="10.5" Foreground="{DynamicResource AppTextSecondaryBrush}" VerticalAlignment="Center" />
                   </StackPanel>
 
                   <!-- Address Box -->
@@ -575,7 +576,7 @@
                       FontSize="10"
                       FontFamily="Consolas, Segoe UI"
                       FontWeight="SemiBold"
-                      Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                      Foreground="{DynamicResource AppTextPrimaryBrush}"
                       Text="{Binding PolygonAddress, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                       BorderThickness="0"
                       Background="Transparent"
@@ -612,7 +613,7 @@
                     TextWrapping="Wrap"
                     HorizontalAlignment="Center"
                     TextAlignment="Center"
-                    Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                    Foreground="{DynamicResource AppTextTertiaryBrush}"
                     Text="💡 仅限 Polygon (PoS) 链上资产"
                   />
                 </StackPanel>
@@ -622,17 +623,17 @@
             <!-- Unified Safety Tip -->
             <Border
               Background="{DynamicResource SubtleFillColorSecondaryBrush}"
-              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
               BorderThickness="1"
               CornerRadius="8"
               Padding="12,8"
               Margin="0,6,0,0"
             >
               <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                <ui:SymbolIcon Symbol="Info24" FontSize="14" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,8,0" VerticalAlignment="Center" />
+                <ui:SymbolIcon Symbol="Info24" FontSize="14" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,8,0" VerticalAlignment="Center" />
                 <TextBlock
                   FontSize="11"
-                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                  Foreground="{DynamicResource AppTextSecondaryBrush}"
                   VerticalAlignment="Center"
                   Text="安全提示：转账时请务必核对所选区块链协议与充值网络（TRC-20 / BEP-20 / Polygon），跨链充错将导致资产无法找回。"
                 />
@@ -643,8 +644,8 @@
 
         <!-- Card 4: 项目说明 (Project Notes & Instructions) -->
         <Border
-          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          Background="{DynamicResource AppCardBrush}"
+          BorderBrush="{DynamicResource AppCardBorderBrush}"
           BorderThickness="1"
           CornerRadius="14"
           Padding="20,18"
@@ -661,7 +662,7 @@
               </Grid.ColumnDefinitions>
 
               <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                <ui:SymbolIcon Symbol="DocumentText24" Foreground="{DynamicResource AccentFillColorDefaultBrush}" FontSize="20" Margin="0,0,8,0" />
+                <ui:SymbolIcon Symbol="DocumentText24" Foreground="{DynamicResource AppAccentBrush}" FontSize="20" Margin="0,0,8,0" />
                 <TextBlock Text="项目说明" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center" />
               </StackPanel>
 
@@ -679,15 +680,15 @@
 
             <TextBlock
               FontSize="12"
-              Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+              Foreground="{DynamicResource AppTextSecondaryBrush}"
               Margin="0,0,0,10"
               Text="以下为项目的特别说明、使用指南与免责声明（只读保护模式，不可删除）："
             />
 
             <!-- Notes Content Text Area (不可删除，只读保护) -->
             <Border
-              Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-              BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+              Background="{DynamicResource AppInputBrush}"
+              BorderBrush="{DynamicResource AppCardBorderBrush}"
               BorderThickness="1"
               CornerRadius="10"
               Padding="14,12"
@@ -725,12 +726,12 @@
               <ColumnDefinition Width="Auto" />
               <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
-            <ui:SymbolIcon Grid.Column="0" Symbol="Info24" FontSize="15" Margin="0,0,8,0" Foreground="{DynamicResource AccentFillColorDefaultBrush}" VerticalAlignment="Center" />
+            <ui:SymbolIcon Grid.Column="0" Symbol="Info24" FontSize="15" Margin="0,0,8,0" Foreground="{DynamicResource AppAccentBrush}" VerticalAlignment="Center" />
             <TextBlock
               Grid.Column="1"
               VerticalAlignment="Center"
               FontSize="12"
-              Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"
+              Foreground="{DynamicResource AppAccentBrush}"
               Text="{Binding StatusMessage, FallbackValue='就绪'}"
             />
           </Grid>

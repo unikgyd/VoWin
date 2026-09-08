@@ -18,7 +18,7 @@ namespace VoWin.Models
         public int Index { get; set; }
         public string SenderOrRecipient { get; set; } = string.Empty;
         public string Text { get; set; } = string.Empty;
-        public DateTime Timestamp { get; set; } = DateTime.Now;
+        public DateTime Timestamp { get; set; } = DateTime.UtcNow;
         public bool IsOutgoing { get; set; }
         public SmsDeliveryState DeliveryState { get; set; } = SmsDeliveryState.Received;
         public string? DeliveryStatus { get; set; }

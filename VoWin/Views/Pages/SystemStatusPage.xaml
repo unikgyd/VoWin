@@ -13,8 +13,8 @@
   d:DesignHeight="750"
   d:DesignWidth="1200"
   ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
-  ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
-  Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+  ui:Design.Foreground="{DynamicResource AppTextPrimaryBrush}"
+  Foreground="{DynamicResource AppTextPrimaryBrush}"
   ScrollViewer.VerticalScrollBarVisibility="Disabled"
   ScrollViewer.HorizontalScrollBarVisibility="Disabled"
   mc:Ignorable="d"
@@ -34,7 +34,7 @@
     </Style>
   </Page.Resources>
 
-  <Grid Margin="20,12,20,14">
+  <Grid Margin="24,18,24,24">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
@@ -50,8 +50,7 @@
       <!-- Page Title & Slot Switcher -->
       <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
         <TextBlock
-          FontSize="22"
-          FontWeight="SemiBold"
+          Style="{DynamicResource AppPageTitleStyle}"
           VerticalAlignment="Center"
           Text="系统状态"
           Margin="0,0,14,0"
@@ -60,15 +59,15 @@
         <!-- Current Slot Selector Badge -->
         <Border
           Padding="8,3"
-          Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-          BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+          Background="{DynamicResource AppCardBrush}"
+          BorderBrush="{DynamicResource AppCardBorderBrush}"
           BorderThickness="1"
           CornerRadius="8"
           VerticalAlignment="Center"
         >
           <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-            <ui:SymbolIcon Symbol="Sim24" FontSize="14" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,6,0" VerticalAlignment="Center" />
-            <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="通信设备: " VerticalAlignment="Center" />
+            <ui:SymbolIcon Symbol="Sim24" FontSize="14" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,6,0" VerticalAlignment="Center" />
+            <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="通信设备: " VerticalAlignment="Center" />
             <ComboBox
               ItemsSource="{Binding Slots}"
               SelectedItem="{Binding SelectedSlot, Mode=TwoWay}"
@@ -139,8 +138,8 @@
           <Border
             Margin="0,0,0,14"
             Padding="18,16"
-            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            Background="{DynamicResource AppCardBrush}"
+            BorderBrush="{DynamicResource AppCardBorderBrush}"
             BorderThickness="1"
             CornerRadius="12"
           >
@@ -189,7 +188,7 @@
                     <TextBlock
                       FontSize="19"
                       FontWeight="SemiBold"
-                      Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                      Foreground="{DynamicResource AppTextPrimaryBrush}"
                       Text="{Binding MainStatusTitle, Mode=OneWay}"
                       VerticalAlignment="Center"
                     />
@@ -212,17 +211,17 @@
                   <!-- Link Summary line (e.g. 51566 PH · COM6 · LTE/NR · IMS Registered) -->
                   <TextBlock
                     FontSize="12"
-                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                    Foreground="{DynamicResource AppTextSecondaryBrush}"
                     Text="{Binding MainStatusSubText, Mode=OneWay}"
                     Margin="0,0,0,6"
                   />
 
                   <!-- Endpoints: Virtual IP & P-CSCF -->
-                  <TextBlock FontSize="12" Foreground="{DynamicResource TextFillColorTertiaryBrush}">
+                  <TextBlock FontSize="12" Foreground="{DynamicResource AppTextTertiaryBrush}">
                     <Run Text="虚拟内网 IP: " />
-                    <Run Text="{Binding AssignedIp, Mode=OneWay}" FontFamily="Consolas" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                    <Run Text="{Binding AssignedIp, Mode=OneWay}" FontFamily="Consolas" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" />
                     <Run Text="   ·   P-CSCF 端点: " />
-                    <Run Text="{Binding PcscfIp, Mode=OneWay}" FontFamily="Consolas" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}" />
+                    <Run Text="{Binding PcscfIp, Mode=OneWay}" FontFamily="Consolas" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" />
                   </TextBlock>
                 </StackPanel>
               </Grid>
@@ -273,8 +272,8 @@
               <Border
                 Margin="0,10,0,0"
                 Padding="12,10"
-                Background="#18DC2626"
-                BorderBrush="#40DC2626"
+                Background="{DynamicResource AppDangerSoftBrush}"
+                BorderBrush="{DynamicResource AppDangerBrush}"
                 BorderThickness="1"
                 CornerRadius="8"
                 Visibility="{Binding HasError, Converter={StaticResource BoolToVis}}"
@@ -286,11 +285,11 @@
                     <ColumnDefinition Width="Auto" />
                   </Grid.ColumnDefinitions>
 
-                  <ui:SymbolIcon Grid.Column="0" Symbol="DismissCircle24" Foreground="#DC2626" FontSize="18" Margin="0,0,10,0" VerticalAlignment="Center" />
+                  <ui:SymbolIcon Grid.Column="0" Symbol="DismissCircle24" Foreground="{DynamicResource AppDangerBrush}" FontSize="18" Margin="0,0,10,0" VerticalAlignment="Center" />
 
                   <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                    <TextBlock FontSize="13" FontWeight="SemiBold" Foreground="#DC2626" Text="{Binding ErrorTitle, Mode=OneWay}" />
-                    <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding ErrorDetail, Mode=OneWay}" Margin="0,2,0,0" TextWrapping="Wrap" />
+                    <TextBlock FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource AppDangerBrush}" Text="{Binding ErrorTitle, Mode=OneWay}" />
+                    <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding ErrorDetail, Mode=OneWay}" Margin="0,2,0,0" TextWrapping="Wrap" />
                   </StackPanel>
 
                   <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
@@ -311,8 +310,8 @@
           <Border
             Margin="0,0,0,14"
             Padding="18,16"
-            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            Background="{DynamicResource AppCardBrush}"
+            BorderBrush="{DynamicResource AppCardBorderBrush}"
             BorderThickness="1"
             CornerRadius="12"
           >
@@ -325,26 +324,26 @@
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                  <ui:SymbolIcon Symbol="CellularData124" FontSize="16" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,8,0" />
+                  <ui:SymbolIcon Symbol="CellularData124" FontSize="16" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,8,0" />
                   <TextBlock FontSize="15" FontWeight="SemiBold" Text="蜂窝网络与 SIM" />
                 </StackPanel>
 
                 <!-- Header Badges -->
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                   <!-- Retail card-profile country; a hosted IMSI may differ. -->
-                  <Border Margin="0,0,6,0" Padding="8,3" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="6">
+                  <Border Margin="0,0,6,0" Padding="8,3" Background="{DynamicResource AppInputBrush}" CornerRadius="6">
                     <TextBlock FontSize="11" FontWeight="SemiBold" ToolTip="仅用于展示根据 ICCID / 卡配置识别的卡品牌，不会改写 IMSI、PLMN 或网络鉴权参数。">
                       <Run Text="SIM 卡：" />
                       <Run Text="{Binding CardProfileDisplay, Mode=OneWay}" />
                     </TextBlock>
                   </Border>
                   <!-- Roaming Badge -->
-                  <Border Margin="0,0,6,0" Padding="8,3" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="6">
-                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Text="{Binding RoamingText, Mode=OneWay}" />
+                  <Border Margin="0,0,6,0" Padding="8,3" Background="{DynamicResource AppInputBrush}" CornerRadius="6">
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource AppAccentBrush}" Text="{Binding RoamingText, Mode=OneWay}" />
                   </Border>
                   <!-- SIM Ready Badge -->
-                  <Border Padding="8,3" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="6">
-                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Text="{Binding SimCardStatusText, Mode=OneWay}" />
+                  <Border Padding="8,3" Background="{DynamicResource AppInputBrush}" CornerRadius="6">
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource AppAccentBrush}" Text="{Binding SimCardStatusText, Mode=OneWay}" />
                   </Border>
                 </StackPanel>
               </Grid>
@@ -360,9 +359,9 @@
 
                 <!-- 1. RSSI -->
                 <StackPanel Grid.Column="0" Margin="0,0,8,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="信号强度 (RSSI)" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="信号强度 (RSSI)" />
                   <TextBlock FontSize="16" FontWeight="Bold" Margin="0,3,0,0" Text="{Binding SignalDbmText, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0">
                     <Run Text="{Binding SignalEvaluation, Mode=OneWay}" />
                     <Run Text=" · " />
                     <Run Text="{Binding SignalBars, Mode=OneWay}" /><Run Text="/5格" />
@@ -371,25 +370,25 @@
 
                 <!-- 2. RAT -->
                 <StackPanel Grid.Column="1" Margin="4,0,8,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="接入制式 (RAT)" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="接入制式 (RAT)" />
                   <TextBlock FontSize="16" FontWeight="Bold" Margin="0,3,0,0" Text="{Binding Rat, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="4G / 5G 蜂窝数据" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" Text="4G / 5G 蜂窝数据" />
                 </StackPanel>
 
                 <!-- 3. Retail carrier / card profile -->
                 <StackPanel Grid.Column="2" Margin="4,0,8,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="卡配置运营商（ICCID）" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="卡配置运营商（ICCID）" />
                   <TextBlock FontSize="15" FontWeight="Bold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding OperatorName, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis">
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis">
                     <Run Text="IMSI 认证归属：" /><Run Text="{Binding ImsiHomeDisplay, Mode=OneWay}" />
                   </TextBlock>
                 </StackPanel>
 
-                <!-- 4. Modem Port -->
+                <!-- 4. Subscriber phone number -->
                 <StackPanel Grid.Column="3" Margin="4,0,0,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="通信模组与端口" />
-                  <TextBlock FontSize="15" FontFamily="Consolas" FontWeight="Bold" Margin="0,3,0,0" Text="{Binding PortName, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="{Binding SlotStateText, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="本机号码 (MSISDN)" />
+                  <TextBlock FontSize="15" FontFamily="Consolas" FontWeight="Bold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding PhoneNumber, Mode=OneWay}" ToolTip="{Binding PhoneNumber, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding PhoneNumberDetail, Mode=OneWay}" ToolTip="{Binding PhoneNumberDetail, Mode=OneWay}" />
                 </StackPanel>
               </Grid>
 
@@ -401,7 +400,7 @@
                   Padding="4,2"
                   Command="{Binding ToggleDeviceDetailsCommand}"
                   Content="{Binding DeviceDetailsToggleText, Mode=OneWay}"
-                  Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}"
+                  Foreground="{DynamicResource AppAccentBrush}"
                   FontSize="12"
                 />
               </Grid>
@@ -410,7 +409,7 @@
               <Border
                 Margin="0,8,0,0"
                 Padding="12,10"
-                Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
+                Background="{DynamicResource AppInputBrush}"
                 CornerRadius="8"
                 Visibility="{Binding IsDeviceDetailsExpanded, Converter={StaticResource BoolToVis}}"
               >
@@ -427,35 +426,38 @@
 
                   <!-- Row 0: ICCID, IMSI, IMEI -->
                   <StackPanel Grid.Row="0" Grid.Column="0" Margin="0,0,8,8">
-                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="SIM 识别码 (ICCID) · 卡配置归属" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="SIM 识别码 (ICCID) · 卡配置归属" />
                     <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding Iccid, Mode=OneWay}" />
-                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding CardProfileDisplay, Mode=OneWay}" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding CardProfileDisplay, Mode=OneWay}" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource AppAccentBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis">
+                      <Run Text="卡片别名：" /><Run Text="{Binding CardNicknameDisplay, Mode=OneWay}" />
+                    </TextBlock>
                   </StackPanel>
 
                   <StackPanel Grid.Row="0" Grid.Column="1" Margin="4,0,8,8">
-                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="国际移动用户识别码 (IMSI) · 认证归属" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="国际移动用户识别码 (IMSI) · 认证归属" />
                     <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding Imsi, Mode=OneWay}" />
-                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding ImsiHomeDisplay, Mode=OneWay}" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding ImsiHomeDisplay, Mode=OneWay}" />
                   </StackPanel>
 
                   <StackPanel Grid.Row="0" Grid.Column="2" Margin="4,0,0,8">
-                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="设备识别码 (IMEI)" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="设备识别码 (IMEI)" />
                     <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding Imei, Mode=OneWay}" />
                   </StackPanel>
 
                   <!-- Row 1: Cell ID, Modem HW, Firmware -->
                   <StackPanel Grid.Row="1" Grid.Column="0" Margin="0,0,8,0">
-                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="服务小区 (Cell ID)" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="服务小区 (Cell ID)" />
                     <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding CellIdText, Mode=OneWay}" />
                   </StackPanel>
 
                   <StackPanel Grid.Row="1" Grid.Column="1" Margin="4,0,8,0">
-                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="模组型号与波特率" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="模组型号与波特率" />
                     <TextBlock FontSize="11" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding BaudRateText, Mode=OneWay}" />
                   </StackPanel>
 
                   <StackPanel Grid.Row="1" Grid.Column="2" Margin="4,0,0,0">
-                    <TextBlock FontSize="10" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="基带固件版本" />
+                    <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="基带固件版本" />
                     <TextBlock FontSize="11" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding ModemFirmware, Mode=OneWay}" />
                   </StackPanel>
                 </Grid>
@@ -467,8 +469,8 @@
           <!-- ================= CARD 3: IMS / SIP 网络质量与实时保活 ================= -->
           <Border
             Padding="18,16"
-            Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            Background="{DynamicResource AppCardBrush}"
+            BorderBrush="{DynamicResource AppCardBorderBrush}"
             BorderThickness="1"
             CornerRadius="12"
           >
@@ -481,7 +483,7 @@
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                  <ui:SymbolIcon Symbol="Pulse24" FontSize="16" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,8,0" />
+                  <ui:SymbolIcon Symbol="Pulse24" FontSize="16" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,8,0" />
                   <TextBlock FontSize="15" FontWeight="SemiBold" Text="IMS / SIP 网络质量与保活" />
                 </StackPanel>
 
@@ -504,8 +506,8 @@
                   <Border Margin="0,0,6,0" Padding="8,3" Background="{Binding Stage4Bg, Mode=OneWay}" CornerRadius="6">
                     <TextBlock FontSize="11" FontWeight="Bold" Foreground="{Binding Stage4Brush, Mode=OneWay}" Text="{Binding SipProbeStatus, Mode=OneWay}" />
                   </Border>
-                  <Border Padding="8,3" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="6">
-                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="NAT-T RFC 3948" />
+                  <Border Padding="8,3" Background="{DynamicResource AppInputBrush}" CornerRadius="6">
+                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="NAT-T RFC 3948" />
                   </Border>
                 </StackPanel>
               </Grid>
@@ -521,30 +523,30 @@
 
                 <!-- 1. RTT Latency -->
                 <StackPanel Grid.Column="0" Margin="0,0,8,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="往返延迟 (RTT)" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="往返延迟 (RTT)" />
                   <TextBlock FontSize="16" FontWeight="Bold" Margin="0,3,0,0" Foreground="{Binding Stage4Brush, Mode=OneWay}" Text="{Binding SipProbeRtt, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastProbeStatusText, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastProbeStatusText, Mode=OneWay}" />
                 </StackPanel>
 
                 <!-- 2. Probe Stats (Success / Failed / Loss Rate) -->
                 <StackPanel Grid.Column="1" Margin="4,0,8,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="探针统计 (成功 / 失败)" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="探针统计 (成功 / 失败)" />
                   <TextBlock FontSize="15" FontWeight="Bold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SipProbeCountText, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SipProbeLossDetailText, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SipProbeLossDetailText, Mode=OneWay}" />
                 </StackPanel>
 
                 <!-- 3. Last Probe Time & Interval -->
                 <StackPanel Grid.Column="2" Margin="4,0,8,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="上次探测保活" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="上次探测保活" />
                   <TextBlock FontSize="15" FontWeight="SemiBold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastHeartbeatRelativeText, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastHeartbeatExactText, Mode=OneWay}" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastHeartbeatExactText, Mode=OneWay}" />
                 </StackPanel>
 
                 <!-- 4. NAT Binding -->
                 <StackPanel Grid.Column="3" Margin="4,0,0,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="NAT 映射与端点" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="NAT 映射与端点" />
                   <TextBlock FontSize="12" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding NatBindingText, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource TextFillColorTertiaryBrush}" Margin="0,2,0,0" Text="RFC 3948 UDP 5060 (20s窗口)" />
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" Text="RFC 3948 UDP 5060 (20s窗口)" />
                 </StackPanel>
               </Grid>
 
@@ -560,8 +562,8 @@
         Grid.Column="1"
         Width="370"
         Padding="14,12"
-        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+        Background="{DynamicResource AppCardBrush}"
+        BorderBrush="{DynamicResource AppCardBorderBrush}"
         BorderThickness="1"
         CornerRadius="12"
         PreviewMouseWheel="OnTerminalPreviewMouseWheel"
@@ -584,10 +586,10 @@
 
             <!-- Title & Count -->
             <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-              <ui:SymbolIcon Symbol="Code24" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,6,0" FontSize="16" />
+              <ui:SymbolIcon Symbol="Code24" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,6,0" FontSize="16" />
               <TextBlock FontSize="14" FontWeight="SemiBold" Text="实时日志" VerticalAlignment="Center" />
-              <Border Margin="6,0,0,0" Padding="6,2" Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}" CornerRadius="4">
-                <TextBlock FontSize="10" FontWeight="Medium" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Text="{Binding FilteredLogsCountText, Mode=OneWay}" />
+              <Border Margin="6,0,0,0" Padding="6,2" Background="{DynamicResource AppInputBrush}" CornerRadius="4">
+                <TextBlock FontSize="10" FontWeight="Medium" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding FilteredLogsCountText, Mode=OneWay}" />
               </Border>
             </StackPanel>
 
@@ -737,8 +739,8 @@
           <!-- Structured Log List with Fixed Columns (Time / Level / Module / Message) -->
           <Border
             Grid.Row="3"
-            Background="{DynamicResource CardBackgroundFillColorSecondaryBrush}"
-            BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+            Background="{DynamicResource AppInputBrush}"
+            BorderBrush="{DynamicResource AppCardBorderBrush}"
             BorderThickness="1"
             CornerRadius="8"
             Padding="6,6,4,6"
@@ -780,7 +782,7 @@
                       FontFamily="Consolas"
                       FontSize="10"
                       VerticalAlignment="Center"
-                      Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                      Foreground="{DynamicResource AppTextTertiaryBrush}"
                       Text="{Binding Timestamp, StringFormat='{}{0:HH:mm:ss}', Mode=OneWay}"
                     />
 
@@ -811,13 +813,13 @@
                       CornerRadius="4"
                       HorizontalAlignment="Left"
                       VerticalAlignment="Center"
-                      Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+                      Background="{DynamicResource AppCardBrush}"
                     >
                       <TextBlock
                         FontFamily="Consolas"
                         FontSize="9"
                         FontWeight="SemiBold"
-                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                        Foreground="{DynamicResource AppTextSecondaryBrush}"
                         Text="{Binding Source, Mode=OneWay}"
                         TextTrimming="CharacterEllipsis"
                       />
@@ -829,7 +831,7 @@
                       FontFamily="Consolas"
                       FontSize="11"
                       LineHeight="16"
-                      Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                      Foreground="{DynamicResource AppTextPrimaryBrush}"
                       Text="{Binding Message, Mode=OneWay}"
                       TextWrapping="Wrap"
                       VerticalAlignment="Center"
@@ -848,8 +850,8 @@
         Grid.Column="1"
         Width="36"
         Margin="4,0,0,0"
-        Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
-        BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+        Background="{DynamicResource AppCardBrush}"
+        BorderBrush="{DynamicResource AppCardBorderBrush}"
         BorderThickness="1"
         CornerRadius="10"
         Visibility="{Binding IsLogPanelExpanded, Converter={StaticResource InvertBoolToVis}}"
@@ -863,13 +865,13 @@
           ToolTip="展开实时日志面板"
         >
           <StackPanel Orientation="Vertical" HorizontalAlignment="Center" VerticalAlignment="Center">
-            <ui:SymbolIcon Symbol="ChevronLeft24" FontSize="16" Foreground="{DynamicResource AccentFillColorDefaultBrush}" Margin="0,0,0,10" />
-            <ui:SymbolIcon Symbol="Code24" FontSize="16" Foreground="{DynamicResource TextFillColorSecondaryBrush}" Margin="0,0,0,10" />
+            <ui:SymbolIcon Symbol="ChevronLeft24" FontSize="16" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,0,10" />
+            <ui:SymbolIcon Symbol="Code24" FontSize="16" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="0,0,0,10" />
             <TextBlock
               Text="实时日志"
               FontSize="11"
               FontWeight="SemiBold"
-              Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+              Foreground="{DynamicResource AppTextSecondaryBrush}"
               HorizontalAlignment="Center"
             >
               <TextBlock.LayoutTransform>

@@ -360,7 +360,7 @@ namespace VoWin.Services
 
                     if (e.NewState == CallState.Active)
                     {
-                        _callStartTime = DateTime.Now;
+                        _callStartTime = DateTime.UtcNow;
                         HasIncomingCall = false;
                         Views.Windows.IncomingCallFloatingWindow.Dismiss();
                     }
@@ -370,7 +370,7 @@ namespace VoWin.Services
                         Views.Windows.IncomingCallFloatingWindow.Dismiss();
                         if (!_callRecordSavedForCurrentSession && _callStartTime.HasValue)
                         {
-                            var dur = DateTime.Now - _callStartTime.Value;
+                            var dur = DateTime.UtcNow - _callStartTime.Value;
                             RecordCallFinished(e.TargetNumber, _currentCallDirection, e.NewState, _callStartTime.Value, dur);
                         }
                         _callStartTime = null;
@@ -423,7 +423,7 @@ namespace VoWin.Services
                 {
                     StopIncomingAlerting();
                     CurrentCallState = CallState.Active;
-                    _callStartTime = DateTime.Now;
+                    _callStartTime = DateTime.UtcNow;
                     HasIncomingCall = false;
                     Views.Windows.IncomingCallFloatingWindow.Dismiss();
                     AddLog("INFO", "Calls", $"Call connected: {e.TargetNumber} (Codec: {e.Codec ?? "Default"})");
@@ -476,8 +476,8 @@ namespace VoWin.Services
                     _ = StopQdc507VoiceRouteAsync();
                     ApplyVolteAudioPrewarmPreference();
 
-                    var dur = e.Duration ?? (_callStartTime.HasValue ? DateTime.Now - _callStartTime.Value : TimeSpan.Zero);
-                    RecordCallFinished(e.TargetNumber, _currentCallDirection, CallState.Ended, _callStartTime ?? DateTime.Now, dur, null, e.SlotId, e.WavRecordingPath);
+                    var dur = e.Duration ?? (_callStartTime.HasValue ? DateTime.UtcNow - _callStartTime.Value : TimeSpan.Zero);
+                    RecordCallFinished(e.TargetNumber, _currentCallDirection, CallState.Ended, _callStartTime ?? DateTime.UtcNow, dur, null, e.SlotId, e.WavRecordingPath);
                     _callStartTime = null;
                     AddLog("INFO", "Calls",
                         $"Call ended: {e.TargetNumber}, duration: {dur:mm\\:ss}, reason: {e.Reason ?? "unknown"}");
@@ -758,7 +758,14 @@ namespace VoWin.Services
         private async Task AddIncomingSmsAsync(SmsMessage msg, string? slotId)
         {
             var remote = !string.IsNullOrWhiteSpace(msg.SenderOrRecipient) ? msg.SenderOrRecipient : "Unknown";
-            var exists = await Preferences.HasSmsMessageAsync(remote, msg.Timestamp, msg.Text, msg.RawPdu).ConfigureAwait(false);
+            var receivedAtUtc = DateTime.UtcNow;
+            var normalizedTimestamp = TimestampDisplayHelper.NormalizeIncomingNetworkTime(msg.Timestamp, receivedAtUtc);
+            if (normalizedTimestamp != TimestampDisplayHelper.ToUtcStorageTime(msg.Timestamp))
+            {
+                AddLog("INFO", "SMS", $"Corrected network timestamp from {msg.Timestamp:o} to {normalizedTimestamp:o}");
+            }
+
+            var exists = await Preferences.HasSmsMessageAsync(remote, normalizedTimestamp, msg.Text, msg.RawPdu).ConfigureAwait(false);
             if (exists)
             {
                 return;
@@ -770,7 +777,7 @@ namespace VoWin.Services
                 SlotId = slotId,
                 SenderOrRecipient = remote,
                 Text = msg.Text,
-                Timestamp = msg.Timestamp,
+                Timestamp = normalizedTimestamp,
                 IsOutgoing = false,
                 DeliveryState = SmsDeliveryState.Received,
                 DeliveryStatus = msg.DeliveryStatus,
@@ -1049,7 +1056,7 @@ namespace VoWin.Services
             _callRecordSavedForCurrentSession = false;
             CurrentCallNumber = number;
             CurrentCallState = CallState.Dialing;
-            _callStartTime = DateTime.Now;
+            _callStartTime = DateTime.UtcNow;
 
             try
             {
@@ -1071,7 +1078,7 @@ namespace VoWin.Services
             catch (Exception ex)
             {
                 CurrentCallState = CallState.Ended;
-                RecordCallFinished(number, CallDirection.Outgoing, CallState.Ended, _callStartTime ?? DateTime.Now, TimeSpan.Zero);
+                RecordCallFinished(number, CallDirection.Outgoing, CallState.Ended, _callStartTime ?? DateTime.UtcNow, TimeSpan.Zero);
                 AddLog("ERROR", "Calls", $"Dial failed: {ex.Message}");
                 throw;
             }
@@ -1089,10 +1096,10 @@ namespace VoWin.Services
             }
             catch { }
 
-            var dur = _callStartTime.HasValue ? DateTime.Now - _callStartTime.Value : TimeSpan.FromSeconds(15);
+            var dur = _callStartTime.HasValue ? DateTime.UtcNow - _callStartTime.Value : TimeSpan.FromSeconds(15);
             if (!string.IsNullOrEmpty(CurrentCallNumber))
             {
-                RecordCallFinished(CurrentCallNumber, _currentCallDirection, CallState.Ended, _callStartTime ?? DateTime.Now, dur, "AMR-WB");
+                RecordCallFinished(CurrentCallNumber, _currentCallDirection, CallState.Ended, _callStartTime ?? DateTime.UtcNow, dur, "AMR-WB");
             }
 
             CurrentCallState = CallState.Ended;
@@ -1129,7 +1136,7 @@ namespace VoWin.Services
 
             if (!string.IsNullOrEmpty(IncomingCallerNumber))
             {
-                RecordCallFinished(IncomingCallerNumber, CallDirection.Missed, CallState.Ended, DateTime.Now, TimeSpan.Zero, "AMR-WB");
+                RecordCallFinished(IncomingCallerNumber, CallDirection.Missed, CallState.Ended, DateTime.UtcNow, TimeSpan.Zero, "AMR-WB");
             }
 
             try
@@ -1161,7 +1168,7 @@ namespace VoWin.Services
                 {
                     SenderOrRecipient = recipient,
                     Text = text,
-                    Timestamp = DateTime.Now,
+                    Timestamp = DateTime.UtcNow,
                     IsOutgoing = true,
                     DeliveryState = SmsDeliveryState.Sending
                 };
@@ -1258,7 +1265,9 @@ namespace VoWin.Services
             var targetSlot = (!string.IsNullOrEmpty(slotId) ? Slots.FirstOrDefault(s => s.Id == slotId) : ActiveSlot) ?? Slots.FirstOrDefault();
             if (targetSlot != null)
             {
-                await ApplyPreferencesToSlotAsync(targetSlot).ConfigureAwait(false);
+                // Restore the card's routing/radio policy, but do not schedule a
+                // second automatic start while this explicit start is in flight.
+                await ApplyPreferencesToSlotAsync(targetSlot, restoreAutoVoWifi: false).ConfigureAwait(false);
 
                 // An explicit per-SIM/per-slot route wins over MCC routing.
                 // The earlier code changed only the WPF model and never updated
@@ -1312,7 +1321,15 @@ namespace VoWin.Services
             var slot = (!string.IsNullOrEmpty(slotId) ? Slots.FirstOrDefault(s => s.Id == slotId) : ActiveSlot) ?? Slots.FirstOrDefault();
             if (slot != null)
             {
-                return await slot.SwitchEuiccProfileAsync(iccidOrAid);
+                var switched = await slot.SwitchEuiccProfileAsync(iccidOrAid).ConfigureAwait(false);
+                if (switched)
+                {
+                    // Only the newly verified ICCID may select SIM preferences,
+                    // proxy routing, permanent IMSI overrides and auto-VoWiFi.
+                    await ApplyPreferencesToSlotAsync(slot).ConfigureAwait(false);
+                    RequestSlotSync();
+                }
+                return switched;
             }
             return await Kernel.SwitchEuiccProfileAsync(iccidOrAid);
         }
@@ -1360,13 +1377,42 @@ namespace VoWin.Services
             string? confirmationCode = null,
             IProgress<EuiccDownloadProgress>? progress = null,
             string? slotId = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            bool allowUntrustedTls = false,
+            bool allowRetryAfterUncertain = false)
         {
             var slot = (!string.IsNullOrEmpty(slotId) ? Slots.FirstOrDefault(s => s.Id == slotId) : ActiveSlot) ?? Slots.FirstOrDefault();
             AddLog("INFO", "eSIM", $"Starting verified eSIM profile download on slot {slot?.Name ?? "Active"}.");
-            if (slot != null)
-                return await slot.DownloadEuiccProfileAsync(activationCode, confirmationCode, progress, cancellationToken);
-            return await Kernel.DownloadEuiccProfileAsync(activationCode, confirmationCode, progress, cancellationToken);
+            if (allowUntrustedTls)
+                AddLog("WARN", "eSIM", "TLS certificate validation bypass enabled for this SM-DP+ download session.");
+            if (allowRetryAfterUncertain)
+                AddLog("WARN", "eSIM", "Provider-authorized retry enabled; the matching local uncertain transaction may be reset.");
+            var tracedProgress = new CallbackProgress<EuiccDownloadProgress>(value =>
+            {
+                AddLog("INFO", "eSIM", $"Download progress {value.Percent}%: {value.Status}");
+                progress?.Report(value);
+            });
+            try
+            {
+                var result = slot != null
+                    ? await slot.DownloadEuiccProfileAsync(activationCode, confirmationCode, tracedProgress, cancellationToken, allowUntrustedTls, allowRetryAfterUncertain)
+                    : await Kernel.DownloadEuiccProfileAsync(activationCode, confirmationCode, tracedProgress, cancellationToken, allowUntrustedTls, allowRetryAfterUncertain);
+                AddLog(result.InstalledWithWarning ? "WARN" : "INFO", "eSIM",
+                    $"Profile download completed. ICCID={result.Iccid}; Warning={result.Warning ?? "None"}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                var errorChain = new List<string>();
+                for (Exception? current = ex; current != null; current = current.InnerException)
+                {
+                    var message = current.Message.Trim();
+                    if (!string.IsNullOrEmpty(message) && !errorChain.Contains(message, StringComparer.Ordinal))
+                        errorChain.Add(message);
+                }
+                AddLog("ERROR", "eSIM", $"Profile download failed: {string.Join(" -> ", errorChain)}");
+                throw;
+            }
         }
 
         public bool SetSlotProxy(string slotId, string? proxyUrl)
@@ -1558,7 +1604,10 @@ namespace VoWin.Services
             }
         }
 
-        public async Task ApplyPreferencesToSlotAsync(ModemSlot slot)
+        public Task ApplyPreferencesToSlotAsync(ModemSlot slot) =>
+            ApplyPreferencesToSlotAsync(slot, restoreAutoVoWifi: true);
+
+        private async Task ApplyPreferencesToSlotAsync(ModemSlot slot, bool restoreAutoVoWifi)
         {
             try
             {
@@ -1569,23 +1618,103 @@ namespace VoWin.Services
                     simPref = await Preferences.GetSimPreferenceAsync(slot.Sim.Iccid);
                 }
 
+                if (modPref != null && !string.IsNullOrWhiteSpace(modPref.CustomName))
+                {
+                    slot.Name = modPref.CustomName.Trim();
+                }
+                slot.CardNickname = simPref?.CardNickname;
+
                 // A SIM follows the card between modules, so it must override
                 // the module preference.  Both are applied to the kernel before
                 // any VoWiFi session can begin.
                 var preferredProxy = !string.IsNullOrWhiteSpace(simPref?.DedicatedProxyUrl)
                     ? simPref.DedicatedProxyUrl
                     : modPref?.DefaultProxyUrl;
-                if (!string.IsNullOrWhiteSpace(preferredProxy))
-                {
-                    Kernel.SetSlotProxy(slot.Id, preferredProxy);
-                    AddLog("INFO", "Proxy", $"已恢复卡槽 [{slot.Name}] 的代理设置: {DescribeProxyEndpoint(preferredProxy)}");
-                }
+                Kernel.SetSlotProxy(slot.Id,
+                    string.IsNullOrWhiteSpace(preferredProxy) ? null : preferredProxy!.Trim());
+                AddLog("INFO", "Proxy", string.IsNullOrWhiteSpace(preferredProxy)
+                    ? $"已恢复卡槽 [{slot.Name}] 的直连设置。"
+                    : $"已恢复卡槽 [{slot.Name}] 的代理设置: {DescribeProxyEndpoint(preferredProxy)}");
 
                 ApplyVoWifiHomeIdentity(slot, simPref);
 
-                var autoVoWifi = simPref?.DefaultVoWifi ?? modPref?.DefaultVoWifi ?? false;
-                if (autoVoWifi)
-                    QueueAutoVoWifiStart(slot);
+                // A SIM preference follows the card and overrides the module
+                // default. Restore RF state before starting any background work
+                // that could report cellular registration or signal state.
+                bool? preferredFlightMode = simPref?.DefaultFlightMode ?? modPref?.DefaultFlightMode;
+                if (preferredFlightMode.HasValue && slot.IsFlightMode != preferredFlightMode.Value)
+                {
+                    try
+                    {
+                        var applied = await slot.SetFlightModeAsync(preferredFlightMode.Value).ConfigureAwait(false);
+                        if (!applied)
+                        {
+                            AddLog("WARN", "Preferences", $"无法为卡槽 [{slot.Name}] 恢复飞行模式偏好。");
+                        }
+                        else
+                        {
+                            AddLog("INFO", "Preferences", preferredFlightMode.Value
+                                ? $"已为卡槽 [{slot.Name}] 恢复飞行模式，蜂窝射频已关闭。"
+                                : $"已为卡槽 [{slot.Name}] 恢复正常模式，蜂窝射频已开启。");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        AddLog("WARN", "Preferences", $"恢复飞行模式偏好失败，继续处理其他设置: {ex.Message}");
+                    }
+                }
+
+                if (!slot.IsFlightMode)
+                {
+                    bool? preferredRoaming = simPref?.DefaultDataRoaming ?? modPref?.DefaultDataRoaming;
+                    if (preferredRoaming.HasValue)
+                    {
+                        try
+                        {
+                            var applied = await slot.SetDataRoamingEnabledAsync(preferredRoaming.Value).ConfigureAwait(false);
+                            AddLog(applied ? "INFO" : "WARN", "Preferences", applied
+                                ? $"已为卡槽 [{slot.Name}] 恢复数据漫游偏好: {(preferredRoaming.Value ? "允许" : "禁止")}。"
+                                : $"模组未确认数据漫游偏好，可能不支持 Quectel 漫游指令。");
+                        }
+                        catch (Exception ex)
+                        {
+                            AddLog("WARN", "Preferences", $"恢复数据漫游偏好失败，继续处理其他设置: {ex.Message}");
+                        }
+                    }
+
+                    bool? preferredCellularData = simPref?.DefaultCellularData ?? modPref?.DefaultCellularData;
+                    if (preferredCellularData.HasValue)
+                    {
+                        try
+                        {
+                            var applied = await slot.SetCellularDataEnabledAsync(preferredCellularData.Value).ConfigureAwait(false);
+                            AddLog(applied ? "INFO" : "WARN", "Preferences", applied
+                                ? $"已为卡槽 [{slot.Name}] 恢复蜂窝数据偏好: {(preferredCellularData.Value ? "开启" : "关闭")}。"
+                                : $"模组未确认蜂窝数据偏好 (CGATT)。");
+                        }
+                        catch (Exception ex)
+                        {
+                            AddLog("WARN", "Preferences", $"恢复蜂窝数据偏好失败，继续处理 VoWiFi: {ex.Message}");
+                        }
+                    }
+
+                    try { await slot.RefreshMetricsAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { AddLog("WARN", "Preferences", $"偏好恢复后的网络刷新失败: {ex.Message}"); }
+                }
+
+                if (restoreAutoVoWifi)
+                {
+                    var autoVoWifi = simPref?.DefaultVoWifi ?? modPref?.DefaultVoWifi ?? false;
+                    if (autoVoWifi)
+                    {
+                        QueueAutoVoWifiStart(slot);
+                    }
+                    else if (slot.VoWifi.State != VoWifiState.Disconnected)
+                    {
+                        await slot.StopVoWifiAsync().ConfigureAwait(false);
+                        AddLog("INFO", "VoWiFi", $"已按卡槽 [{slot.Name}] 的关闭偏好停止自动 VoWiFi。");
+                    }
+                }
 
                 _ = SyncModemSmsAsync(slot);
             }
@@ -1673,8 +1802,11 @@ namespace VoWin.Services
 
                     bool isOutgoing = msg.Direction == SmsDirection.Submitted;
                     var remote = !string.IsNullOrWhiteSpace(msg.SenderOrRecipient) ? msg.SenderOrRecipient : "Unknown";
+                    var normalizedTimestamp = isOutgoing
+                        ? TimestampDisplayHelper.ToUtcStorageTime(msg.Timestamp)
+                        : TimestampDisplayHelper.NormalizeIncomingNetworkTime(msg.Timestamp);
 
-                    bool exists = await Preferences.HasSmsMessageAsync(remote, msg.Timestamp, msg.Text, msg.RawPdu).ConfigureAwait(false);
+                    bool exists = await Preferences.HasSmsMessageAsync(remote, normalizedTimestamp, msg.Text, msg.RawPdu).ConfigureAwait(false);
                     if (!exists)
                     {
                         var model = new SmsMessageModel
@@ -1683,7 +1815,7 @@ namespace VoWin.Services
                             SlotId = slot.Id,
                             SenderOrRecipient = remote,
                             Text = msg.Text,
-                            Timestamp = msg.Timestamp,
+                            Timestamp = normalizedTimestamp,
                             IsOutgoing = isOutgoing,
                             DeliveryState = isOutgoing ? SmsDeliveryState.Sent : SmsDeliveryState.Received,
                             DeliveryStatus = msg.DeliveryStatus,
@@ -1767,13 +1899,16 @@ namespace VoWin.Services
             }
         }
 
-        public async Task SaveModulePreferencesAsync(string slotId, bool flightMode, bool vowifi, bool cellularData, bool roaming, string? proxyUrl)
+        public async Task SaveModulePreferencesAsync(string slotId, bool flightMode, bool vowifi, bool cellularData, bool roaming, string? proxyUrl, string? customName = null)
         {
             var slot = Kernel.GetSlots().FirstOrDefault(s => s.Id == slotId);
+            var normalizedName = string.IsNullOrWhiteSpace(customName) ? null : customName.Trim();
             var model = new ModulePreferenceModel
             {
                 Id = slotId,
                 Imei = slot?.Imei,
+                PortName = slot?.PortName,
+                CustomName = normalizedName,
                 DefaultFlightMode = flightMode,
                 DefaultVoWifi = vowifi,
                 DefaultCellularData = cellularData,
@@ -1783,15 +1918,23 @@ namespace VoWin.Services
                 LastSeenAt = DateTime.Now
             };
             await Preferences.SaveModulePreferenceAsync(model);
+            if (slot != null)
+            {
+                slot.Name = normalizedName ?? $"Slot {slot.Id} ({slot.PortName})";
+            }
             AddLog("INFO", "Preferences", $"Saved module preference for [{slotId}]");
         }
 
         public async Task SaveSimPreferencesAsync(string iccid, bool flightMode, bool vowifi, bool cellularData, bool roaming, string? proxyUrl, string? nickname)
         {
+            var normalizedNickname = string.IsNullOrWhiteSpace(nickname) ? null : nickname.Trim();
+            var slot = Kernel.GetSlots().FirstOrDefault(s =>
+                string.Equals(s.Sim?.Iccid, iccid, StringComparison.Ordinal));
             var model = new SimPreferenceModel
             {
                 Iccid = iccid,
-                CardNickname = nickname,
+                Imsi = slot?.Sim?.Imsi,
+                CardNickname = normalizedNickname,
                 DefaultFlightMode = flightMode,
                 DefaultVoWifi = vowifi,
                 DefaultCellularData = cellularData,
@@ -1800,6 +1943,10 @@ namespace VoWin.Services
                 LastSeenAt = DateTime.Now
             };
             await Preferences.SaveSimPreferenceAsync(model);
+            if (slot != null)
+            {
+                slot.CardNickname = normalizedNickname;
+            }
             AddLog("INFO", "Preferences", $"Saved sim preference for [{iccid}]");
         }
 

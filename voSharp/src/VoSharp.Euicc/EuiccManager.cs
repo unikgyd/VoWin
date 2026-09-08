@@ -169,7 +169,9 @@ public class EuiccManager
         string imei,
         string? confirmationCode = null,
         IProgress<EuiccDownloadProgress>? progress = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool allowUntrustedTls = false,
+        bool allowRetryAfterUncertain = false)
     {
         var parsedCode = EuiccActivationCode.Parse(activationCode);
         var normalizedImei = new string((imei ?? string.Empty).Where(char.IsDigit).ToArray());
@@ -202,9 +204,17 @@ public class EuiccManager
                         true,
                         "检测到该激活码对应的 Profile 已在卡内；已阻止重复下载。请在安装通知列表中确认运营商通知状态。");
                 }
-                throw new EuiccDownloadUncertainException(
-                    "该激活码已有未完成或结果不确定的事务记录。为防止 SM-DP+ 已消耗二维码，已禁止再次下载；请先重新读取卡片和安装通知。",
-                    cardCommitMayHaveCompleted: true);
+                if (allowRetryAfterUncertain)
+                {
+                    EuiccDownloadJournal.ResetForAuthorizedRetry(fingerprint);
+                    progress?.Report(new EuiccDownloadProgress(7, "服务商已授权重试；已清除本地事务锁定，正在建立新下载事务"));
+                }
+                else
+                {
+                    throw new EuiccDownloadUncertainException(
+                        "该激活码已有未完成或结果不确定的事务记录。为防止 SM-DP+ 已消耗二维码，已禁止再次下载；请先重新读取卡片和安装通知。",
+                        cardCommitMayHaveCompleted: true);
+                }
             }
 
             try
@@ -222,13 +232,19 @@ public class EuiccManager
             EuiccDownloadJournal.Begin(fingerprint, beforeIccids);
             journalStarted = true;
 
-            var downloader = new EuiccProfileDownloader(Transport);
+            var downloader = new EuiccProfileDownloader(Transport, allowUntrustedTls);
             Exception? downloadError = null;
             string reportedIccid = string.Empty;
             EuiccWorkerDownloadResult? workerResult = null;
+            var lastDownloadProgress = new EuiccDownloadProgress(10, "正在建立下载会话");
+            var trackedProgress = new EuiccForwardingProgress(value =>
+            {
+                lastDownloadProgress = value;
+                progress?.Report(value);
+            });
             try
             {
-                workerResult = await downloader.DownloadAsync(parsedCode, normalizedImei, normalizedConfirmationCode, progress, ct).ConfigureAwait(false);
+                workerResult = await downloader.DownloadAsync(parsedCode, normalizedImei, normalizedConfirmationCode, trackedProgress, ct).ConfigureAwait(false);
                 reportedIccid = workerResult.Iccid;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -236,7 +252,11 @@ public class EuiccManager
                 downloadError = ex;
             }
 
-            progress?.Report(new EuiccDownloadProgress(95, "正在重新读取 Profile 并核对写入结果"));
+            progress?.Report(downloadError is null
+                ? new EuiccDownloadProgress(95, "正在重新读取 Profile 并核对写入结果")
+                : new EuiccDownloadProgress(
+                    lastDownloadProgress.Percent,
+                    $"{lastDownloadProgress.Status}时失败；正在只读核验卡片，确认是否发生写入"));
             List<Profile>? after = null;
             Exception? verifyError = null;
             for (var attempt = 0; attempt < 3; attempt++)
@@ -266,7 +286,7 @@ public class EuiccManager
                 {
                     EuiccDownloadJournal.MarkUncertain(fingerprint);
                     var state = unsafeError.Ambiguous
-                        ? "最终写卡响应中断，当前无法确认卡内是否已经提交"
+                        ? "写卡数据传输已经开始，但未收到完整安装结果，当前无法确认卡内是否已经提交"
                         : "下载事务已经进入运营商处理阶段";
                     throw new EuiccDownloadUncertainException(
                         $"{state}；此激活码可能已经失效，禁止直接再次下载。请先重新读取 Profile 和安装通知。原始错误：{unsafeError.Message}",
@@ -300,7 +320,7 @@ public class EuiccManager
             try { ProfilesUpdated?.Invoke(this, new EuiccProfilesChangedEventArgs(after!)); } catch { }
             EventBus?.Publish("euicc.profile.downloaded", "EuiccManager", new { installed.ICCID, parsedCode.SmdpAddress });
 
-            if (downloadError is not null || workerResult?.Recovered == true)
+            if (downloadError is not null || workerResult?.Recovered == true || !string.IsNullOrWhiteSpace(workerResult?.Warning))
             {
                 var warning = workerResult?.Warning ?? $"Profile 已写入卡片，但运营商确认阶段返回警告：{downloadError?.Message}";
                 return new EuiccDownloadResult(installed.ICCID, true, warning);
@@ -331,6 +351,11 @@ public class EuiccManager
             using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
             await Transport.CloseLogicalChannelAsync(channel, cleanupCts.Token).ConfigureAwait(false);
         }
+    }
+
+    private sealed class EuiccForwardingProgress(Action<EuiccDownloadProgress> callback) : IProgress<EuiccDownloadProgress>
+    {
+        public void Report(EuiccDownloadProgress value) => callback(value);
     }
 
     private async Task<EuiccInfo> GetEuiccInfoWithoutGateAsync(CancellationToken ct)
