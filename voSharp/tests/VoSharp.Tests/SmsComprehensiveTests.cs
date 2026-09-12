@@ -209,6 +209,15 @@ public class SmsComprehensiveTests
         Assert.Equal(95, rpErr[3]);
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("invalid-smsc")]
+    [InlineData("+123456789012345678901")]
+    public void TestImsSmsHandler_RejectsUnverifiedRpDestination(string value)
+    {
+        Assert.Throws<ArgumentException>(() => ImsSmsHandler.EncodeRpAddress(value));
+    }
+
     [Fact]
     public void TestImsSmsHandler_ExtractSmsPayload_MultipartAndDirect()
     {

@@ -159,7 +159,7 @@ public class SipImsTests
     }
 
     [Fact]
-    public void InitialRegisterDeclaresAlgorithmAndUnprotectedIntegrity()
+    public void InitialRegisterDoesNotSendAnEmptyDigestAuthorization()
     {
         var profile = new VoSharp.Sip.ImsProfile(
             PrivateIdentity: "001010123456789@ims.mnc001.mcc001.3gppnetwork.org",
@@ -170,12 +170,40 @@ public class SipImsTests
             LocalPort: 5060);
 
         var message = VoSharp.Sip.ImsRegisterBuilder.BuildInitialRegister(profile, "callid", 1, "fromtag");
-        var authorization = message.GetHeader("Authorization");
+        Assert.Null(message.GetHeader("Authorization"));
+    }
 
-        Assert.NotNull(authorization);
-        Assert.Contains("algorithm=AKAv1-MD5", authorization, StringComparison.Ordinal);
-        Assert.Contains("integrity-protected=no", authorization, StringComparison.Ordinal);
-        Assert.Contains("nonce=\"\"", authorization, StringComparison.Ordinal);
+    [Fact]
+    public void FormatHostBracketsOnlyIpv6Addresses()
+    {
+        Assert.Equal("[2001:db8::1]", VoSharp.Sip.ImsRegisterBuilder.FormatHost("2001:db8::1"));
+        Assert.Equal("[2001:db8::1]", VoSharp.Sip.ImsRegisterBuilder.FormatHost("[2001:db8::1]"));
+        Assert.Equal("10.0.0.5", VoSharp.Sip.ImsRegisterBuilder.FormatHost("10.0.0.5"));
+        Assert.Equal("ims.mnc001.mcc001.3gppnetwork.org",
+            VoSharp.Sip.ImsRegisterBuilder.FormatHost("ims.mnc001.mcc001.3gppnetwork.org"));
+        Assert.Equal(string.Empty, VoSharp.Sip.ImsRegisterBuilder.FormatHost(null));
+    }
+
+    [Fact]
+    public void InitialRegisterKeepsAnIpv6HostUnambiguous()
+    {
+        var profile = new VoSharp.Sip.ImsProfile(
+            PrivateIdentity: "001010123456789@ims.mnc001.mcc001.3gppnetwork.org",
+            PublicIdentity: "sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org",
+            HomeDomain: "ims.mnc001.mcc001.3gppnetwork.org",
+            Imei: "860000000000001",
+            LocalIp: "2001:db8::1",
+            LocalPort: 5060);
+
+        var message = VoSharp.Sip.ImsRegisterBuilder.BuildInitialRegister(profile, "callid", 1, "fromtag");
+
+        var via = message.GetHeader("Via");
+        var contact = message.GetHeader("Contact");
+        Assert.NotNull(via);
+        Assert.NotNull(contact);
+        // "SIP/2.0/UDP 2001:db8::1:5060" would be read as host "2001" with a nonsense port.
+        Assert.Contains("[2001:db8::1]:5060", via, StringComparison.Ordinal);
+        Assert.Contains("[2001:db8::1]:5060", contact, StringComparison.Ordinal);
     }
 
     private static string Md5(string text)

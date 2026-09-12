@@ -6,7 +6,6 @@
     <ProjectReference Include="..\VoSharp.Crypto\VoSharp.Crypto.csproj" />
     <ProjectReference Include="..\VoSharp.Sip\VoSharp.Sip.csproj" />
     <ProjectReference Include="..\VoSharp.Sim\VoSharp.Sim.csproj" />
-    <ProjectReference Include="..\VoSharp.Native\VoSharp.Native.csproj" />
     <ProjectReference Include="..\VoSharp.Ike\VoSharp.Ike.csproj" />
     <ProjectReference Include="..\VoSharp.Ipsec\VoSharp.Ipsec.csproj" />
   </ItemGroup>

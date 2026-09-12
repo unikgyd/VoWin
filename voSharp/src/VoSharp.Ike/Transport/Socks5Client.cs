@@ -18,6 +18,7 @@ public sealed class Socks5Client : IDisposable
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(10);
 
     private Socket? _controlSocket;
+    private IPEndPoint? _udpRelayEndpoint;
     private bool _disposed;
 
     public Socket? ControlSocket => _controlSocket;
@@ -31,7 +32,7 @@ public sealed class Socks5Client : IDisposable
     }
 
     /// <summary>
-    /// Parses a URL such as "socks5://127.0.0.1:10808" or "socks5://user:pass@10.0.0.1:1080".
+    /// Parses a URL such as "socks5://127.0.0.1:1080" or "socks5://user:pass@10.0.0.1:1080".
     /// </summary>
     public static Socks5Client? TryParse(string? proxyUrl)
     {
@@ -81,6 +82,7 @@ public sealed class Socks5Client : IDisposable
     public async Task ConnectAndAuthenticateAsync(CancellationToken ct = default)
     {
         _controlSocket?.Dispose();
+        _udpRelayEndpoint = null;
         _controlSocket = new Socket(SocketType.Stream, ProtocolType.Tcp)
         {
             NoDelay = true
@@ -101,11 +103,11 @@ public sealed class Socks5Client : IDisposable
         greeting[1] = (byte)methods.Count;
         for (int i = 0; i < methods.Count; i++) greeting[2 + i] = methods[i];
 
-        await _controlSocket.SendAsync(greeting, SocketFlags.None, linkedCts.Token).ConfigureAwait(false);
+        await SendAllAsync(_controlSocket, greeting, linkedCts.Token).ConfigureAwait(false);
 
         var response = new byte[2];
-        int read = await _controlSocket.ReceiveAsync(response, SocketFlags.None, linkedCts.Token).ConfigureAwait(false);
-        if (read < 2 || response[0] != 0x05)
+        await ReadExactAsync(_controlSocket, response, linkedCts.Token).ConfigureAwait(false);
+        if (response[0] != 0x05)
             throw new InvalidOperationException($"Invalid SOCKS5 greeting response from {ProxyHost}:{ProxyPort}");
 
         if (response[1] == 0xFF)
@@ -127,11 +129,11 @@ public sealed class Socks5Client : IDisposable
             authBuf[2 + uBytes.Length] = (byte)pBytes.Length;
             Buffer.BlockCopy(pBytes, 0, authBuf, 3 + uBytes.Length, pBytes.Length);
 
-            await _controlSocket.SendAsync(authBuf, SocketFlags.None, linkedCts.Token).ConfigureAwait(false);
+            await SendAllAsync(_controlSocket, authBuf, linkedCts.Token).ConfigureAwait(false);
 
             var authResp = new byte[2];
-            int authRead = await _controlSocket.ReceiveAsync(authResp, SocketFlags.None, linkedCts.Token).ConfigureAwait(false);
-            if (authRead < 2 || authResp[1] != 0x00)
+            await ReadExactAsync(_controlSocket, authResp, linkedCts.Token).ConfigureAwait(false);
+            if (authResp[1] != 0x00)
                 throw new InvalidOperationException($"SOCKS5 proxy username/password authentication failed (code {authResp[1]}).");
         }
     }
@@ -141,6 +143,9 @@ public sealed class Socks5Client : IDisposable
     /// </summary>
     public async Task<IPEndPoint> UdpAssociateAsync(CancellationToken ct = default)
     {
+        if (_udpRelayEndpoint != null && _controlSocket?.Connected == true)
+            return _udpRelayEndpoint;
+
         if (_controlSocket == null || !_controlSocket.Connected)
             await ConnectAndAuthenticateAsync(ct).ConfigureAwait(false);
 
@@ -149,11 +154,11 @@ public sealed class Socks5Client : IDisposable
 
         // Send UDP ASSOCIATE request: 05 03 00 01 (IPv4) 00 00 00 00 00 00 (0.0.0.0:0)
         var req = new byte[] { 0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-        await _controlSocket!.SendAsync(req, SocketFlags.None, linkedCts.Token).ConfigureAwait(false);
+        await SendAllAsync(_controlSocket!, req, linkedCts.Token).ConfigureAwait(false);
 
         // Read reply header (4 bytes: VER, REP, RSV, ATYP)
         var header = new byte[4];
-        await ReadExactAsync(_controlSocket, header, linkedCts.Token).ConfigureAwait(false);
+        await ReadExactAsync(_controlSocket!, header, linkedCts.Token).ConfigureAwait(false);
 
         if (header[0] != 0x05)
             throw new InvalidOperationException($"SOCKS5 unexpected reply version: {header[0]}");
@@ -166,21 +171,21 @@ public sealed class Socks5Client : IDisposable
         if (atyp == 0x01) // IPv4
         {
             var ipBytes = new byte[4];
-            await ReadExactAsync(_controlSocket, ipBytes, linkedCts.Token).ConfigureAwait(false);
+            await ReadExactAsync(_controlSocket!, ipBytes, linkedCts.Token).ConfigureAwait(false);
             relayIp = new IPAddress(ipBytes);
         }
         else if (atyp == 0x04) // IPv6
         {
             var ipBytes = new byte[16];
-            await ReadExactAsync(_controlSocket, ipBytes, linkedCts.Token).ConfigureAwait(false);
+            await ReadExactAsync(_controlSocket!, ipBytes, linkedCts.Token).ConfigureAwait(false);
             relayIp = new IPAddress(ipBytes);
         }
         else if (atyp == 0x03) // Domain name
         {
             var lenByte = new byte[1];
-            await ReadExactAsync(_controlSocket, lenByte, linkedCts.Token).ConfigureAwait(false);
+            await ReadExactAsync(_controlSocket!, lenByte, linkedCts.Token).ConfigureAwait(false);
             var domainBytes = new byte[lenByte[0]];
-            await ReadExactAsync(_controlSocket, domainBytes, linkedCts.Token).ConfigureAwait(false);
+            await ReadExactAsync(_controlSocket!, domainBytes, linkedCts.Token).ConfigureAwait(false);
             var domain = Encoding.ASCII.GetString(domainBytes);
             var resolved = await Dns.GetHostAddressesAsync(domain, linkedCts.Token).ConfigureAwait(false);
             relayIp = resolved.FirstOrDefault() ?? throw new InvalidOperationException($"Could not resolve SOCKS5 relay domain '{domain}'");
@@ -191,7 +196,7 @@ public sealed class Socks5Client : IDisposable
         }
 
         var portBytes = new byte[2];
-        await ReadExactAsync(_controlSocket, portBytes, linkedCts.Token).ConfigureAwait(false);
+        await ReadExactAsync(_controlSocket!, portBytes, linkedCts.Token).ConfigureAwait(false);
         int relayPort = BinaryPrimitives.ReadUInt16BigEndian(portBytes);
 
         // If proxy returned 0.0.0.0, use the proxy's own IP address
@@ -208,7 +213,42 @@ public sealed class Socks5Client : IDisposable
             }
         }
 
-        return new IPEndPoint(relayIp, relayPort);
+        _udpRelayEndpoint = new IPEndPoint(relayIp, relayPort);
+        return _udpRelayEndpoint;
+    }
+
+    /// <summary>
+    /// Sends one UDP datagram through the SOCKS5 relay and waits for a reply.
+    /// This verifies the UDP data plane, rather than only the TCP handshake
+    /// and UDP ASSOCIATE control response.
+    /// </summary>
+    public async Task<byte[]> UdpRoundTripAsync(
+        ReadOnlyMemory<byte> payload,
+        IPEndPoint targetEndpoint,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(targetEndpoint);
+        if (payload.IsEmpty)
+            throw new ArgumentException("UDP probe payload cannot be empty.", nameof(payload));
+
+        var relayEndpoint = await UdpAssociateAsync(ct).ConfigureAwait(false);
+        using var udpSocket = new Socket(relayEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        var anyAddress = relayEndpoint.AddressFamily == AddressFamily.InterNetwork
+            ? IPAddress.Any
+            : IPAddress.IPv6Any;
+        udpSocket.Bind(new IPEndPoint(anyAddress, 0));
+        udpSocket.Connect(relayEndpoint);
+
+        var request = EncapsulateUdpDatagram(payload.Span, targetEndpoint);
+        await udpSocket.SendAsync(request, SocketFlags.None, ct).ConfigureAwait(false);
+
+        var responseBuffer = new byte[65535];
+        var received = await udpSocket.ReceiveAsync(responseBuffer, SocketFlags.None, ct).ConfigureAwait(false);
+        var response = DecapsulateUdpDatagram(responseBuffer.AsMemory(0, received));
+        if (response == null)
+            throw new InvalidOperationException("SOCKS5 relay returned a malformed UDP datagram.");
+
+        return response.Value.ToArray();
     }
 
     /// <summary>
@@ -257,7 +297,9 @@ public sealed class Socks5Client : IDisposable
         if (raw.Length < 10) return null;
         var span = raw.Span;
         if (span[0] != 0 || span[1] != 0) return null; // RSV check
-        // span[2] is FRAG
+        // RFC 1928 UDP fragmentation is optional and this client has no reassembly state. Passing
+        // a nonzero fragment upward would make an incomplete IKE/ESP packet look authentic.
+        if (span[2] != 0) return null;
         byte atyp = span[3];
         int headerLen;
         if (atyp == 0x01) headerLen = 10; // 4 header + 4 IPv4 + 2 port
@@ -273,12 +315,24 @@ public sealed class Socks5Client : IDisposable
         return raw.Slice(headerLen);
     }
 
-    private static async Task ReadExactAsync(Socket socket, byte[] buffer, CancellationToken ct)
+    private static async Task SendAllAsync(Socket socket, ReadOnlyMemory<byte> buffer, CancellationToken ct)
+    {
+        var offset = 0;
+        while (offset < buffer.Length)
+        {
+            var sent = await socket.SendAsync(buffer[offset..], SocketFlags.None, ct).ConfigureAwait(false);
+            if (sent == 0)
+                throw new InvalidOperationException("Socket connection closed while sending to SOCKS5 proxy.");
+            offset += sent;
+        }
+    }
+
+    private static async Task ReadExactAsync(Socket socket, Memory<byte> buffer, CancellationToken ct)
     {
         int offset = 0;
         while (offset < buffer.Length)
         {
-            int read = await socket.ReceiveAsync(buffer.AsMemory(offset, buffer.Length - offset), SocketFlags.None, ct).ConfigureAwait(false);
+            int read = await socket.ReceiveAsync(buffer[offset..], SocketFlags.None, ct).ConfigureAwait(false);
             if (read == 0)
                 throw new InvalidOperationException("Socket connection closed prematurely by SOCKS5 proxy.");
             offset += read;
@@ -291,5 +345,6 @@ public sealed class Socks5Client : IDisposable
         _disposed = true;
         _controlSocket?.Dispose();
         _controlSocket = null;
+        _udpRelayEndpoint = null;
     }
 }

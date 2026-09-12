@@ -221,7 +221,7 @@
 
                   <!-- Line 3: Operator / RAT / SIM Status -->
                   <TextBlock Grid.Row="2" FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="16,3,0,0" TextTrimming="CharacterEllipsis">
-                    <Run Text="{Binding Sim.OperatorName, Mode=OneWay, FallbackValue='51566'}" />
+                    <Run Text="{Binding CarrierName, Mode=OneWay, FallbackValue='未识别运营商'}" />
                     <Run Text=" · " />
                     <Run Text="{Binding Signal.Rat, Mode=OneWay, FallbackValue='LTE/NR'}" />
                     <Run Text=" · " />
@@ -1109,13 +1109,13 @@
                 </Grid>
               </TabItem>
 
-              <!-- ================= TAB 6: 卡槽偏好设置 (Slot Preferences) ================= -->
-              <TabItem Header="卡槽偏好">
+              <!-- ================= TAB 6: 卡槽资料 ================= -->
+              <TabItem Header="卡槽资料">
                 <ScrollViewer Margin="0,10,0,0" VerticalScrollBarVisibility="Auto">
                   <StackPanel>
-                    <TextBlock FontSize="13" FontWeight="SemiBold" Text="硬件与 SIM 卡偏好配置 (出站代理已全权收敛至“网络分流与代理”页面)" Margin="0,0,0,12" />
+                    <TextBlock FontSize="13" FontWeight="SemiBold" Text="硬件与 SIM 卡资料（VoWiFi、飞行模式、漫游和数据开关请在首页“开关”中操作）" Margin="0,0,0,12" />
 
-                    <TextBlock FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AppAccentBrush}" Text="模组默认（未给 SIM 单独保存时使用）" Margin="0,0,0,8" />
+                    <TextBlock FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AppAccentBrush}" Text="模组资料" Margin="0,0,0,8" />
 
                     <!-- Module Name -->
                     <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
@@ -1133,51 +1133,7 @@
                       </Grid>
                     </Border>
 
-                    <!-- Flight Mode Card -->
-                    <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
-                      <Grid>
-                        <StackPanel>
-                          <TextBlock FontWeight="Medium" Text="飞行模式 (CFUN=4)" />
-                          <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="关闭模块蜂窝射频发射。仅使用 VoWiFi 建立连接。" />
-                        </StackPanel>
-                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding ModuleFlightMode, Mode=TwoWay}" />
-                      </Grid>
-                    </Border>
-
-                    <!-- VoWiFi Auto Card -->
-                    <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
-                      <Grid>
-                        <StackPanel>
-                          <TextBlock FontWeight="Medium" Text="默认开启 VoWiFi" />
-                          <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="当检测到此模块插卡时，自动建立 IPsec 隧道。" />
-                        </StackPanel>
-                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding ModuleVoWifi, Mode=TwoWay}" />
-                      </Grid>
-                    </Border>
-
-                    <!-- Cellular Data Switch Card -->
-                    <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
-                      <Grid>
-                        <StackPanel>
-                          <TextBlock FontWeight="Medium" Text="蜂窝移动数据" />
-                          <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="开启或关闭此模组的蜂窝移动数据连接 (PS 域上网业务)。" />
-                        </StackPanel>
-                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding ModuleCellularData, Mode=TwoWay}" />
-                      </Grid>
-                    </Border>
-
-                    <!-- Data Roaming Card -->
-                    <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
-                      <Grid>
-                        <StackPanel>
-                          <TextBlock FontWeight="Medium" Text="数据漫游" />
-                          <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="在非归属运营商网络漫游时，允许使用蜂窝移动数据业务。" />
-                        </StackPanel>
-                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding ModuleDataRoaming, Mode=TwoWay}" />
-                      </Grid>
-                    </Border>
-
-                    <TextBlock FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AppAccentBrush}" Text="当前 SIM 卡（按 ICCID 保存，优先于模组默认）" Margin="0,8,0,8" />
+                    <TextBlock FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AppAccentBrush}" Text="当前 SIM 卡（按 ICCID 保存）" Margin="0,8,0,8" />
 
                     <!-- SIM Card Nickname -->
                     <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,12">
@@ -1195,51 +1151,11 @@
                       </Grid>
                     </Border>
 
-                    <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
-                      <Grid>
-                        <StackPanel>
-                          <TextBlock FontWeight="Medium" Text="此卡默认飞行模式" />
-                          <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="启动或启用此 ICCID 时覆盖模组默认值。" />
-                        </StackPanel>
-                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding SimFlightMode, Mode=TwoWay}" />
-                      </Grid>
-                    </Border>
-
-                    <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
-                      <Grid>
-                        <StackPanel>
-                          <TextBlock FontWeight="Medium" Text="此卡默认开启 VoWiFi" />
-                          <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="启用此卡后按该值启动或保持关闭 VoWiFi。" />
-                        </StackPanel>
-                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding SimVoWifi, Mode=TwoWay}" />
-                      </Grid>
-                    </Border>
-
-                    <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,8">
-                      <Grid>
-                        <StackPanel>
-                          <TextBlock FontWeight="Medium" Text="此卡蜂窝移动数据" />
-                          <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="启用此卡后恢复 PS 域附着设置。" />
-                        </StackPanel>
-                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding SimCellularData, Mode=TwoWay}" />
-                      </Grid>
-                    </Border>
-
-                    <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="0,0,0,12">
-                      <Grid>
-                        <StackPanel>
-                          <TextBlock FontWeight="Medium" Text="此卡数据漫游" />
-                          <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="启用此卡后恢复该 ICCID 的漫游策略。" />
-                        </StackPanel>
-                        <ui:ToggleSwitch HorizontalAlignment="Right" IsChecked="{Binding SimDataRoaming, Mode=TwoWay}" />
-                      </Grid>
-                    </Border>
-
-                    <!-- Save All Preferences Button -->
+                    <!-- Save card details button -->
                     <ui:Button
                       Appearance="Primary"
-                      Command="{Binding SaveAllPreferencesCommand}"
-                      Content="保存偏好设置至 SQLite"
+                      Command="{Binding SaveSimPreferenceCommand}"
+                      Content="保存卡片资料"
                       HorizontalAlignment="Left"
                       Margin="0,0,0,20"
                     />

@@ -27,6 +27,12 @@
 | USDT · BNB Smart Chain（BEP-20） | `0x0e5e07b7604d8585fd936527f48874a10ad8b884` |
 | USDT · Polygon                   | `0x0e5e07b7604d8585fd936527f48874a10ad8b884` |
 
+`项目目前处于迭代期，可能会有bug。`
+
+`目前测试通过的有:ec20、dji 模块，英国ctexcel、菲律宾dito(新加坡节点/国内直连)`
+
+
+
 ## 安装教程
 
 ### 1. 准备运行环境

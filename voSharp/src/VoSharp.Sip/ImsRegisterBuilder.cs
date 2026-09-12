@@ -1,3 +1,7 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using VoSharp.Crypto;
 
@@ -10,13 +14,41 @@ public record ImsProfile(
     string Imei,
     string LocalIp,
     int LocalPort = 5060,
-    int? ContactPort = null
+    int? ContactPort = null,
+    string? PAccessNetworkInfo = null
 );
 
 public static class ImsRegisterBuilder
 {
     // 3GPP TS 24.229: default registration expiry is 3600 s
     private const int DefaultExpiresSeconds = 3600;
+
+    /// <summary>
+    /// Brackets an IPv6 host so "host:port" stays unambiguous in Via, Contact and From
+    /// (RFC 3261 §25.1). IPv4 addresses and host names pass through unchanged.
+    /// </summary>
+    public static string FormatHost(string? host) =>
+        !string.IsNullOrWhiteSpace(host) &&
+        IPAddress.TryParse(host.Trim('[', ']'), out var address) &&
+        address.AddressFamily == AddressFamily.InterNetworkV6
+            ? $"[{address}]"
+            : host ?? string.Empty;
+
+    /// <summary>
+    /// Builds a plausible P-Access-Network-Info (3GPP TS 24.229 §7.2A.4). A constant or obviously
+    /// fake node identity (an all-zero or all-f "BSSID") is treated by some P-CSCFs as a UE that
+    /// is not really on Wi-Fi, and the registration is refused or torn down. Derive a stable,
+    /// locally administered unicast node id from the SIM identity instead — the same approach the
+    /// reference gateway uses. Only the derived id is sent; the identity itself is never exposed.
+    /// </summary>
+    public static string BuildAccessNetworkInfo(string? identity)
+    {
+        var digest = SHA256.HashData(Encoding.UTF8.GetBytes("vowin-pani:" + (identity ?? string.Empty)));
+        var node = new byte[6];
+        Array.Copy(digest, node, node.Length);
+        node[0] = (byte)((node[0] | 0x02) & 0xFE); // locally administered, never multicast
+        return $"IEEE-802.11;i-wlan-node-id={Convert.ToHexString(node).ToLowerInvariant()}";
+    }
 
     /// <summary>
     /// Builds initial 3GPP IMS SIP REGISTER without auth credentials.
@@ -58,20 +90,19 @@ public static class ImsRegisterBuilder
             : cleanImei;
         var imeiInstance = $"\"<urn:gsma:imei:{imeiFormatted}>\"";
 
-        msg.SetHeader("Via", $"SIP/2.0/UDP {profile.LocalIp}:{profile.LocalPort};branch={branch};rport");
+        var localHost = FormatHost(profile.LocalIp);
+        msg.SetHeader("Via", $"SIP/2.0/UDP {localHost}:{profile.LocalPort};branch={branch};rport");
         msg.SetHeader("Max-Forwards", "70");
         msg.SetHeader("From", $"<{publicId}>;tag={tag}");
         msg.SetHeader("To", $"<{publicId}>");
         msg.SetHeader("Call-ID", callId);
         msg.SetHeader("CSeq", $"{cseq} REGISTER");
-        msg.SetHeader("Contact", $"<sip:{user}@{profile.LocalIp}:{profile.ContactPort ?? profile.LocalPort};transport=udp>;+sip.instance={imeiInstance};+g.3gpp.smsip;audio;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";expires={DefaultExpiresSeconds}");
-        msg.SetHeader("P-Access-Network-Info", "IEEE-802.11;i-wlan-node-id=000000000000;network-provided");
+        msg.SetHeader("Contact", $"<sip:{user}@{localHost}:{profile.ContactPort ?? profile.LocalPort};transport=udp>;+sip.instance={imeiInstance};+g.3gpp.smsip;audio;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";expires={DefaultExpiresSeconds}");
+        if (!string.IsNullOrWhiteSpace(profile.PAccessNetworkInfo))
+            msg.SetHeader("P-Access-Network-Info", profile.PAccessNetworkInfo);
         msg.SetHeader("Accept-Contact", "*;+g.3gpp.smsip, *;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"");
         msg.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, MESSAGE, OPTIONS, NOTIFY, PRACK, UPDATE, INFO");
         msg.SetHeader("Accept", "application/vnd.3gpp.sms, text/plain, multipart/mixed");
-        msg.SetHeader("Authorization",
-            $"Digest username=\"{profile.PrivateIdentity}\", realm=\"{profile.HomeDomain}\", nonce=\"\", " +
-            $"uri=\"sip:{profile.HomeDomain}\", response=\"\", algorithm=AKAv1-MD5, integrity-protected=no");
         msg.SetHeader("Supported", "path, gruu");
         msg.SetHeader("User-Agent", "voSharp/1.0.0 (Windows; C# Telephony Kernel)");
         msg.SetHeader("Content-Length", "0");
@@ -128,6 +159,21 @@ public static class ImsRegisterBuilder
             algoMatch.Groups[1].Value,
             qop
         );
+    }
+
+    /// <summary>
+    /// Returns a redacted description suitable for diagnostics when no supported challenge was
+    /// offered. Never include the nonce itself: it contains the AKA RAND/AUTN material.
+    /// </summary>
+    public static string DescribeChallenge(string headerValue)
+    {
+        var realm = Regex.Match(headerValue, @"realm=""([^""]*)""", RegexOptions.IgnoreCase);
+        var algorithm = Regex.Match(headerValue, @"(?:^|[,\s])algorithm\s*=\s*""?([a-zA-Z0-9_\-]+)", RegexOptions.IgnoreCase);
+        var nonce = Regex.Match(headerValue, @"nonce=""([^""]*)""", RegexOptions.IgnoreCase);
+        var realmText = realm.Success ? realm.Groups[1].Value : "?";
+        var algorithmText = algorithm.Success ? algorithm.Groups[1].Value : "(missing)";
+        var nonceLength = nonce.Success ? nonce.Groups[1].Value.Length : 0;
+        return $"algorithm={algorithmText}, realm={realmText}, nonce-length={nonceLength}";
     }
 
     /// <summary>

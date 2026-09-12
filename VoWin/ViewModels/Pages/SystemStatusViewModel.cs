@@ -35,7 +35,10 @@ namespace VoWin.ViewModels.Pages
         private readonly IVoKernelService _kernelService;
         private readonly ICollectionView? _filteredLogsView;
         private readonly System.Windows.Threading.DispatcherTimer _heartbeatTimer;
+        private readonly SemaphoreSlim _simSwitchGate = new(1, 1);
         private int _refreshNotificationScheduled;
+        private int _simSwitchLoadVersion;
+        private bool _isLoadingSimSwitches;
 
         // UI Design Token Colors (Frozen for performance & thread safety)
         public static Brush TokenPrimary => ThemeBrushes.Accent;
@@ -55,6 +58,28 @@ namespace VoWin.ViewModels.Pages
 
         [ObservableProperty]
         private ModemSlot? _selectedSlot;
+
+        // These are deliberately SIM-scoped. A modem slot can be reused with a
+        // different card, but the desired radio/data/VoWiFi policy follows the
+        // ICCID and defaults to off for a previously unseen SIM.
+        [ObservableProperty]
+        private bool _voWifiSwitchEnabled;
+
+        [ObservableProperty]
+        private bool _flightModeSwitchEnabled;
+
+        [ObservableProperty]
+        private bool _cellularDataSwitchEnabled;
+
+        [ObservableProperty]
+        private bool _dataRoamingSwitchEnabled;
+
+        public bool HasCurrentSim => !string.IsNullOrWhiteSpace(SelectedSlot?.Sim?.Iccid);
+
+        partial void OnVoWifiSwitchEnabledChanged(bool value) => QueueApplySimSwitches();
+        partial void OnFlightModeSwitchEnabledChanged(bool value) => QueueApplySimSwitches();
+        partial void OnCellularDataSwitchEnabledChanged(bool value) => QueueApplySimSwitches();
+        partial void OnDataRoamingSwitchEnabledChanged(bool value) => QueueApplySimSwitches();
 
         [ObservableProperty]
         private string _statusMessage = "系统运行正常";
@@ -595,8 +620,22 @@ namespace VoWin.ViewModels.Pages
             _kernelService.Kernel.VoWifiStateChanged += (s, e) => NotifyAll();
             _kernelService.Kernel.SignalQualityChanged += (s, e) => NotifyAll();
             _kernelService.Kernel.NetworkRegistrationChanged += (s, e) => NotifyAll();
-            _kernelService.Kernel.SimStateChanged += (s, e) => NotifyAll();
+            _kernelService.Kernel.SimStateChanged += (s, e) =>
+            {
+                NotifyAll();
+                App.Current?.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (SelectedSlot != null &&
+                        (string.IsNullOrWhiteSpace(e.SlotId) || string.Equals(e.SlotId, SelectedSlot.Id, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        _ = LoadSimSwitchesAsync(SelectedSlot);
+                    }
+                }), System.Windows.Threading.DispatcherPriority.DataBind);
+            };
             _kernelService.Kernel.FlightModeChanged += (s, e) => NotifyAll();
+
+            if (SelectedSlot != null)
+                _ = LoadSimSwitchesAsync(SelectedSlot);
 
             // 1-second live heartbeat tick for real-time probe telemetry
             _heartbeatTimer = new System.Windows.Threading.DispatcherTimer
@@ -623,6 +662,105 @@ namespace VoWin.ViewModels.Pages
         partial void OnSelectedSlotChanged(ModemSlot? value)
         {
             NotifyAll();
+            OnPropertyChanged(nameof(HasCurrentSim));
+            if (value != null)
+                _ = LoadSimSwitchesAsync(value);
+        }
+
+        private async Task LoadSimSwitchesAsync(ModemSlot slot)
+        {
+            var version = Interlocked.Increment(ref _simSwitchLoadVersion);
+            try
+            {
+                var iccid = slot.Sim?.Iccid;
+                var saved = string.IsNullOrWhiteSpace(iccid)
+                    ? null
+                    : await _kernelService.Preferences.GetSimPreferenceAsync(iccid);
+                if (version != Volatile.Read(ref _simSwitchLoadVersion) || !ReferenceEquals(slot, SelectedSlot)) return;
+
+                _isLoadingSimSwitches = true;
+                // No saved ICCID means all functions start disabled. Existing
+                // saved values remain intact when a card is moved between slots.
+                VoWifiSwitchEnabled = saved?.DefaultVoWifi ?? false;
+                FlightModeSwitchEnabled = saved?.DefaultFlightMode ?? false;
+                CellularDataSwitchEnabled = saved?.DefaultCellularData ?? false;
+                DataRoamingSwitchEnabled = saved?.DefaultDataRoaming ?? false;
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = $"读取 SIM 开关失败: {ex.Message}";
+            }
+            finally
+            {
+                if (version == Volatile.Read(ref _simSwitchLoadVersion))
+                    _isLoadingSimSwitches = false;
+            }
+        }
+
+        private void QueueApplySimSwitches()
+        {
+            if (_isLoadingSimSwitches) return;
+            _ = PersistAndApplySimSwitchesAsync();
+        }
+
+        private async Task PersistAndApplySimSwitchesAsync()
+        {
+            var slot = SelectedSlot;
+            var iccid = slot?.Sim?.Iccid;
+            if (slot == null || string.IsNullOrWhiteSpace(iccid))
+            {
+                StatusMessage = "请先选择已识别 SIM 卡的通信设备。";
+                return;
+            }
+
+            await _simSwitchGate.WaitAsync();
+            try
+            {
+                // A toggle always writes the complete four-switch policy. Keep
+                // unrelated SIM metadata such as nickname and proxy untouched.
+                var existing = await _kernelService.Preferences.GetSimPreferenceAsync(iccid);
+                await _kernelService.SaveSimPreferencesAsync(
+                    iccid,
+                    FlightModeSwitchEnabled,
+                    VoWifiSwitchEnabled,
+                    CellularDataSwitchEnabled,
+                    DataRoamingSwitchEnabled,
+                    existing?.DedicatedProxyUrl,
+                    existing?.CardNickname);
+
+                if (!ReferenceEquals(slot, SelectedSlot)) return;
+
+                if (slot.IsFlightMode != FlightModeSwitchEnabled)
+                    await slot.SetFlightModeAsync(FlightModeSwitchEnabled);
+
+                if (!FlightModeSwitchEnabled)
+                {
+                    await slot.SetDataRoamingEnabledAsync(DataRoamingSwitchEnabled);
+                    await slot.SetCellularDataEnabledAsync(CellularDataSwitchEnabled);
+                    await slot.RefreshMetricsAsync();
+                }
+
+                if (VoWifiSwitchEnabled)
+                {
+                    if (slot.VoWifi.State == VoWifiState.Disconnected)
+                        await _kernelService.StartVoWifiAsync(slot.Id);
+                }
+                else if (slot.VoWifi.State != VoWifiState.Disconnected)
+                {
+                    await _kernelService.StopVoWifiAsync(slot.Id);
+                }
+
+                StatusMessage = "已保存并应用此 SIM 卡的开关。";
+                NotifyAll();
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = $"应用 SIM 开关失败: {ex.Message}";
+            }
+            finally
+            {
+                _simSwitchGate.Release();
+            }
         }
 
         partial void OnSelectedLogModuleChanged(string value)

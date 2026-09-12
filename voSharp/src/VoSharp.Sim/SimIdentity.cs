@@ -6,35 +6,37 @@ public record SimIdentity(
     string Mcc,
     string Mnc,
     string OperatorName,
-    string? PhoneNumber = null
+    string? PhoneNumber = null,
+    bool IsHomePlmnAuthoritative = false,
+    IReadOnlyList<string>? HomePlmns = null
 )
 {
     public static SimIdentity FromImsiAndIccid(
         string imsi,
         string iccid,
         string? opName = null,
-        string? phoneNumber = null)
+        string? phoneNumber = null,
+        int? mncLength = null,
+        IReadOnlyList<string>? homePlmns = null)
     {
         imsi = imsi.Trim();
         iccid = iccid.Trim();
         var mcc = imsi.Length >= 3 ? imsi[..3] : "";
-        var mnc = imsi.Length >= 5 ? imsi.Substring(3, Math.Min(2, imsi.Length - 3)) : "";
-        return new SimIdentity(imsi, iccid, mcc, mnc, opName ?? GuessOperator(mcc, mnc), phoneNumber);
-    }
-
-    private static string GuessOperator(string mcc, string mnc)
-    {
-        if (mcc == "460")
-        {
-            return mnc switch
-            {
-                "00" or "02" or "07" or "08" => "China Mobile",
-                "01" or "06" or "09" => "China Unicom",
-                "03" or "05" or "11" => "China Telecom",
-                "15" => "China Broadnet",
-                _ => "China Operator"
-            };
-        }
-        return $"{mcc}{mnc}";
+        var validatedMncLength = mncLength is 2 or 3 ? mncLength.Value : 2;
+        var mnc = imsi.Length >= 3 + validatedMncLength
+            ? imsi.Substring(3, validatedMncLength)
+            : "";
+        var operatorName = string.IsNullOrWhiteSpace(opName)
+            ? $"PLMN {mcc}-{mnc}"
+            : opName.Trim();
+        return new SimIdentity(
+            imsi,
+            iccid,
+            mcc,
+            mnc,
+            operatorName,
+            phoneNumber,
+            IsHomePlmnAuthoritative: mncLength is 2 or 3,
+            HomePlmns: homePlmns?.Distinct(StringComparer.Ordinal).ToArray());
     }
 }

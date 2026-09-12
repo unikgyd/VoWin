@@ -40,6 +40,10 @@ public class ImsCallManager : IDisposable
     private string? _currentCallId;
     private string? _currentFromTag;
     private string? _currentLocalIp;
+    // The IMS security agreement replaces 5060 with a negotiated UE port.  Keep
+    // dialog requests on that actual transport endpoint instead of advertising a
+    // stale pre-registration port in Via/Contact.
+    private int _currentSignalingPort = 5060;
     private string? _targetUri;
     private string? _dialogTargetUri;
     private string? _dialogTo;
@@ -50,6 +54,8 @@ public class ImsCallManager : IDisposable
     private string? _lastInviteBranch;
     private int _lastInviteCSeq;
     private string? _lastInviteVia;
+    private readonly object _prackGate = new();
+    private readonly HashSet<string> _reliableProvisionals = new(StringComparer.Ordinal);
 
     private SipMessage? _incomingInvite;
     private Func<SipMessage, Task>? _incomingReplySender;
@@ -78,6 +84,7 @@ public class ImsCallManager : IDisposable
 
         var cleanNumber = number.Trim();
         _cseq = 1;
+        lock (_prackGate) _reliableProvisionals.Clear();
         _currentCallId  = Guid.NewGuid().ToString("N") + "@" + voWifi.AssignedIp;
         _currentFromTag = Guid.NewGuid().ToString("N")[..8];
 
@@ -94,14 +101,18 @@ public class ImsCallManager : IDisposable
         voWifi.RegisterRtpSession(_rtp);
 
         var localIp = voWifi.AssignedIp;
+        var signalingEndpoint = voWifi.SipTransport?.LocalEndPoint
+            ?? new IPEndPoint(IPAddress.Parse(localIp), 5060);
+        var signalingHost = ImsRegisterBuilder.FormatHost(signalingEndpoint.Address.ToString());
 
         // ── Build SDP Offer ───────────────────────────────────────────────────
         var sessionID = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var family = SdpAddressFamily(localIp);
         var sdp = new StringBuilder();
         sdp.Append("v=0\r\n");
-        sdp.Append($"o=- {sessionID} {sessionID} IN IP4 {localIp}\r\n");
+        sdp.Append($"o=- {sessionID} {sessionID} IN {family} {localIp}\r\n");
         sdp.Append("s=VoCat\r\n");
-        sdp.Append($"c=IN IP4 {localIp}\r\n");
+        sdp.Append($"c=IN {family} {localIp}\r\n");
         sdp.Append("t=0 0\r\n");
         sdp.Append($"m=audio {_rtp.LocalPort} RTP/AVP 104 102 101\r\n");
         sdp.Append("a=rtpmap:104 AMR-WB/16000/1\r\n");
@@ -116,13 +127,17 @@ public class ImsCallManager : IDisposable
         var sdpStr = sdp.ToString();
 
         // ── Build SIP INVITE (matching voCore 3GPP TS 24.229) ──────────────────
-        var homeDomain = voWifi.EpdgInfo?.ImsDomain ?? "ims.mnc066.mcc515.3gppnetwork.org";
-        var targetUri = cleanNumber.StartsWith("sip:") || cleanNumber.StartsWith("tel:")
+        var epdgInfo = voWifi.EpdgInfo
+            ?? throw new InvalidOperationException("IMS network identity is unavailable for the active VoWiFi session.");
+        var homeDomain = epdgInfo.ImsDomain;
+        var targetUri = cleanNumber.StartsWith("sip:", StringComparison.OrdinalIgnoreCase) || cleanNumber.StartsWith("tel:", StringComparison.OrdinalIgnoreCase)
             ? cleanNumber
-            : "tel:" + cleanNumber;
+            : cleanNumber.StartsWith('+')
+                ? "tel:" + cleanNumber
+                : $"tel:{cleanNumber};phone-context={homeDomain}";
 
         // Use primary public identity from P-Associated-URI or fallback to Impu
-        string publicURI = voWifi.EpdgInfo?.Impu ?? $"sip:{cleanNumber}@{homeDomain}";
+        string publicURI = epdgInfo.Impu;
         if (!string.IsNullOrWhiteSpace(voWifi.ImsInfo?.PAssociatedUri))
         {
             var match = Regex.Match(voWifi.ImsInfo.PAssociatedUri, @"<([^>]+)>");
@@ -146,18 +161,26 @@ public class ImsCallManager : IDisposable
             if (semi >= 0) user = user[..semi];
         }
 
-        var instanceId = $"urn:gsma:imei:{voWifi.EpdgInfo?.Impi?.Split('@')[0] ?? "863212061673965"}";
-        if (voWifi.Modem != null)
-        {
-            try { instanceId = $"urn:gsma:imei:{voWifi.ImsInfo?.ContactUri ?? ""}"; } catch { }
-        }
+        // An MSISDN associated with the registered IMPU is the originating
+        // identity.  The SIP From URI stays in the home IMS domain while the
+        // preferred identity is the matching tel URI (the same generic rule
+        // used by VoCat); do not derive a telephone number from an IMSI.
+        var associatedNumber = ExtractNumberFromUri(voWifi.ImsInfo?.PAssociatedUri ?? publicURI);
+        var fromIdentity = associatedNumber.StartsWith('+')
+            ? $"sip:{associatedNumber}@{homeDomain}"
+            : publicURI;
+        var preferredIdentity = associatedNumber.StartsWith('+')
+            ? $"tel:{associatedNumber}"
+            : publicURI;
 
         var contactUser = !string.IsNullOrEmpty(voWifi.ImsInfo?.ContactUri)
             ? Regex.Match(voWifi.ImsInfo.ContactUri, @"<sip:([^@]+)@").Groups[1].Value
-            : (voWifi.EpdgInfo?.Impi?.Split('@')[0] ?? user);
+            : epdgInfo.Impi.Split('@')[0];
         if (string.IsNullOrEmpty(contactUser)) contactUser = user;
 
-        string contact = $"<sip:{contactUser}@{localIp}:5060;transport=udp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio";
+        var contactAddress = ExtractRegisteredContactAddress(voWifi.ImsInfo?.ContactUri)
+            ?? $"{signalingHost}:{signalingEndpoint.Port}";
+        string contact = $"<sip:{contactUser}@{contactAddress};transport=udp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio";
         if (!string.IsNullOrWhiteSpace(voWifi.ImsInfo?.ContactUri))
         {
             var instMatch = Regex.Match(voWifi.ImsInfo.ContactUri, @"(\+sip\.instance=""[^""]+"")");
@@ -165,7 +188,8 @@ public class ImsCallManager : IDisposable
                 contact += $";{instMatch.Groups[1].Value}";
         }
 
-        _currentLocalIp = localIp;
+        _currentLocalIp = signalingEndpoint.Address.ToString();
+        _currentSignalingPort = signalingEndpoint.Port;
         _targetUri = targetUri;
 
         var invite = new SipMessage
@@ -185,11 +209,13 @@ public class ImsCallManager : IDisposable
         var branch = "z9hG4bK" + Guid.NewGuid().ToString("N")[..12];
         _lastInviteBranch = branch;
         _lastInviteCSeq = _cseq;
-        _lastInviteVia = $"SIP/2.0/UDP {localIp}:5060;branch={branch};rport";
-        _dialogFrom = $"<{publicURI}>;tag={_currentFromTag}";
+        // An IPv6 address must be bracketed or "host:port" becomes ambiguous (RFC 3261 §25.1).
+        _lastInviteVia = $"SIP/2.0/UDP {signalingHost}:{signalingEndpoint.Port};branch={branch};rport";
+        _dialogFrom = $"<{fromIdentity}>;tag={_currentFromTag}";
         _dialogTo = $"<{targetUri}>";
         _targetUri = targetUri;
-        _currentLocalIp = localIp;
+        _currentLocalIp = signalingEndpoint.Address.ToString();
+        _currentSignalingPort = signalingEndpoint.Port;
 
         invite.SetHeader("Via",      _lastInviteVia);
         invite.SetHeader("Max-Forwards", "70");
@@ -198,17 +224,20 @@ public class ImsCallManager : IDisposable
         invite.SetHeader("Call-ID",  _currentCallId);
         invite.SetHeader("CSeq",     $"{_cseq++} INVITE");
         invite.SetHeader("Contact",  contact);
-        invite.SetHeader("P-Preferred-Identity", $"<{publicURI}>");
+        invite.SetHeader("P-Preferred-Identity", $"<{preferredIdentity}>");
         invite.SetHeader("P-Preferred-Service",  "urn:urn-7:3gpp-service.ims.icsi.mmtel");
         invite.SetHeader("Accept-Contact",      "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"");
-        invite.SetHeader("P-Access-Network-Info", "IEEE-802.11; i-wlan-node-id=505322000000");
-        invite.SetHeader("Allow",         "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE");
-        invite.SetHeader("Supported",     "100rel, timer");
+        invite.SetHeader("P-Access-Network-Info", ImsRegisterBuilder.BuildAccessNetworkInfo(epdgInfo.Impi));
+        invite.SetHeader("Allow",         "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, PRACK, UPDATE, INFO");
+        invite.SetHeader("Supported",     "100rel, timer, replaces");
+        invite.SetHeader("Session-Expires", "1800;refresher=uac");
+        invite.SetHeader("Min-SE",        "90");
+        invite.SetHeader("Accept",        "application/sdp");
         invite.SetHeader("Content-Type",   "application/sdp");
         invite.SetHeader("Content-Length", sdpStr.Length.ToString());
         invite.SetHeader("User-Agent",    "iPhone Pro/17");
 
-        Console.WriteLine($"[ImsCallManager] INVITE headers:\n{string.Join("\n", invite.Headers.Select(h => $"  {h.Key}: {string.Join(", ", h.Value)}"))}");
+        Console.WriteLine($"[ImsCallManager] INVITE prepared for {targetUri} via IMS signalling port {signalingEndpoint.Port}.");
 
         var wavPath = Path.Combine(
             Directory.GetCurrentDirectory(),
@@ -241,6 +270,8 @@ public class ImsCallManager : IDisposable
                     invite,
                     onProvisional: prov =>
                     {
+                        if (RequiresReliableProvisional(prov))
+                            _ = SendPrackAsync(sipTransport, prov, ct);
                         if (prov.StatusCode is 180 or 183)
                         {
                             var old = State;
@@ -306,8 +337,7 @@ public class ImsCallManager : IDisposable
                     NotifyCallEnded(ActiveCall, finalResp.ReasonPhrase);
                     EventBus?.Publish("call.rejected", "ImsCallManager",
                         new { Code = finalResp.StatusCode, Reason = finalResp.ReasonPhrase });
-                    throw new InvalidOperationException(
-                        $"Call rejected: {finalResp.StatusCode} {finalResp.ReasonPhrase}\nHeaders:\n{string.Join("\n", finalResp.Headers.Select(h => $"  {h.Key}: {string.Join(", ", h.Value)}"))}\nBody:\n{finalResp.Body}");
+                    throw new InvalidOperationException($"Call rejected: {finalResp.StatusCode} {finalResp.ReasonPhrase}");
                 }
             }
             catch (TimeoutException)
@@ -372,6 +402,9 @@ public class ImsCallManager : IDisposable
         _currentCallId = invite.GetHeader("Call-ID") ?? Guid.NewGuid().ToString("N");
         _currentFromTag = Guid.NewGuid().ToString("N")[..8];
         _remoteOfferSdp = invite.Body;
+        var incomingEndpoint = voWifi.SipTransport?.LocalEndPoint;
+        _currentLocalIp = incomingEndpoint?.Address.ToString() ?? voWifi.AssignedIp ?? "127.0.0.1";
+        _currentSignalingPort = incomingEndpoint?.Port ?? 5060;
 
         var fromHeader = invite.GetHeader("From") ?? "Unknown";
         var callerNumber = ExtractNumberFromUri(fromHeader);
@@ -403,7 +436,7 @@ public class ImsCallManager : IDisposable
         await replySender(resp100).ConfigureAwait(false);
 
         // 2. Send 180 Ringing
-        var localIp = voWifi.AssignedIp ?? "127.0.0.1";
+        var localIp = _currentLocalIp;
         var resp180 = new SipMessage
         {
             IsRequest = false,
@@ -416,7 +449,7 @@ public class ImsCallManager : IDisposable
         resp180.SetHeader("To", $"{invite.GetHeader("To")};tag={_currentFromTag}");
         resp180.SetHeader("Call-ID", _currentCallId);
         resp180.SetHeader("CSeq", invite.GetHeader("CSeq") ?? "1 INVITE");
-        resp180.SetHeader("Contact", $"<sip:{localIp}:5060;transport=udp>;audio");
+        resp180.SetHeader("Contact", $"<sip:{ImsRegisterBuilder.FormatHost(localIp)}:{_currentSignalingPort};transport=udp>;audio");
         resp180.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE");
         resp180.SetHeader("Content-Length", "0");
         await replySender(resp180).ConfigureAwait(false);
@@ -462,13 +495,14 @@ public class ImsCallManager : IDisposable
         _currentVoWifi = voWifi;
         voWifi.RegisterRtpSession(_rtp);
 
-        var localIp = voWifi.AssignedIp ?? "127.0.0.1";
+        var localIp = _currentLocalIp ?? voWifi.AssignedIp ?? "127.0.0.1";
         var sessionID = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var family = SdpAddressFamily(localIp);
         var sdp = new StringBuilder();
         sdp.Append("v=0\r\n");
-        sdp.Append($"o=- {sessionID} {sessionID} IN IP4 {localIp}\r\n");
+        sdp.Append($"o=- {sessionID} {sessionID} IN {family} {localIp}\r\n");
         sdp.Append("s=VoCat\r\n");
-        sdp.Append($"c=IN IP4 {localIp}\r\n");
+        sdp.Append($"c=IN {family} {localIp}\r\n");
         sdp.Append("t=0 0\r\n");
         sdp.Append($"m=audio {_rtp.LocalPort} RTP/AVP 104 102 101\r\n");
         sdp.Append("a=rtpmap:104 AMR-WB/16000/1\r\n");
@@ -495,7 +529,7 @@ public class ImsCallManager : IDisposable
         resp200.SetHeader("To", $"{_incomingInvite.GetHeader("To")};tag={_currentFromTag}");
         resp200.SetHeader("Call-ID", _currentCallId ?? string.Empty);
         resp200.SetHeader("CSeq", _incomingInvite.GetHeader("CSeq") ?? "1 INVITE");
-        resp200.SetHeader("Contact", $"<sip:{localIp}:5060;transport=udp>;audio");
+        resp200.SetHeader("Contact", $"<sip:{ImsRegisterBuilder.FormatHost(localIp)}:{_currentSignalingPort};transport=udp>;audio");
         resp200.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE");
         resp200.SetHeader("Content-Type", "application/sdp");
         resp200.SetHeader("Content-Length", sdpStr.Length.ToString());
@@ -818,6 +852,81 @@ public class ImsCallManager : IDisposable
         return uriOrHeader;
     }
 
+    private static string? ExtractRegisteredContactAddress(string? contact)
+    {
+        if (string.IsNullOrWhiteSpace(contact)) return null;
+
+        // Contact is a SIP URI, not merely a host:port.  Preserve the address
+        // that the registrar accepted: under ipsec-3gpp it is the protected
+        // server port, distinct from the client source port in Via.
+        var match = Regex.Match(contact,
+            @"<\s*sip:(?:[^@;>]+@)?(?<host>\[[^\]]+\]|[^;>:]+):(?<port>\d{1,5})(?:[;>])",
+            RegexOptions.IgnoreCase);
+        if (!match.Success || !int.TryParse(match.Groups["port"].Value, out var port) || port is < 1 or > 65535)
+            return null;
+        return $"{match.Groups["host"].Value}:{port}";
+    }
+
+    private static bool RequiresReliableProvisional(SipMessage response) =>
+        response.StatusCode is > 100 and < 200 &&
+        !string.IsNullOrWhiteSpace(response.GetHeader("RSeq")) &&
+        (response.GetHeader("Require") ?? string.Empty)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Any(value => value.Equals("100rel", StringComparison.OrdinalIgnoreCase));
+
+    private async Task SendPrackAsync(SipTransport transport, SipMessage provisional, CancellationToken ct)
+    {
+        var rseq = provisional.GetHeader("RSeq")?.Trim();
+        var inviteCseq = provisional.GetHeader("CSeq")?.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        var callId = provisional.GetHeader("Call-ID")?.Trim();
+        if (string.IsNullOrWhiteSpace(rseq) || string.IsNullOrWhiteSpace(inviteCseq) || string.IsNullOrWhiteSpace(callId))
+            return;
+
+        var key = $"{callId}|{rseq}|{inviteCseq}";
+        lock (_prackGate)
+        {
+            if (!_reliableProvisionals.Add(key)) return;
+        }
+
+        var to = provisional.GetHeader("To");
+        if (!string.IsNullOrWhiteSpace(to)) _dialogTo = to;
+        if (provisional.Headers.TryGetValue("Record-Route", out var recordRoutes) && recordRoutes.Count > 0)
+            _dialogRoutes = ParseAndReverseRecordRoute(recordRoutes);
+
+        var localIp = _currentLocalIp ?? "127.0.0.1";
+        var branch = "z9hG4bK" + Guid.NewGuid().ToString("N")[..12];
+        var prack = new SipMessage
+        {
+            IsRequest = true,
+            Method = "PRACK",
+            RequestUri = _dialogTargetUri ?? _targetUri ?? string.Empty,
+            SipVersion = "SIP/2.0"
+        };
+        prack.SetHeader("Via", $"SIP/2.0/UDP {ImsRegisterBuilder.FormatHost(localIp)}:{_currentSignalingPort};branch={branch};rport");
+        prack.SetHeader("Max-Forwards", "70");
+        prack.SetHeader("From", _dialogFrom ?? string.Empty);
+        prack.SetHeader("To", _dialogTo ?? string.Empty);
+        prack.SetHeader("Call-ID", callId);
+        prack.SetHeader("CSeq", $"{_cseq++} PRACK");
+        prack.SetHeader("RAck", $"{rseq} {inviteCseq} INVITE");
+        if (_dialogRoutes is { Count: > 0 }) prack.SetHeader("Route", string.Join(", ", _dialogRoutes));
+        if (_currentVoWifi?.EpdgInfo is { } epdg)
+            prack.SetHeader("P-Access-Network-Info", ImsRegisterBuilder.BuildAccessNetworkInfo(epdg.Impi));
+        prack.SetHeader("User-Agent", "iPhone Pro/17");
+        prack.SetHeader("Content-Length", "0");
+
+        try
+        {
+            var response = await transport.SendAndReceiveFinalAsync(prack, timeoutMs: 10000, ct: ct).ConfigureAwait(false);
+            if (response.StatusCode is < 200 or >= 300)
+                Console.WriteLine($"[ImsCallManager] PRACK rejected: {response.StatusCode} {response.ReasonPhrase}");
+        }
+        catch (Exception ex) when (ex is TimeoutException or InvalidOperationException)
+        {
+            Console.WriteLine($"[ImsCallManager] PRACK failed: {ex.Message}");
+        }
+    }
+
     public Task<bool> SendDtmfAsync(char digit)
     {
         if (State != CallState.Active)
@@ -879,7 +988,7 @@ public class ImsCallManager : IDisposable
         }
         ack.SetHeader("Content-Length", "0");
 
-        Console.WriteLine($"[ImsCallManager] ACK sent -> {ack.RequestUri} (Route: {ack.GetHeader("Route") ?? "None"})");
+        Console.WriteLine("[ImsCallManager] ACK sent for established IMS call.");
         await transport.SendAsync(ack, ct).ConfigureAwait(false);
     }
 
@@ -920,9 +1029,9 @@ public class ImsCallManager : IDisposable
         var branch = "z9hG4bK" + Guid.NewGuid().ToString("N")[..12];
         var localIp = _currentLocalIp ?? "127.0.0.1";
 
-        bye.SetHeader("Via",            $"SIP/2.0/UDP {localIp}:5060;branch={branch};rport");
+        bye.SetHeader("Via",            $"SIP/2.0/UDP {ImsRegisterBuilder.FormatHost(localIp)}:{_currentSignalingPort};branch={branch};rport");
         bye.SetHeader("Max-Forwards",   "70");
-        bye.SetHeader("From",           _dialogFrom ?? $"<sip:ue@{localIp}>;tag={_currentFromTag}");
+        bye.SetHeader("From",           _dialogFrom ?? $"<sip:ue@{ImsRegisterBuilder.FormatHost(localIp)}>;tag={_currentFromTag}");
         bye.SetHeader("To",             _dialogTo ?? $"<{ActiveCall?.TargetNumber}>");
         bye.SetHeader("Call-ID",        _currentCallId ?? string.Empty);
         bye.SetHeader("CSeq",           $"{_cseq++} BYE");
@@ -946,11 +1055,11 @@ public class ImsCallManager : IDisposable
         };
 
         var localIp = _currentLocalIp ?? "127.0.0.1";
-        var viaHeader = _lastInviteVia ?? $"SIP/2.0/UDP {localIp}:5060;branch={_lastInviteBranch ?? ("z9hG4bK" + Guid.NewGuid().ToString("N")[..12])}";
+        var viaHeader = _lastInviteVia ?? $"SIP/2.0/UDP {ImsRegisterBuilder.FormatHost(localIp)}:{_currentSignalingPort};branch={_lastInviteBranch ?? ("z9hG4bK" + Guid.NewGuid().ToString("N")[..12])}";
 
         cancel.SetHeader("Via",            viaHeader);
         cancel.SetHeader("Max-Forwards",   "70");
-        cancel.SetHeader("From",           _dialogFrom ?? $"<sip:ue@{localIp}>;tag={_currentFromTag}");
+        cancel.SetHeader("From",           _dialogFrom ?? $"<sip:ue@{ImsRegisterBuilder.FormatHost(localIp)}>;tag={_currentFromTag}");
         cancel.SetHeader("To",             _dialogTo ?? $"<{_targetUri ?? ActiveCall?.TargetNumber}>");
         cancel.SetHeader("Call-ID",        _currentCallId ?? string.Empty);
         cancel.SetHeader("CSeq",           $"{_lastInviteCSeq} CANCEL");
@@ -961,11 +1070,22 @@ public class ImsCallManager : IDisposable
     /// <summary>
     /// Parses the remote SDP Answer and configures the RTP session endpoint.
     /// </summary>
+    /// <summary>
+    /// SDP announces the connection address family explicitly (RFC 4566 §8.2.6). A dual-stack
+    /// ePDG may assign IPv6, and "c=IN IP4 2001:db8::1" makes the peer reject the offer or send
+    /// its RTP to a host it cannot resolve. The address itself stays unbracketed in SDP.
+    /// </summary>
+    private static string SdpAddressFamily(string? address) =>
+        IPAddress.TryParse(address, out var parsed) &&
+        parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+            ? "IP6"
+            : "IP4";
+
     private void SetRtpFromSdpAnswer(string sdpBody)
     {
         if (_rtp == null) return;
 
-        var connectionMatch = Regex.Match(sdpBody, @"c=IN IP4 (\S+)");
+        var connectionMatch = Regex.Match(sdpBody, @"c=IN IP[46] (\S+)");
         var mediaMatch      = Regex.Match(sdpBody, @"m=audio (\d+)");
         var ptMatch         = Regex.Match(sdpBody, @"a=rtpmap:(\d+) ([A-Za-z0-9\-]+)/");
 
@@ -986,8 +1106,9 @@ public class ImsCallManager : IDisposable
                     var tr = _currentVoWifi.Transport;
                     _rtp.CustomSender = async rtpBytes =>
                     {
-                        var inner = VoWifi.IpPacketUtils.BuildIpv4UdpPacket(localIp, remoteIp, (ushort)_rtp.LocalPort, (ushort)remotePort, rtpBytes);
-                        var sealedEsp = esp.Seal(inner, nextHeader: 4);
+                        var inner = VoWifi.IpPacketUtils.BuildUdpPacket(localIp, remoteIp, (ushort)_rtp.LocalPort, (ushort)remotePort, rtpBytes);
+                        var nextHeader = localIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? (byte)41 : (byte)4;
+                        var sealedEsp = esp.Seal(inner, nextHeader);
                         await tr.SendEspAsync(sealedEsp, CancellationToken.None).ConfigureAwait(false);
                     };
                 }

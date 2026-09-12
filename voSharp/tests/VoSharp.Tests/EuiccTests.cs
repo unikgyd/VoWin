@@ -106,7 +106,7 @@ public class EuiccTests
         var child1 = new Tlv(0xE3);
         child1.Children.Add(new Tlv(0x5A, Tlv.IccidToBcd("89860412345678901234")));
         child1.Children.Add(new Tlv(0x9F70, new byte[] { 0x01 })); // Enabled
-        child1.Children.Add(new Tlv(0x90, "China Mobile eSIM"));
+        child1.Children.Add(new Tlv(0x90, "Test eSIM"));
         root.Children.Add(child1);
 
         var encodedRoot = root.Encode();
@@ -124,7 +124,7 @@ public class EuiccTests
 
         var nickTlv = parsedE3.FindFirstChild(0x90);
         Assert.NotNull(nickTlv);
-        Assert.Equal("China Mobile eSIM", nickTlv.TextValue());
+        Assert.Equal("Test eSIM", nickTlv.TextValue());
     }
 
     [Fact]
@@ -141,7 +141,7 @@ public class EuiccTests
         p1.Children.Add(new Tlv(0x4F, HexUtils.FromHexString("A0000005591010FFFFFFFF8900001100")));
         p1.Children.Add(new Tlv(0x9F70, new byte[] { 0x01 })); // Enabled
         p1.Children.Add(new Tlv(0x90, "Personal eSIM"));
-        p1.Children.Add(new Tlv(0x91, "China Telecom"));
+        p1.Children.Add(new Tlv(0x91, "Test Provider A"));
         p1.Children.Add(new Tlv(0x92, "5G Ultra"));
         respTlv.Children.Add(p1);
 
@@ -151,7 +151,7 @@ public class EuiccTests
         p2.Children.Add(new Tlv(0x4F, HexUtils.FromHexString("A0000005591010FFFFFFFF8900002200")));
         p2.Children.Add(new Tlv(0x9F70, new byte[] { 0x00 })); // Disabled
         p2.Children.Add(new Tlv(0x90, "Travel Roaming"));
-        p2.Children.Add(new Tlv(0x91, "Vodafone UK"));
+        p2.Children.Add(new Tlv(0x91, "Test Provider B"));
         respTlv.Children.Add(p2);
 
         var payload = respTlv.Encode();
@@ -172,13 +172,13 @@ public class EuiccTests
         Assert.Equal("A0000005591010FFFFFFFF8900001100", profiles[0].ISDPAID);
         Assert.Equal(ProfileState.Enabled, profiles[0].State);
         Assert.Equal("Personal eSIM", profiles[0].Nickname);
-        Assert.Equal("China Telecom", profiles[0].ServiceProviderName);
+        Assert.Equal("Test Provider A", profiles[0].ServiceProviderName);
 
         // Check Profile 2
         Assert.Equal("89860223456789012345", profiles[1].ICCID);
         Assert.Equal(ProfileState.Disabled, profiles[1].State);
         Assert.Equal("Travel Roaming", profiles[1].Nickname);
-        Assert.Equal("Vodafone UK", profiles[1].ServiceProviderName);
+        Assert.Equal("Test Provider B", profiles[1].ServiceProviderName);
     }
 
     [Fact]

@@ -77,6 +77,12 @@ public class ImsSecurityRuntimeTests
             if (count == 1)
             {
                 Assert.NotNull(request.GetHeader("Security-Client"));
+                Assert.Equal("sec-agree", request.GetHeader("Require"));
+                Assert.Equal("sec-agree", request.GetHeader("Proxy-Require"));
+                var identityAuthorization = request.GetHeader("Authorization");
+                Assert.NotNull(identityAuthorization);
+                Assert.Contains("algorithm=AKAv1-MD5", identityAuthorization, StringComparison.Ordinal);
+                Assert.Contains("integrity-protected=no", identityAuthorization, StringComparison.Ordinal);
                 response.SetHeader("WWW-Authenticate", $"Digest realm=\"example.test\", nonce=\"{Convert.ToBase64String(new byte[32])}\", algorithm=AKAv1-MD5, qop=\"auth\"");
                 response.SetHeader("Security-Server", securityHeader);
             }

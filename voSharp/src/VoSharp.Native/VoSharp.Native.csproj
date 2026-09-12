@@ -4,26 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>VoSharp.Native</RootNamespace>
   </PropertyGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\VoSharp.Common\VoSharp.Common.csproj" />
-  </ItemGroup>
-
-  <!-- Copy native DLLs to output directory -->
-  <ItemGroup>
-    <Content Include="$(MSBuildThisFileDirectory)..\..\native\amd64\*.*"
-             Exclude="$(MSBuildThisFileDirectory)..\..\native\amd64\opencore-amr.dll;$(MSBuildThisFileDirectory)..\..\native\amd64\VoSharp.EuiccLpaWorker.*"
-             Condition="Exists('$(MSBuildThisFileDirectory)..\..\native\amd64')"
-             CopyToOutputDirectory="PreserveNewest"
-             Link="native\%(Filename)%(Extension)" />
-    <Content Include="$(MSBuildThisFileDirectory)..\..\native\amd64\*.*"
-             Exclude="$(MSBuildThisFileDirectory)..\..\native\amd64\opencore-amr.dll;$(MSBuildThisFileDirectory)..\..\native\amd64\VoSharp.EuiccLpaWorker.*"
-             Condition="Exists('$(MSBuildThisFileDirectory)..\..\native\amd64')"
-             CopyToOutputDirectory="PreserveNewest"
-             Link="native\amd64\%(Filename)%(Extension)" />
-  </ItemGroup>
 
 </Project>

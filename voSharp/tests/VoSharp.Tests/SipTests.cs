@@ -112,7 +112,7 @@ public class SipTests
 
         Assert.Equal("REGISTER", initial.Method);
         Assert.Contains("+sip.instance=\"<urn:gsma:imei:86012345-678901-2>\"", initial.GetHeader("Contact"));
-        Assert.Contains("Digest username=", initial.GetHeader("Authorization"));
+        Assert.Null(initial.GetHeader("Authorization"));
 
         // Build authenticated with mock 401 challenge and RES
         var challenge = new Crypto.DigestChallenge(
@@ -131,5 +131,21 @@ public class SipTests
         Assert.Contains("algorithm=AKAv1-MD5", authHeader);
         Assert.Contains("response=", authHeader);
         Assert.Contains("cnonce=", authHeader);
+    }
+
+    [Fact]
+    public void ImsRegisterBuilder_BracketsIpv6InViaAndContact()
+    {
+        var profile = new ImsProfile(
+            PrivateIdentity: "234330000000000@ims.mnc033.mcc234.3gppnetwork.org",
+            PublicIdentity: "sip:234330000000000@ims.mnc033.mcc234.3gppnetwork.org",
+            HomeDomain: "ims.mnc033.mcc234.3gppnetwork.org",
+            Imei: "352127213600296",
+            LocalIp: "2001:db8::1234");
+
+        var register = ImsRegisterBuilder.BuildInitialRegister(profile, "ipv6-call", 1);
+
+        Assert.Contains("[2001:db8::1234]:5060", register.GetHeader("Via"));
+        Assert.Contains("@[2001:db8::1234]:5060", register.GetHeader("Contact"));
     }
 }

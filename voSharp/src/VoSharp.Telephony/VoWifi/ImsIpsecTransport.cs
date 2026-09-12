@@ -41,6 +41,10 @@ public sealed class ImsIpsecTransport : IDisposable
             ClearSas();
             try
             {
+                // Security-Client advertises the SPIs of the two SAs terminating at the UE.
+                // Security-Server contains the distinct SPIs terminating at the P-CSCF and those
+                // are outbound-only here. Accepting peer-owned SPIs inbound hides direction bugs
+                // and weakens SA validation.
                 _inbound[Proposal.SpiClient] = new EspSa(Proposal.SpiClient, auth, enc, agreement.Selected);
                 _inbound[Proposal.SpiServer] = new EspSa(Proposal.SpiServer, auth, enc, agreement.Selected);
                 _clientOutbound = new EspSa(agreement.PcscfServerSpi, auth, enc, agreement.Selected);
@@ -53,7 +57,7 @@ public sealed class ImsIpsecTransport : IDisposable
 
     public byte[] Protect(SipDatagram datagram)
     {
-        var plain = IpPacketUtils.BuildIpv4UdpPacket(datagram.LocalEndPoint.Address, datagram.RemoteEndPoint.Address,
+        var plain = IpPacketUtils.BuildUdpPacket(datagram.LocalEndPoint.Address, datagram.RemoteEndPoint.Address,
             (ushort)datagram.LocalEndPoint.Port, (ushort)datagram.RemoteEndPoint.Port, datagram.Payload);
         lock (_gate)
         {
@@ -63,28 +67,40 @@ public sealed class ImsIpsecTransport : IDisposable
             var sa = datagram.LocalEndPoint.Port == Proposal.PortClient ? _clientOutbound :
                 datagram.LocalEndPoint.Port == Proposal.PortServer ? _serverOutbound : null;
             if (sa == null) throw new InvalidOperationException("No IMS SA for the local SIP port.");
-            return IpPacketUtils.ReplaceIpv4Payload(plain, 50, sa.Seal(plain.AsSpan(20).ToArray()));
+            var headerLength = _local.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? 20 : 40;
+            var protectedPayload = sa.Seal(plain.AsSpan(headerLength).ToArray());
+            return _local.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                ? IpPacketUtils.ReplaceIpv4Payload(plain, 50, protectedPayload)
+                : IpPacketUtils.ReplaceIpv6Payload(plain, 50, protectedPayload);
         }
     }
 
     public byte[] Unprotect(byte[] inner)
     {
-        var (ihl, total, protocol) = IpPacketUtils.ReadIpv4Header(inner);
+        var isIpv6 = inner.Length > 0 && inner[0] >> 4 == 6;
+        var (ihl, total, protocol) = isIpv6
+            ? IpPacketUtils.ReadIpv6Header(inner)
+            : IpPacketUtils.ReadIpv4Header(inner);
         lock (_gate)
         {
             if (protocol != 50)
             {
-                if (Agreement != null && protocol == 17 && AcceptsPort(IpPacketUtils.ParseIpv4UdpPacket(inner).LocalEndPoint.Port))
+                if (Agreement != null && protocol == 17 && AcceptsPort(IpPacketUtils.ParseUdpPacket(inner).LocalEndPoint.Port))
                     throw new FormatException("Unprotected packet on an active IMS IPsec port.");
                 return inner; // RTP remains outside the IMS signalling SA.
             }
-            if (total - ihl < 8 || !new IPAddress(inner.AsSpan(12, 4)).Equals(_remote) ||
-                !new IPAddress(inner.AsSpan(16, 4)).Equals(_local)) throw new FormatException("Invalid IMS ESP endpoint or length.");
+            var source = isIpv6 ? new IPAddress(inner.AsSpan(8, 16)) : new IPAddress(inner.AsSpan(12, 4));
+            var destination = isIpv6 ? new IPAddress(inner.AsSpan(24, 16)) : new IPAddress(inner.AsSpan(16, 4));
+            if (total - ihl < 8 || !source.Equals(_remote) || !destination.Equals(_local))
+                throw new FormatException("Invalid IMS ESP endpoint or length.");
             var esp = inner.AsSpan(ihl, total - ihl).ToArray();
             uint spi = BinaryPrimitives.ReadUInt32BigEndian(esp);
             if (!_inbound.TryGetValue(spi, out var sa)) throw new FormatException($"Unknown IMS inbound SPI {spi:x8}.");
-            var result = IpPacketUtils.ReplaceIpv4Payload(inner, 17, sa.Open(esp));
-            var packet = IpPacketUtils.ParseIpv4UdpPacket(result);
+            var openedPayload = sa.Open(esp);
+            var result = isIpv6
+                ? IpPacketUtils.ReplaceIpv6Payload(inner, 17, openedPayload)
+                : IpPacketUtils.ReplaceIpv4Payload(inner, 17, openedPayload);
+            var packet = IpPacketUtils.ParseUdpPacket(result);
             int expectedPort = spi == Proposal.SpiClient ? Proposal.PortClient : Proposal.PortServer;
             if (packet.LocalEndPoint.Port != expectedPort) throw new FormatException("IMS ESP SPI/port mismatch.");
             return result;

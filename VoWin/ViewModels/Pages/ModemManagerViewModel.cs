@@ -196,16 +196,16 @@ namespace VoWin.ViewModels.Pages
         }
 
         [ObservableProperty]
-        private bool _moduleVoWifi = true;
+        private bool _moduleVoWifi;
 
         [ObservableProperty]
         private string _moduleName = string.Empty;
 
         [ObservableProperty]
-        private bool _moduleCellularData = true;
+        private bool _moduleCellularData;
 
         [ObservableProperty]
-        private bool _moduleDataRoaming = true;
+        private bool _moduleDataRoaming;
 
         [ObservableProperty]
         private string _moduleProxyUrl = string.Empty;
@@ -218,13 +218,13 @@ namespace VoWin.ViewModels.Pages
         private bool _simFlightMode;
 
         [ObservableProperty]
-        private bool _simVoWifi = true;
+        private bool _simVoWifi;
 
         [ObservableProperty]
-        private bool _simCellularData = true;
+        private bool _simCellularData;
 
         [ObservableProperty]
-        private bool _simDataRoaming = true;
+        private bool _simDataRoaming;
 
         [ObservableProperty]
         private string _simProxyUrl = string.Empty;
@@ -381,7 +381,11 @@ namespace VoWin.ViewModels.Pages
             StatusMessage = $"正在启动 [{SelectedSlot.Name}] 的 VoWiFi 隧道...";
             try
             {
-                bool ok = await SelectedSlot.StartVoWifiAsync();
+                // Start through the application service so the effective per-SIM,
+                // per-slot or MCC country route is applied to the kernel first.
+                // Calling ModemSlot directly bypasses country routing and silently
+                // leaves the IKE/ESP session on direct UDP.
+                bool ok = await _kernelService.StartVoWifiAsync(SelectedSlot.Id);
                 StatusMessage = ok ? "VoWiFi 隧道建立成功！" : "VoWiFi 隧道建立失败。";
                 OnPropertyChanged(nameof(SelectedSlot));
             }
@@ -403,7 +407,7 @@ namespace VoWin.ViewModels.Pages
             StatusMessage = $"正在断开 [{SelectedSlot.Name}] 的 VoWiFi 隧道...";
             try
             {
-                await SelectedSlot.StopVoWifiAsync();
+                await _kernelService.StopVoWifiAsync(SelectedSlot.Id);
                 StatusMessage = "VoWiFi 隧道已断开。";
                 OnPropertyChanged(nameof(SelectedSlot));
             }
@@ -425,9 +429,9 @@ namespace VoWin.ViewModels.Pages
             StatusMessage = $"正在重连 [{SelectedSlot.Name}] 的 VoWiFi 隧道...";
             try
             {
-                await SelectedSlot.StopVoWifiAsync();
+                await _kernelService.StopVoWifiAsync(SelectedSlot.Id);
                 await Task.Delay(500);
-                bool ok = await SelectedSlot.StartVoWifiAsync();
+                bool ok = await _kernelService.StartVoWifiAsync(SelectedSlot.Id);
                 StatusMessage = ok ? "VoWiFi 隧道重连成功！" : "VoWiFi 隧道重连失败。";
                 OnPropertyChanged(nameof(SelectedSlot));
             }
@@ -477,9 +481,9 @@ namespace VoWin.ViewModels.Pages
                 {
                     ModuleName = slot.Name;
                     ModuleFlightMode = slot.IsFlightMode;
-                    ModuleVoWifi = true;
-                    ModuleCellularData = true;
-                    ModuleDataRoaming = true;
+                    ModuleVoWifi = false;
+                    ModuleCellularData = false;
+                    ModuleDataRoaming = false;
                     ModuleProxyUrl = slot.ProxyUrl ?? string.Empty;
                 }
 
@@ -500,10 +504,10 @@ namespace VoWin.ViewModels.Pages
                     else
                     {
                         SimCardNickname = string.Empty;
-                        SimFlightMode = ModuleFlightMode;
-                        SimVoWifi = ModuleVoWifi;
-                        SimCellularData = ModuleCellularData;
-                        SimDataRoaming = ModuleDataRoaming;
+                        SimFlightMode = false;
+                        SimVoWifi = false;
+                        SimCellularData = false;
+                        SimDataRoaming = false;
                         SimProxyUrl = string.Empty;
                         slot.CardNickname = null;
                     }
@@ -511,10 +515,10 @@ namespace VoWin.ViewModels.Pages
                 else
                 {
                     SimCardNickname = string.Empty;
-                    SimFlightMode = ModuleFlightMode;
-                    SimVoWifi = ModuleVoWifi;
-                    SimCellularData = ModuleCellularData;
-                    SimDataRoaming = ModuleDataRoaming;
+                    SimFlightMode = false;
+                    SimVoWifi = false;
+                    SimCellularData = false;
+                    SimDataRoaming = false;
                     SimProxyUrl = string.Empty;
                     slot.CardNickname = null;
                 }

@@ -902,7 +902,7 @@ public class VoKernel : IVoKernel
         ModemSlot? slot = (!string.IsNullOrEmpty(slotId) && Pool.Slots.TryGetValue(slotId, out var s)) ? s : Pool.ActiveSlot;
         if (slot != null)
         {
-            await slot.RefreshMetricsAsync(ct).ConfigureAwait(false);
+            await slot.RefreshSimAsync(ct).ConfigureAwait(false);
             return slot.Sim;
         }
         if (Modem != null && Modem.IsOpen)
@@ -1056,7 +1056,9 @@ public class VoKernel : IVoKernel
                     return new KernelCommandResult(true, "No physical modem attached (simulated)", new SignalQuality(25, -63, 5, "LTE (Simulated)"));
 
                 case "sim":
-                    return new KernelCommandResult(true, "SIM identity retrieved", CurrentSim ?? new SimIdentity("460001234567890", "89860012345678901234", "460", "00", "China Mobile"));
+                    return CurrentSim != null
+                        ? new KernelCommandResult(true, "SIM identity retrieved", CurrentSim)
+                        : new KernelCommandResult(false, "No physical SIM identity is available.");
 
                 case "answer":
                     string? ansSlotId = null;
@@ -1348,24 +1350,15 @@ public class VoKernel : IVoKernel
                     }
                     return new KernelCommandResult(false, "Usage: sms <send|inbox|outbox|status|list|read|delete>");
 
-                case "charon":
-                    if (parts.Length > 1 && parts[1].Equals("status", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var info = VoWifi.GetCharonDiagnosticInfo();
-                        if (info != null)
-                        {
-                            return new KernelCommandResult(true, "charon-svc status retrieved.", info);
-                        }
-                        return new KernelCommandResult(true, "charon-svc is not currently running via VoWiFi manager.");
-                    }
-                    return new KernelCommandResult(false, "Usage: charon status");
-
                 case "vowifi":
                     if (parts.Length < 2 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase) || parts[1].Equals("diag", StringComparison.OrdinalIgnoreCase) || parts[1].Equals("state", StringComparison.OrdinalIgnoreCase))
                     {
                         var diag = VoWifi.GetDiagnosticInfo();
+                        var tunnelIp = !string.IsNullOrWhiteSpace(diag.Tunnel?.AssignedIPv4)
+                            ? diag.Tunnel.AssignedIPv4
+                            : diag.Tunnel?.AssignedIPv6;
                         var summaryMsg = diag.State == VoWifiState.ImsRegistered
-                            ? $"VoWiFi Online | Carrier: {diag.MatchedCarrier} | Tunnel IP: {diag.Tunnel?.AssignedIPv4} | P-CSCF: {diag.Tunnel?.PcscfIp} | IMS: {diag.Ims?.RegistrationState} | Proxy: {VoWifi.ProxyUrl ?? "direct"}"
+                            ? $"VoWiFi Online | Carrier: {diag.MatchedCarrier} | Tunnel IP: {tunnelIp} | P-CSCF: {diag.Tunnel?.PcscfIp} | IMS: {diag.Ims?.RegistrationState} | Proxy: {VoWifi.ProxyUrl ?? "direct"}"
                             : $"VoWiFi State: {diag.State}{(diag.LastError != null ? $" (Error: {diag.LastError})" : "")} | Proxy: {VoWifi.ProxyUrl ?? "direct"}";
                         return new KernelCommandResult(true, summaryMsg, diag);
                     }
@@ -1376,16 +1369,11 @@ public class VoKernel : IVoKernel
                         string? proxyArg = null;
                         string? customEpdg = null;
                         var suite = IkeProposalSuite.Auto;
-                        var useNative = false;
 
                         for (int i = 2; i < parts.Length; i++)
                         {
                             var arg = parts[i];
-                            if (arg.Equals("--native", StringComparison.OrdinalIgnoreCase))
-                            {
-                                useNative = true;
-                            }
-                            else if (arg.Equals("--slot", StringComparison.OrdinalIgnoreCase) && i + 1 < parts.Length)
+                            if (arg.Equals("--slot", StringComparison.OrdinalIgnoreCase) && i + 1 < parts.Length)
                             {
                                 slotId = parts[++i];
                             }
@@ -1423,11 +1411,12 @@ public class VoKernel : IVoKernel
                             voWifiToUse.ProxyUrl = proxyArg.Equals("direct", StringComparison.OrdinalIgnoreCase) ? null : proxyArg;
                         }
 
-                        bool started = useNative
-                            ? await voWifiToUse.StartVoWifiNativeAsync(simToUse, customEpdg, suite, ct).ConfigureAwait(false)
-                            : await voWifiToUse.StartVoWifiAsync(simToUse, customEpdg, suite, proxyUrl: voWifiToUse.ProxyUrl, ct: ct).ConfigureAwait(false);
+                        bool started = await voWifiToUse.StartVoWifiAsync(simToUse, customEpdg, suite, proxyUrl: voWifiToUse.ProxyUrl, ct: ct).ConfigureAwait(false);
                         var diag = voWifiToUse.GetDiagnosticInfo();
-                        return new KernelCommandResult(started, started ? $"VoWiFi established & IMS registered on {diag.Tunnel?.AssignedIPv4} (ePDG: {diag.EpdgFqdn}, Suite: {diag.Suite}, Proxy: {voWifiToUse.ProxyUrl ?? "direct"})" : $"VoWiFi failed: {diag.LastError}", diag);
+                        var tunnelIp = !string.IsNullOrWhiteSpace(diag.Tunnel?.AssignedIPv4)
+                            ? diag.Tunnel.AssignedIPv4
+                            : diag.Tunnel?.AssignedIPv6;
+                        return new KernelCommandResult(started, started ? $"VoWiFi established & IMS registered on {tunnelIp} (ePDG: {diag.EpdgFqdn}, Suite: {diag.Suite}, Proxy: {voWifiToUse.ProxyUrl ?? "direct"})" : $"VoWiFi failed: {diag.LastError}", diag);
                     }
                     else if (voSub is "stop" or "disconnect")
                     {
@@ -1439,7 +1428,7 @@ public class VoKernel : IVoKernel
                         if (CurrentSim == null)
                             return new KernelCommandResult(false, "No active SIM identity.");
                         var customEpdg = parts.Length > 2 && !Enum.TryParse<IkeProposalSuite>(parts[2], true, out _) ? parts[2] : null;
-                        var epdgRes = await EpdgResolver.ResolveAsync(CurrentSim.Imsi, customEpdg, CurrentSim.Iccid, CurrentSim.OperatorName, ct).ConfigureAwait(false);
+                        var epdgRes = await EpdgResolver.ResolveAsync(CurrentSim, customEpdg, ct).ConfigureAwait(false);
                         return new KernelCommandResult(true, $"Carrier: {epdgRes.MatchedCarrier ?? "Generic 3GPP"} | ePDG: {epdgRes.Fqdn} (Resolved IPs: {(epdgRes.IpAddresses.Length > 0 ? string.Join(", ", epdgRes.IpAddresses.Select(a => a.ToString())) : "None - public DNS lookup failed, custom ePDG IP may be needed")})", new
                         {
                             MatchedCarrier = epdgRes.MatchedCarrier ?? "Generic 3GPP",

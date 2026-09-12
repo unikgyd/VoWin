@@ -306,6 +306,82 @@
             </StackPanel>
           </Border>
 
+          <!-- ================= CARD 2: SIM 开关 ================= -->
+          <Border
+            Margin="0,0,0,14"
+            Padding="18,16"
+            Background="{DynamicResource AppCardBrush}"
+            BorderBrush="{DynamicResource AppCardBorderBrush}"
+            BorderThickness="1"
+            CornerRadius="12"
+          >
+            <StackPanel>
+              <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal">
+                  <ui:SymbolIcon Symbol="ToggleRight24" FontSize="16" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,8,0" />
+                  <StackPanel>
+                    <TextBlock FontSize="15" FontWeight="SemiBold" Text="开关" />
+                    <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="只按当前 SIM 卡保存；换卡后按该卡自己的设置恢复。新卡默认全部关闭。" />
+                  </StackPanel>
+                </StackPanel>
+                <TextBlock Grid.Column="1" VerticalAlignment="Center" FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Text="{Binding Iccid, Mode=OneWay}" />
+              </Grid>
+
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0" Margin="0,0,5,0" Padding="12,10" Background="{DynamicResource AppInputBrush}" CornerRadius="8">
+                  <Grid>
+                    <StackPanel Margin="0,0,36,0">
+                      <TextBlock FontWeight="SemiBold" Text="VoWiFi" />
+                      <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="启动或断开 IMS 通话与短信" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <ui:ToggleSwitch HorizontalAlignment="Right" VerticalAlignment="Top" IsChecked="{Binding VoWifiSwitchEnabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                  </Grid>
+                </Border>
+
+                <Border Grid.Column="1" Margin="3,0,3,0" Padding="12,10" Background="{DynamicResource AppInputBrush}" CornerRadius="8">
+                  <Grid>
+                    <StackPanel Margin="0,0,36,0">
+                      <TextBlock FontWeight="SemiBold" Text="飞行模式" />
+                      <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="关闭蜂窝射频（CFUN=4）" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <ui:ToggleSwitch HorizontalAlignment="Right" VerticalAlignment="Top" IsChecked="{Binding FlightModeSwitchEnabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                  </Grid>
+                </Border>
+
+                <Border Grid.Column="2" Margin="3,0,3,0" Padding="12,10" Background="{DynamicResource AppInputBrush}" CornerRadius="8">
+                  <Grid>
+                    <StackPanel Margin="0,0,36,0">
+                      <TextBlock FontWeight="SemiBold" Text="蜂窝数据" />
+                      <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="控制 PS 域移动数据附着" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <ui:ToggleSwitch HorizontalAlignment="Right" VerticalAlignment="Top" IsChecked="{Binding CellularDataSwitchEnabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                  </Grid>
+                </Border>
+
+                <Border Grid.Column="3" Margin="5,0,0,0" Padding="12,10" Background="{DynamicResource AppInputBrush}" CornerRadius="8">
+                  <Grid>
+                    <StackPanel Margin="0,0,36,0">
+                      <TextBlock FontWeight="SemiBold" Text="数据漫游" />
+                      <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="允许漫游网络使用数据" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <ui:ToggleSwitch HorizontalAlignment="Right" VerticalAlignment="Top" IsChecked="{Binding DataRoamingSwitchEnabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                  </Grid>
+                </Border>
+              </Grid>
+            </StackPanel>
+          </Border>
+
           <!-- ================= CARD 2: 蜂窝网络 (Cellular Network & SIM Card) ================= -->
           <Border
             Margin="0,0,0,14"

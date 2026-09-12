@@ -49,9 +49,9 @@ namespace VoWin.Services
                         PortName TEXT,
                         CustomName TEXT,
                         DefaultFlightMode INTEGER NOT NULL DEFAULT 0,
-                        DefaultVoWifi INTEGER NOT NULL DEFAULT 1,
-                        DefaultCellularData INTEGER NOT NULL DEFAULT 1,
-                        DefaultDataRoaming INTEGER NOT NULL DEFAULT 1,
+                        DefaultVoWifi INTEGER NOT NULL DEFAULT 0,
+                        DefaultCellularData INTEGER NOT NULL DEFAULT 0,
+                        DefaultDataRoaming INTEGER NOT NULL DEFAULT 0,
                         DefaultProxyUrl TEXT,
                         BaudRate INTEGER NOT NULL DEFAULT 115200,
                         LastSeenAt TEXT
@@ -62,9 +62,9 @@ namespace VoWin.Services
                         Imsi TEXT,
                         CardNickname TEXT,
                         DefaultFlightMode INTEGER NOT NULL DEFAULT 0,
-                        DefaultVoWifi INTEGER NOT NULL DEFAULT 1,
-                        DefaultCellularData INTEGER NOT NULL DEFAULT 1,
-                        DefaultDataRoaming INTEGER NOT NULL DEFAULT 1,
+                        DefaultVoWifi INTEGER NOT NULL DEFAULT 0,
+                        DefaultCellularData INTEGER NOT NULL DEFAULT 0,
+                        DefaultDataRoaming INTEGER NOT NULL DEFAULT 0,
                         DedicatedProxyUrl TEXT,
                         CustomEpdg TEXT,
                         LastSeenAt TEXT
@@ -136,7 +136,7 @@ namespace VoWin.Services
 
                 try
                 {
-                    using var alterCmd2 = new SqliteCommand("ALTER TABLE SimPreferences ADD COLUMN DefaultCellularData INTEGER NOT NULL DEFAULT 1;", conn);
+                    using var alterCmd2 = new SqliteCommand("ALTER TABLE SimPreferences ADD COLUMN DefaultCellularData INTEGER NOT NULL DEFAULT 0;", conn);
                     await alterCmd2.ExecuteNonQueryAsync();
                 }
                 catch { }

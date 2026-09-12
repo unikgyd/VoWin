@@ -91,43 +91,30 @@ public class SipRegisterSession : IDisposable
         if (resp1.StatusCode != 401)
             throw new InvalidOperationException(
                 $"SIP REGISTER: unexpected response {resp1.StatusCode} {resp1.ReasonPhrase}\nHeaders:\n{string.Join("\n", resp1.Headers.Select(h => $"  {h.Key}: {string.Join(", ", h.Value)}"))}\nBody:\n{resp1.Body}");
-        if (Agreement != null)
-            throw new InvalidOperationException("Protected IMS registration was challenged again; reconnect to negotiate fresh SAs.");
+        // A registered UE may be re-challenged over the existing security agreement without a
+        // new Security-Server header during reauthentication. Preserve
+        // the live SAs and answer the fresh AKA challenge instead of tearing the session down.
+        var wwwAuthHeaders = resp1.Headers.TryGetValue("WWW-Authenticate", out var authValues)
+            ? authValues.ToArray()
+            : Array.Empty<string>();
+        if (wwwAuthHeaders.Length == 0)
+            throw new InvalidOperationException("SIP 401 missing WWW-Authenticate header.");
 
-        var wwwAuth = resp1.GetHeader("WWW-Authenticate")
-                     ?? throw new InvalidOperationException("SIP 401 missing WWW-Authenticate header.");
-
-        var challenge = ImsRegisterBuilder.ParseWwwAuthenticate(wwwAuth)
-                        ?? throw new InvalidOperationException("Failed to parse WWW-Authenticate challenge.");
+        // A P-CSCF may advertise several challenges. Match the first supported IMS-AKA
+        // challenge instead of blindly taking the first (plain Digest is not usable with a USIM).
+        var challenge = wwwAuthHeaders
+            .Select(ImsRegisterBuilder.ParseWwwAuthenticate)
+            .FirstOrDefault(parsed => parsed != null);
+        if (challenge == null)
+        {
+            var advertised = string.Join(" | ", wwwAuthHeaders.Select(ImsRegisterBuilder.DescribeChallenge));
+            throw new InvalidOperationException(
+                $"SIP 401 did not offer a supported IMS-AKA challenge ({advertised}). " +
+                "A physical USIM can answer AKAv1-MD5 only; plain Digest MD5 needs a carrier password.");
+        }
 
         // ── Step 3: Decode RAND + AUTN from nonce (3GPP TS 24.228 §5.1.1.2) ─
-        // The Digest nonce for IMS AKA is Base64(RAND || AUTN)
-        byte[] rand, autn;
-        try
-        {
-            var nonceBytes = Convert.FromBase64String(challenge.Nonce);
-            if (nonceBytes.Length < 32)
-                throw new InvalidOperationException($"AKA nonce too short: {nonceBytes.Length} bytes (expected ≥32).");
-            rand = nonceBytes[..16];
-            autn = nonceBytes[16..32];
-        }
-        catch (FormatException)
-        {
-            // Some operators send RAND+AUTN as hex instead of Base64
-            try
-            {
-                var hex = challenge.Nonce.Replace("-", "");
-                if (hex.Length < 64)
-                    throw new InvalidOperationException("AKA nonce hex too short.");
-                rand = Convert.FromHexString(hex[..32]);
-                autn = Convert.FromHexString(hex[32..64]);
-            }
-            catch
-            {
-                throw new InvalidOperationException(
-                    $"Cannot decode RAND/AUTN from nonce: '{challenge.Nonce}'");
-            }
-        }
+        var (rand, autn) = DecodeAkaNonce(challenge.Nonce);
 
         // ── Step 4: Perform AKA authentication ───────────────────────────────
         var (res, ck, ik) = await akaProvider(rand, autn, ct).ConfigureAwait(false);
@@ -137,8 +124,10 @@ public class SipRegisterSession : IDisposable
             {
                 if (_securityProposal == null || _activateSecurity == null)
                     throw new InvalidOperationException("P-CSCF requires IMS IPsec, but this transport has no IMS security data plane.");
-                var agreement = SecurityAgreementBuilder.ParseSecurityServer(string.Join(", ", offered), _securityProposal)
-                    ?? throw new InvalidOperationException("P-CSCF offered no supported IMS security agreement.");
+                var agreement = SecurityAgreementBuilder.ParseSecurityServer(
+                    string.Join(", ", offered), _securityProposal,
+                    _securityIntegrityAlgorithms, _securityEncryptionAlgorithms)
+                    ?? throw new InvalidOperationException("P-CSCF offered no IMS security mechanism that was present in Security-Client.");
                 _activateSecurity(agreement, ck, ik);
                 Agreement = agreement;
                 _profile = _profile with { LocalPort = _securityProposal.PortClient, ContactPort = _securityProposal.PortServer };
@@ -155,7 +144,7 @@ public class SipRegisterSession : IDisposable
                 throw new InvalidOperationException(
                     $"SIP REGISTER auth failed: {resp2.StatusCode} {resp2.ReasonPhrase}");
 
-            Console.WriteLine($"[SipRegisterSession] 200 OK Headers:\n{string.Join("\n", resp2.Headers.Select(h => $"  {h.Key}: {string.Join(", ", h.Value)}"))}");
+            Console.WriteLine("[SipRegisterSession] IMS registration accepted (200 OK).");
             LastResult = ExtractRegistrationResult(resp2);
             return LastResult;
         }
@@ -167,20 +156,66 @@ public class SipRegisterSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Decodes the IMS AKA nonce. Some P-CSCFs use Base64(RAND || AUTN); others send the same
+    /// 32 bytes as 64 hexadecimal characters. Hexadecimal text is also valid Base64 text, so the
+    /// encoding must be detected before attempting Base64 or the USIM receives unrelated bytes.
+    /// </summary>
+    public static (byte[] Rand, byte[] Autn) DecodeAkaNonce(string nonce)
+    {
+        if (string.IsNullOrWhiteSpace(nonce))
+            throw new InvalidOperationException("IMS AKA challenge contains an empty nonce.");
+
+        var compact = nonce.Replace("-", string.Empty, StringComparison.Ordinal).Trim();
+        byte[] decoded;
+        if (compact.Length >= 64 && compact.Length % 2 == 0 && compact.All(Uri.IsHexDigit))
+        {
+            try { decoded = Convert.FromHexString(compact); }
+            catch (FormatException ex) { throw new InvalidOperationException("IMS AKA hexadecimal nonce is malformed.", ex); }
+        }
+        else
+        {
+            try { decoded = Convert.FromBase64String(nonce.Trim()); }
+            catch (FormatException ex) { throw new InvalidOperationException("IMS AKA nonce is neither valid Base64 nor hexadecimal RAND/AUTN.", ex); }
+        }
+
+        if (decoded.Length < 32)
+            throw new InvalidOperationException($"IMS AKA nonce decoded to {decoded.Length} bytes; RAND/AUTN requires at least 32.");
+        return (decoded[..16], decoded[16..32]);
+    }
+
     public void AddSecurityHeaders(SipMessage request)
     {
         if (_securityProposal == null) return;
-        request.SetHeader("Supported", "path, sec-agree, gruu");
         if (request.Method == "REGISTER")
+        {
+            request.SetHeader("Supported", "path, sec-agree, gruu");
             request.SetHeader("Security-Client", _securityIntegrityAlgorithms != null && _securityEncryptionAlgorithms != null
                 ? SecurityAgreementBuilder.BuildSecurityClient(_securityProposal, _securityIntegrityAlgorithms, _securityEncryptionAlgorithms)
                 : SecurityAgreementBuilder.BuildSecurityClient(_securityProposal));
+
+            // TS 24.229 security-agreement registration identifies the UE's intended
+            // IMS AKA scheme even before the P-CSCF supplies RAND/AUTN.  This is not
+            // a password response: nonce and response are deliberately empty.  VoCat
+            // does the same for its initial protected REGISTER.  Omitting it lets some
+            // P-CSCFs select their generic MD5 realm instead of the IMS-AKA realm.
+            request.SetHeader("Require", "sec-agree");
+            request.SetHeader("Proxy-Require", "sec-agree");
+            if (request.GetHeader("Authorization") == null)
+            {
+                request.SetHeader("Authorization",
+                    $"Digest username=\"{_profile.PrivateIdentity}\", realm=\"{_profile.HomeDomain}\", nonce=\"\", " +
+                    $"uri=\"sip:{_profile.HomeDomain}\", response=\"\", algorithm=AKAv1-MD5, integrity-protected=no");
+            }
+        }
         if (Agreement != null)
         {
             var authorization = request.GetHeader("Authorization");
             if (authorization != null)
                 request.SetHeader("Authorization", authorization.Replace("integrity-protected=no", "integrity-protected=yes"));
             request.SetHeader("Security-Verify", Agreement.VerifyValue);
+            // Subsequent IMS transactions, including RP-ACK, remain covered by
+            // the negotiated security agreement rather than silently downgrading.
             request.SetHeader("Require", "sec-agree");
             request.SetHeader("Proxy-Require", "sec-agree");
         }
@@ -259,7 +294,7 @@ public class SipRegisterSession : IDisposable
     {
         var req = ImsRegisterBuilder.BuildInitialRegister(_profile, _callId, _cseq++, _fromTag);
         // Override Contact expires and Expires header to 0
-        req.SetHeader("Contact", $"<sip:{_profile.PrivateIdentity}@{_profile.LocalIp}:{_profile.LocalPort}>;expires=0");
+        req.SetHeader("Contact", $"<sip:{_profile.PrivateIdentity}@{ImsRegisterBuilder.FormatHost(_profile.LocalIp)}:{_profile.LocalPort}>;expires=0");
         req.SetHeader("Expires", "0");
         await _transport.SendAsync(req, ct).ConfigureAwait(false);
     }

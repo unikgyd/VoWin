@@ -136,8 +136,8 @@ public static class ImsSmsHandler
     {
         var clean = value.Trim();
         var digits = clean.TrimStart('+');
-        if (digits.Length < 1 || digits.Length > 20)
-            digits = "13800100500"; // fallback
+        if (digits.Length < 1 || digits.Length > 20 || !digits.All(char.IsAsciiDigit))
+            throw new ArgumentException("RP address must be a SIM-provisioned phone number in E.164-compatible digits.", nameof(value));
 
         byte toa = clean.StartsWith("+") ? (byte)0x91 : (byte)0x81;
         int byteCount = (digits.Length + 1) / 2;

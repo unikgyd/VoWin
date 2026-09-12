@@ -55,7 +55,7 @@ internal sealed class RemoteCommandProcessor
         var sb = new StringBuilder("VoWin 系统状态\n");
         sb.AppendLine($"卡槽：{slot?.Name ?? "无"} ({slot?.Id ?? "-"})");
         sb.AppendLine($"模块：{slot?.State.ToString() ?? "离线"} / {slot?.PortName ?? "-"}");
-        sb.AppendLine($"SIM：{MaskIccid(slot?.Sim?.Iccid)} / {slot?.Sim?.OperatorName ?? "未知运营商"}");
+        sb.AppendLine($"SIM：{MaskIccid(slot?.Sim?.Iccid)} / {slot?.CarrierName ?? "未知运营商"}");
         sb.AppendLine(slot?.IsFlightMode == true
             ? "蜂窝：飞行模式（射频关闭，未搜索网络）"
             : $"蜂窝：{reg?.StatusDisplay ?? "未知"} {reg?.AccessTechnology ?? string.Empty}");

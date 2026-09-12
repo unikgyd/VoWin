@@ -1,4 +1,5 @@
 using System.IO.Ports;
+using System.Text;
 using System.Text.RegularExpressions;
 using VoSharp.Common.Events;
 using VoSharp.Common.Utils;
@@ -149,6 +150,251 @@ public class ModemDriver : IAsyncDisposable
     {
         var resp = await _session.ExecuteCommandAsync("AT+CNUM", 3000, ct).ConfigureAwait(false);
         return resp.Success ? ParseOwnPhoneNumber(resp.Lines) : string.Empty;
+    }
+
+    /// <summary>
+    /// Reads the SMS service-centre address provisioned on the active SIM.  IMS
+    /// SMS uses it both as the RP destination and, absent a SIM-provided PSI, as
+    /// the SIP MESSAGE target.  It must therefore come from the SIM/modem rather
+    /// than a carrier-specific fallback compiled into the client.
+    /// </summary>
+    public async Task<string> GetSmsCenterAsync(CancellationToken ct = default)
+    {
+        var response = await _session.ExecuteCommandAsync("AT+CSCA?", 3000, ct).ConfigureAwait(false);
+        return response.Success ? ParseSmsCenter(response.Lines) : string.Empty;
+    }
+
+    internal static string ParseSmsCenter(IEnumerable<string> lines)
+    {
+        foreach (var line in lines)
+        {
+            var match = Regex.Match(line,
+                @"^\s*\+CSCA:\s*""(?<number>\+?[0-9]{1,20})""\s*,\s*\d+\s*$",
+                RegexOptions.IgnoreCase);
+            if (match.Success)
+                return match.Groups["number"].Value;
+        }
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Reads the SIM service-provider name reported by Quectel firmware instead
+    /// of substituting the currently serving network name.
+    /// </summary>
+    public async Task<string> GetServiceProviderNameAsync(CancellationToken ct = default)
+    {
+        var resp = await _session.ExecuteCommandAsync("AT+QSPN", 2500, ct).ConfigureAwait(false);
+        return resp.Success ? ParseServiceProviderName(resp.Lines) : string.Empty;
+    }
+
+    internal static string ParseServiceProviderName(IEnumerable<string> lines)
+    {
+        foreach (var line in lines)
+        {
+            // Quectel: +QSPN: <FNN>,<SNN>,<SPN>,<alphabet>,<RPLMN>
+            var match = Regex.Match(
+                line,
+                "^\\s*\\+QSPN:\\s*\"(?<fnn>[^\"]*)\"\\s*,\\s*\"(?<snn>[^\"]*)\"\\s*,\\s*\"(?<spn>[^\"]*)\"\\s*,\\s*(?<alphabet>[01])",
+                RegexOptions.IgnoreCase);
+            if (!match.Success)
+                continue;
+
+            var spn = match.Groups["spn"].Value.Trim();
+            if (spn.Length == 0)
+                return string.Empty;
+
+            if (match.Groups["alphabet"].Value == "1" &&
+                spn.Length % 4 == 0 && spn.All(Uri.IsHexDigit))
+            {
+                try
+                {
+                    return Encoding.BigEndianUnicode.GetString(Convert.FromHexString(spn)).TrimEnd('\0').Trim();
+                }
+                catch (FormatException)
+                {
+                }
+            }
+
+            return spn;
+        }
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Reads the permanent subscriber identity from USIM EF_IMSI. Some multi-IMSI
+    /// profiles expose a temporary roaming identity through AT+CIMI while keeping
+    /// the home identity in this standard file.
+    /// </summary>
+    public async Task<string> GetPermanentImsiAsync(CancellationToken ct = default)
+    {
+        foreach (var command in new[]
+                 {
+                     "AT+CRSM=176,28423,0,0,9",
+                     "AT+CRSM=176,28423,0,0,9,\"\",\"3F007FFF\""
+                 })
+        {
+            var response = await _session.ExecuteCommandAsync(command, 2500, ct).ConfigureAwait(false);
+            var imsi = ParsePermanentImsi(response.Lines);
+            if (imsi.Length is >= 14 and <= 16)
+                return imsi;
+        }
+        return string.Empty;
+    }
+
+    public static string ParsePermanentImsi(IEnumerable<string> lines)
+    {
+        foreach (var hex in ExtractSuccessfulCrsmData(lines))
+        {
+            byte[] bytes;
+            try { bytes = Convert.FromHexString(hex); }
+            catch (FormatException) { continue; }
+            if (bytes.Length < 2)
+                continue;
+
+            var identityOctets = Math.Min(bytes[0], bytes.Length - 1);
+            if (identityOctets < 7)
+                continue;
+
+            var digits = new StringBuilder(identityOctets * 2 - 1);
+            var firstDigit = bytes[1] >> 4;
+            if (firstDigit > 9)
+                continue;
+            digits.Append((char)('0' + firstDigit));
+
+            for (var index = 2; index <= identityOctets; index++)
+            {
+                var low = bytes[index] & 0x0F;
+                var high = bytes[index] >> 4;
+                if (low <= 9) digits.Append((char)('0' + low));
+                else if (low != 0x0F) { digits.Clear(); break; }
+                if (high <= 9) digits.Append((char)('0' + high));
+                else if (high != 0x0F) { digits.Clear(); break; }
+            }
+
+            var imsi = digits.ToString();
+            if (imsi.Length is >= 14 and <= 16)
+                return imsi;
+        }
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Reads the MNC length from USIM EF_AD (3GPP TS 31.102). This is the only
+    /// subscriber-owned source that removes the ambiguity between two- and
+    /// three-digit MNCs; guessing from an IMSI or carrier-name table is not
+    /// globally correct.
+    /// </summary>
+    public async Task<int?> GetHomeMncLengthAsync(CancellationToken ct = default)
+    {
+        foreach (var command in new[]
+                 {
+                     "AT+CRSM=176,28589,0,0,4",
+                     "AT+CRSM=176,28589,0,0,4,\"\",\"3F007FFF\""
+                 })
+        {
+            var response = await _session.ExecuteCommandAsync(command, 2500, ct).ConfigureAwait(false);
+            var length = ParseHomeMncLength(response.Lines);
+            if (length is 2 or 3)
+                return length;
+        }
+
+        return null;
+    }
+
+    public static int? ParseHomeMncLength(IEnumerable<string> lines)
+    {
+        foreach (var data in ExtractSuccessfulCrsmData(lines))
+        {
+            if (data.Length < 2)
+                continue;
+            var finalOctet = Convert.ToByte(data[^2..], 16);
+            var mncLength = finalOctet & 0x0F;
+            if (mncLength is 2 or 3)
+                return mncLength;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Reads equivalent/home PLMN candidates from the USIM. Entries come from
+    /// EF_EHPLMN and EF_HPLMNwAcT and therefore follow the active profile rather
+    /// than a bundled carrier database.
+    /// </summary>
+    public async Task<IReadOnlyList<string>> GetHomePlmnsAsync(CancellationToken ct = default)
+    {
+        var result = new List<string>();
+        foreach (var item in new[]
+                 {
+                     (Command: "AT+CRSM=176,28633,0,0,0", RecordLength: 3), // EF_EHPLMN
+                     (Command: "AT+CRSM=176,28514,0,0,0", RecordLength: 5)  // EF_HPLMNwAcT
+                 })
+        {
+            var response = await _session.ExecuteCommandAsync(item.Command, 2500, ct).ConfigureAwait(false);
+            foreach (var plmn in ParsePlmnList(response.Lines, item.RecordLength))
+            {
+                if (!result.Contains(plmn, StringComparer.Ordinal))
+                    result.Add(plmn);
+            }
+        }
+        return result;
+    }
+
+    public static IReadOnlyList<string> ParsePlmnList(IEnumerable<string> lines, int recordLength)
+    {
+        if (recordLength < 3)
+            throw new ArgumentOutOfRangeException(nameof(recordLength));
+
+        var result = new List<string>();
+        foreach (var hex in ExtractSuccessfulCrsmData(lines))
+        {
+            byte[] bytes;
+            try { bytes = Convert.FromHexString(hex); }
+            catch (FormatException) { continue; }
+
+            for (var offset = 0; offset + recordLength <= bytes.Length; offset += recordLength)
+            {
+                var plmn = DecodePlmn(bytes.AsSpan(offset, 3));
+                if (plmn != null && !result.Contains(plmn, StringComparer.Ordinal))
+                    result.Add(plmn);
+            }
+        }
+        return result;
+    }
+
+    private static string? DecodePlmn(ReadOnlySpan<byte> encoded)
+    {
+        if (encoded.Length < 3 || encoded[0] == 0xFF && encoded[1] == 0xFF && encoded[2] == 0xFF)
+            return null;
+
+        var mcc1 = encoded[0] & 0x0F;
+        var mcc2 = encoded[0] >> 4;
+        var mcc3 = encoded[1] & 0x0F;
+        var mnc1 = encoded[2] & 0x0F;
+        var mnc2 = encoded[2] >> 4;
+        var mnc3 = encoded[1] >> 4;
+        if (mcc1 > 9 || mcc2 > 9 || mcc3 > 9 || mnc1 > 9 || mnc2 > 9 || mnc3 is > 9 and not 0x0F)
+            return null;
+
+        return $"{mcc1}{mcc2}{mcc3}{mnc1}{mnc2}" + (mnc3 == 0x0F ? string.Empty : mnc3);
+    }
+
+    private static IEnumerable<string> ExtractSuccessfulCrsmData(IEnumerable<string> lines)
+    {
+        foreach (var line in lines)
+        {
+            var match = Regex.Match(
+                line,
+                @"\+CRSM:\s*(?<sw1>\d+)\s*,\s*(?<sw2>\d+)\s*,\s*""(?<data>[0-9A-Fa-f]+)""",
+                RegexOptions.IgnoreCase);
+            if (!match.Success)
+                continue;
+            var sw1 = int.Parse(match.Groups["sw1"].Value);
+            var sw2 = int.Parse(match.Groups["sw2"].Value);
+            if (sw1 is 144 or 145 or 159 && sw2 == 0)
+                yield return match.Groups["data"].Value;
+        }
     }
 
     internal static string ParseOwnPhoneNumber(IEnumerable<string> lines)

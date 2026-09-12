@@ -12,8 +12,6 @@ using VoSharp.Crypto;
 using VoSharp.Ike;
 using VoSharp.Ike.Transport;
 using VoSharp.Modem;
-using VoSharp.Native.StrongSwan;
-using VoSharp.Native.Vici;
 using VoSharp.Sim;
 using VoSharp.Sip;
 using VoSharp.Telephony.Calls;
@@ -201,7 +199,12 @@ public class VoWifiManager : IDisposable
     private CancellationTokenSource? _ctsEspDispatch;
     private Task? _espDispatchTask;
     private readonly Ipv4FragmentReassembler _innerIpv4Reassembler = new();
+    private readonly Ipv6FragmentReassembler _innerIpv6Reassembler = new();
     private readonly SmsReassembler _smsReassembler = new();
+    // Inner protocols that are not UDP are logged once each; the tunnel sees the same control
+    // packet every few seconds and repeating it would flood the log.
+    private readonly ConcurrentDictionary<byte, byte> _ignoredInnerProtocols = new();
+    private int _icmpv6EchoLogged;
     private int _nextRpReference;
     private readonly string _smsFromTag = Guid.NewGuid().ToString("N")[..12];
     private sealed record IncomingSmsTransaction(DateTime Created, Lazy<Task> Work);
@@ -219,16 +222,8 @@ public class VoWifiManager : IDisposable
     private const ushort CpAttrInternalIp4Dns = 3;
     private const ushort CpAttrPcscfIp4Address = 12;  // 3GPP TS 24.302 §7.2
 
-    // ── Native layer (strongSwan control plane) ─────────────────────────
-    private CharonManager? _charon;
-    private ViciClient? _vici;
-    private string? _activeConnName;
-
-    // ── C# full-stack IKEv2 backend (Route B') ──────────────────────────
+    // ── C# full-stack IKEv2 backend ─────────────────────────────────────
     private IIkeBackend? _csharpIkeBackend;
-
-    /// <summary>True if the native strongSwan backend is available and being used.</summary>
-    public bool UseNativeBackend { get; set; }
 
     public VoWifiManager(AsyncEventBus? eventBus = null, ModemDriver? modem = null)
     {
@@ -291,238 +286,48 @@ public class VoWifiManager : IDisposable
 
     public SipTransport? SipTransport => _sipTransport;
 
-    private static bool HasNativeDataPlane() => false;
-
-    // ════════════════════════════════════════════════════════════════════════
-    //  NATIVE BACKEND: strongSwan charon-svc control plane
-    // ════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Starts VoWiFi using the native strongSwan IKEv2 stack.
-    /// charon-svc owns IKEv2 and (via kernel-wfp) the ESP data plane. No TUN device is used — see IMPLEMENTATION_PLAN.md §1.1.
-    /// </summary>
-    public async Task<bool> StartVoWifiNativeAsync(
-        SimIdentity sim,
-        string? customEpdg = null,
-        IkeProposalSuite suite = IkeProposalSuite.Auto,
-        CancellationToken ct = default)
-    {
-        try
-        {
-            SetState(VoWifiState.ResolvingEpdg);
-            LastError = null;
-
-            // ── 1. Resolve ePDG ─────────────────────────────────────────────
-            EpdgInfo = await EpdgResolver.ResolveAsync(sim.Imsi, customEpdg, sim.Iccid, sim.OperatorName, ct)
-                                         .ConfigureAwait(false);
-            EventBus?.Publish("vowifi.epdg.resolved", "VoWifiManager", EpdgInfo);
-
-            var epdgIp = EpdgInfo.IpAddresses.FirstOrDefault()?.ToString()
-                ?? throw new InvalidOperationException("No ePDG IP resolved.");
-
-            // ── 2. Start charon-svc ─────────────────────────────────────────
-            SetState(VoWifiState.ConnectingIkev2);
-            _charon?.Dispose();
-            _charon = new CharonManager();
-            await _charon.EnsureRunningAsync(ct).ConfigureAwait(false);
-            EventBus?.Publish("vowifi.charon.started", "VoWifiManager", _charon.GetDiagnosticInfo());
-
-            // ── 3. Connect VICI and load connection ─────────────────────────
-            _vici?.Dispose();
-            _vici = new ViciClient();
-            await _vici.ConnectAsync(ct).ConfigureAwait(false);
-
-            var version = await _vici.GetVersionAsync(ct).ConfigureAwait(false);
-            EventBus?.Publish("vowifi.vici.connected", "VoWifiManager",
-                new { Version = version.GetString("version"), Daemon = version.GetString("daemon") });
-
-            _activeConnName = $"vowifi-{sim.Mcc}{sim.Mnc}";
-            var loadResult = await _vici.LoadConnectionAsync(
-                connName: _activeConnName,
-                epdgIp: epdgIp,
-                imsiNai: EpdgInfo.Impi,
-                epdgFqdn: EpdgInfo.Fqdn,
-                proposals: suite == IkeProposalSuite.Modern
-                    ? "aes256-sha256-ecp256"
-                    : "aes256-sha256-modp2048, aes128-sha256-modp2048",
-                ct: ct
-            ).ConfigureAwait(false);
-
-            var success = loadResult.GetString("success");
-            if (success != "yes")
-                throw new InvalidOperationException(
-                    $"VICI load-conn failed: {loadResult.GetString("errmsg") ?? "unknown error"}");
-
-            EventBus?.Publish("vowifi.vici.conn_loaded", "VoWifiManager", _activeConnName);
-
-            // ── 4. Initiate IKE SA (EAP-AKA with ePDG) ─────────────────────
-            SetState(VoWifiState.AuthenticatingEapAka);
-            var initResult = await _vici.InitiateAsync("vowifi-ims", timeoutSeconds: 30, ct: ct)
-                                         .ConfigureAwait(false);
-
-            var initSuccess = initResult.GetString("success");
-            if (initSuccess != "yes")
-                throw new InvalidOperationException(
-                    $"VICI initiate failed: {initResult.GetString("errmsg") ?? "unknown error"}");
-
-            EventBus?.Publish("vowifi.ike.established", "VoWifiManager", initResult);
-
-            // ── 5. Query SA for assigned IP / P-CSCF ────────────────────────
-            SetState(VoWifiState.IpsecTunnelEstablished);
-            var sas = await _vici.ListSasAsync(ct).ConfigureAwait(false);
-            var activeSa = sas.FirstOrDefault(s => s.State == "ESTABLISHED");
-
-            var assignedIp = activeSa?.AssignedIp ?? "10.0.0.1";
-            AssignedIp = assignedIp;
-            IkeInitiatorSpi = ulong.TryParse(activeSa?.InitiatorSpi?.Replace("0x", ""),
-                System.Globalization.NumberStyles.HexNumber, null, out var spiI) ? spiI : 0;
-            IkeResponderSpi = ulong.TryParse(activeSa?.ResponderSpi?.Replace("0x", ""),
-                System.Globalization.NumberStyles.HexNumber, null, out var spiR) ? spiR : 0;
-
-            var childSa = activeSa?.ChildSas.FirstOrDefault(c => c.State == "INSTALLED");
-
-            // ── 5b. P-CSCF address ───────────────────────────────────────────
-            // The P-CSCF is delivered by the IKE_AUTH Configuration Payload
-            // (3GPP TS 24.302 §7.2, attribute P_CSCF_IP4_ADDRESS = 20). It is a distinct address
-            // from the ePDG; using the ePDG as a stand-in produces a REGISTER that no IMS core
-            // will ever answer, while looking like a perfectly healthy tunnel in diagnostics.
-            var pcscfIp = activeSa?.PcscfIp;
-            if (string.IsNullOrWhiteSpace(pcscfIp))
-            {
-                throw new InvalidOperationException(
-                    "The ePDG did not assign a P-CSCF address. " +
-                    "Ensure strongSwan is configured with the 'attr' and 'p-cscf' plugins " +
-                    "(neither is enabled in the current build — see PREREQUISITES.md B3/B4).");
-            }
-
-            // Build tunnel info from real SA data
-            TunnelInfo = new VoWifiIpsecTunnelInfo(
-                AccessStandard: "3GPP TS 24.302 (strongSwan Native Backend)",
-                InboundSpi: uint.TryParse(childSa?.SpiIn?.Replace("0x", ""),
-                    System.Globalization.NumberStyles.HexNumber, null, out var inSpi) ? inSpi : 0,
-                OutboundSpi: uint.TryParse(childSa?.SpiOut?.Replace("0x", ""),
-                    System.Globalization.NumberStyles.HexNumber, null, out var outSpi) ? outSpi : 0,
-                EncryptionAlgorithm: childSa?.EncAlg ?? "AES-CBC",
-                IntegrityAlgorithm: childSa?.IntegAlg ?? "HMAC-SHA256",
-                AssignedIPv4: assignedIp,
-                AssignedIPv6: null,
-                AssignedDns: null,
-                PcscfIp: pcscfIp,
-                NatPort: Ikev2Protocol.NattPort
-            );
-
-            try { TunnelEstablished?.Invoke(this, TunnelInfo); } catch { }
-            EventBus?.Publish("vowifi.tunnel.established", "VoWifiManager", TunnelInfo);
-
-            // ── 6. Tunnel data plane ─────────────────────────────────────────
-            // The data plane is WFP: the ESP SA is installed in the kernel and the assigned
-            // inner address is added to the physical adapter, with a route drawing traffic into
-            // the tunnel. No TUN device is involved — Wintun is a user-space TUN and is
-            // mutually exclusive with a kernel IPsec data plane.
-            // See IMPLEMENTATION_PLAN.md §1.1 and PREREQUISITES.md §0.2.
-            EventBus?.Publish("vowifi.dataplane.pending", "VoWifiManager",
-                "WFP SA installer not yet implemented (gate G5) — tunnel has no data plane.");
-            if (!HasNativeDataPlane())
-            {
-                throw new InvalidOperationException(
-                    "Native strongSwan control plane connected, but the WFP data plane is not implemented. " +
-                    "VoWiFi cannot be marked online until protected SIP traffic can reach the P-CSCF.");
-            }
-
-            // ── 7. SIP Registration ─────────────────────────────────────────
-            SetState(VoWifiState.ImsRegistering);
-
-            // P-CSCF was resolved above from the Configuration Payload; never the ePDG address.
-            if (!IPAddress.TryParse(pcscfIp, out var pcscfAddr))
-                throw new InvalidOperationException(
-                    $"P-CSCF address '{pcscfIp}' from the Configuration Payload is not a valid IP address.");
-
-            var imsProfile = new ImsProfile(
-                PrivateIdentity: EpdgInfo.Impi,
-                PublicIdentity: EpdgInfo.Impu,
-                HomeDomain: EpdgInfo.ImsDomain,
-                Imei: await ResolveImeiAsync(ct).ConfigureAwait(false),
-                LocalIp: assignedIp,
-                LocalPort: 5060
-            );
-
-            _sipTransport?.Dispose();
-            _sipTransport = new SipTransport(timeoutMs: 5000);
-            _sipTransport.Connect(pcscfAddr, remotePort: 5060, localPort: 5060);
-
-            SipRegistrationResult? regResult = null;
-            string registrationState;
-
-            try
-            {
-                var session = new SipRegisterSession(_sipTransport, imsProfile);
-                regResult = await session.RegisterAsync(
-                    akaProvider: async (rand, autn, token) =>
-                    {
-                        if (Modem != null)
-                        {
-                            var hw = await Modem.AuthenticateUsimAkaAsync(rand, autn, token);
-                            if (hw != null) return (hw.Value.Res, hw.Value.Ck, hw.Value.Ik);
-                        }
-                        var (res, ck, ik, _, _) = Milenage.ComputeF2345(
-                            opc: Convert.FromHexString("cd63cb71954a9f4e48a5994e37a02baf"),
-                            k: Convert.FromHexString("465b5ce8b199b49faa5f0a2ee238a6bc"),
-                            rand: rand);
-                        return (res, ck, ik);
-                    },
-                    ct: ct
-                ).ConfigureAwait(false);
-
-                registrationState = "200 OK (Registered)";
-                EventBus?.Publish("vowifi.ims.registered", "VoWifiManager", regResult);
-            }
-            catch (Exception sipEx)
-            {
-                registrationState = $"FAILED: {sipEx.Message}";
-                EventBus?.Publish("vowifi.ims.register_failed", "VoWifiManager", sipEx.Message);
-                throw new InvalidOperationException($"IMS SIP registration failed: {sipEx.Message}", sipEx);
-            }
-
-            ImsInfo = new VoWifiImsSessionInfo(
-                RegistrationState: registrationState,
-                HomeDomain: EpdgInfo!.ImsDomain,
-                Impi: EpdgInfo!.Impi,
-                Impu: EpdgInfo!.Impu,
-                PcscfEndpoint: $"sip:{pcscfIp}:5060;transport=udp",
-                ContactUri: regResult?.ContactUri ?? imsProfile.PrivateIdentity,
-                CSeq: 1,
-                ExpiresSeconds: regResult?.ExpiresSeconds ?? 3600,
-                SecurityAssociation: "strongSwan IPsec (charon-svc / kernel-wfp)",
-                RegisteredAt: regResult?.RegisteredAt ?? DateTime.UtcNow
-            );
-
-            SetState(VoWifiState.ImsRegistered);
-            ConnectedAt = DateTime.UtcNow;
-            UseNativeBackend = true;
-            return true;
-        }
-        catch (Exception ex)
-        {
-            LastError = ex.Message;
-            SetState(VoWifiState.Failed);
-            EventBus?.Publish("vowifi.error", "VoWifiManager", ex.Message);
-            return false;
-        }
-    }
-
 
     public async Task<bool> StartVoWifiAsync(
         SimIdentity sim,
         string? customEpdg = null,
         IkeProposalSuite suite = IkeProposalSuite.Auto,
         string? proxyUrl = null,
+        CancellationToken ct = default) =>
+        await StartVoWifiAsync(new[] { sim }, customEpdg, suite, proxyUrl, ct).ConfigureAwait(false);
+
+    public async Task<bool> StartVoWifiAsync(
+        IReadOnlyList<SimIdentity> identityCandidates,
+        string? customEpdg = null,
+        IkeProposalSuite suite = IkeProposalSuite.Auto,
+        string? proxyUrl = null,
         CancellationToken ct = default)
     {
-        var options = new VoWifiStartOptions(sim, customEpdg, suite, proxyUrl ?? ProxyUrl);
-        _lastStartOptions = options;
-        Volatile.Write(ref _keepOnlineRequested, 1);
+        ArgumentNullException.ThrowIfNull(identityCandidates);
+        var candidates = identityCandidates
+            .Where(candidate => candidate != null)
+            .GroupBy(candidate => candidate.Imsi, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToArray();
+        if (candidates.Length == 0)
+            throw new ArgumentException("At least one live or learned SIM identity is required.", nameof(identityCandidates));
+        if (candidates.Select(candidate => candidate.Iccid).Distinct(StringComparer.Ordinal).Count() != 1)
+            throw new ArgumentException("All identity candidates must belong to the same live ICCID.", nameof(identityCandidates));
 
-        var started = await StartVoWifiAttemptAsync(options, ct).ConfigureAwait(false);
+        Volatile.Write(ref _keepOnlineRequested, 1);
+        var started = false;
+        for (var index = 0; index < candidates.Length; index++)
+        {
+            var options = new VoWifiStartOptions(candidates[index], customEpdg, suite, proxyUrl ?? ProxyUrl);
+            _lastStartOptions = options;
+            if (candidates.Length > 1)
+                EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                    $"Trying learned SIM identity candidate {index + 1}/{candidates.Length} for this ICCID.");
+
+            started = await StartVoWifiAttemptAsync(options, ct).ConfigureAwait(false);
+            if (started || !CanTryNextIdentity(LastError))
+                break;
+        }
+
         if (!started && Volatile.Read(ref _keepOnlineRequested) != 0)
             QueueAutomaticRecovery(LastError ?? "VoWiFi startup failed.");
         return started;
@@ -574,16 +379,30 @@ public class VoWifiManager : IDisposable
             }
 
             // ── 1. Resolve 3GPP ePDG FQDN & DNS ─────────────────────────────
-            EpdgInfo = await EpdgResolver.ResolveAsync(sim.Imsi, customEpdg, sim.Iccid, sim.OperatorName, ct)
+            EpdgInfo = await EpdgResolver.ResolveAsync(sim, customEpdg, ct)
                                          .ConfigureAwait(false);
+            // TS 24.011 RP-DATA must use the SMSC provisioned by this SIM.  Do
+            // not substitute a number from another carrier when the modem has
+            // no value: VoCat likewise uses SIM-provided SMSC/PSI routing.
+            if (Modem != null)
+            {
+                var smsc = await Modem.GetSmsCenterAsync(ct).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(smsc))
+                    EpdgInfo = EpdgInfo with { SmsCenter = smsc };
+            }
             EventBus?.Publish("vowifi.epdg.resolved", "VoWifiManager", EpdgInfo);
+            EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                $"Resolved ePDG: carrier={EpdgInfo.MatchedCarrier ?? "unmatched"}, " +
+                $"fqdn={EpdgInfo.Fqdn}, apn={EpdgInfo.Apn ?? "ims"}, " +
+                $"addresses=[{string.Join(", ", EpdgInfo.IpAddresses.Select(address => address.ToString()))}].");
 
             var chosenSuite = suite == IkeProposalSuite.Auto ? EpdgInfo.PreferredSuite : suite;
 
-            var targetIp = EpdgInfo.IpAddresses.FirstOrDefault()
-                           ?? throw new InvalidOperationException(
-                               $"ePDG DNS resolution returned no addresses for '{EpdgInfo.Fqdn}'. " +
-                               "Check network connectivity or provide a custom ePDG IP.");
+            var targetIps = EpdgInfo.IpAddresses.Distinct().ToArray();
+            if (targetIps.Length == 0)
+                throw new InvalidOperationException(
+                    $"ePDG DNS resolution returned no addresses for '{EpdgInfo.Fqdn}'. " +
+                    "Check network connectivity or provide a custom ePDG IP.");
 
             // ── 2. Pick AKA Provider ─────────────────────────────────────────
             if (Modem == null || !Modem.IsOpen)
@@ -593,6 +412,7 @@ public class VoWifiManager : IDisposable
             if (!await akaProvider.CheckReadyAsync(sim.Iccid, ct).ConfigureAwait(false))
                 throw new InvalidOperationException(
                     "The live USIM ICCID does not match the identity selected for VoWiFi. Authentication was blocked before EAP-AKA; refresh the SIM identity after switching profiles.");
+            var deviceImei = await ResolveImeiAsync(ct).ConfigureAwait(false);
 
             // ── 3. IKEv2 / EAP-AKA Handshake & Child SA (C# Full Stack) ─────
             string? fallbackPcscf = null;
@@ -604,41 +424,83 @@ public class VoWifiManager : IDisposable
             // EAP-AKA or the CHILD_SA has started, changing algorithms would mask a real
             // authentication/provisioning fault and could consume additional AKA vectors.
             IkeBackendResult? ikeResult = null;
-            var attemptedSuites = new List<IkeProposalSuite>();
+            var attemptedSuites = new List<string>();
             var negotiationErrors = new List<string>();
-            foreach (var attemptSuite in GetIkeSuiteAttempts(suite, chosenSuite))
+            var stopEndpointFailover = false;
+            var suiteAttempts = GetIkeSuiteAttempts(suite, chosenSuite);
+            foreach (var targetIp in targetIps)
             {
-                ct.ThrowIfCancellationRequested();
-                attemptedSuites.Add(attemptSuite);
-                CurrentSuite = attemptSuite;
-                EventBus?.Publish("vowifi.ike.attempt", "VoWifiManager",
-                    new { Suite = attemptSuite.ToString(), Attempt = attemptedSuites.Count });
+                for (var suiteIndex = 0; suiteIndex < suiteAttempts.Count; suiteIndex++)
+                {
+                    var attemptSuite = suiteAttempts[suiteIndex];
+                    ct.ThrowIfCancellationRequested();
+                    attemptedSuites.Add($"{targetIp}/{attemptSuite}");
+                    CurrentSuite = attemptSuite;
+                    EventBus?.Publish("vowifi.ike.attempt", "VoWifiManager",
+                        new { Endpoint = targetIp.ToString(), Suite = attemptSuite.ToString(), Attempt = attemptedSuites.Count });
 
-                _csharpIkeBackend?.Dispose();
-                _csharpIkeBackend = new CSharpIkeBackend();
-                ikeResult = await _csharpIkeBackend.StartTunnelAsync(
-                    sim,
-                    akaProvider,
-                    targetIp.ToString(),
-                    apn,
-                    fallbackPcscf,
-                    attemptSuite,
-                    effectiveProxy,
-                    ct).ConfigureAwait(false);
+                    _csharpIkeBackend?.Dispose();
+                    _csharpIkeBackend = new CSharpIkeBackend();
+                    ikeResult = await _csharpIkeBackend.StartTunnelAsync(
+                        sim,
+                        akaProvider,
+                        targetIp.ToString(),
+                        apn,
+                        fallbackPcscf,
+                        attemptSuite,
+                        effectiveProxy,
+                        deviceImei,
+                        ct).ConfigureAwait(false);
 
-                if (ikeResult.Success && !string.IsNullOrEmpty(ikeResult.AssignedIp) && !string.IsNullOrEmpty(ikeResult.PcscfIp))
+                    if (ikeResult.Success && !string.IsNullOrEmpty(ikeResult.AssignedIp) && !string.IsNullOrEmpty(ikeResult.PcscfIp))
+                        break;
+
+                    var error = ikeResult.ErrorMessage ?? "Unknown IKE negotiation error";
+                    negotiationErrors.Add($"{targetIp}/{attemptSuite}: {error}");
+                    _csharpIkeBackend.Dispose();
+                    _csharpIkeBackend = null;
+
+                    if (IsInitialIkeTimeout(error))
+                    {
+                        // A silent IKE_SA_INIT may mean either an unsupported proposal or a
+                        // dead anycast/backend node. In Auto mode exhaust this endpoint's safe
+                        // pre-EAP proposal ladder, then move to the next DNS address. An explicit
+                        // suite has no useful same-endpoint retry and can fail over immediately.
+                        if (suiteIndex + 1 < suiteAttempts.Count)
+                        {
+                            EventBus?.Publish("vowifi.ike.retry", "VoWifiManager",
+                                new { Endpoint = targetIp.ToString(), FailedSuite = attemptSuite.ToString(), Reason = error });
+                            continue;
+                        }
+
+                        EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                            $"ePDG {targetIp} did not answer IKE_SA_INIT; trying the next resolved address.");
+                        break;
+                    }
+
+                    if (IsProposalNegotiationFailure(error))
+                    {
+                        EventBus?.Publish("vowifi.ike.retry", "VoWifiManager",
+                            new { Endpoint = targetIp.ToString(), FailedSuite = attemptSuite.ToString(), Reason = error });
+                        continue;
+                    }
+
+                    // The peer rejected the permanent identity before it supplied RAND/AUTN.
+                    // No USIM vector has been consumed. Different DNS nodes can be backed by
+                    // independent AAA pools, so it is safe to try the next resolved address.
+                    if (IsPreAkaRejection(error))
+                    {
+                        EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                            $"ePDG {targetIp} rejected EAP before the AKA challenge; trying the next resolved address.");
+                        break;
+                    }
+
+                    stopEndpointFailover = true;
                     break;
+                }
 
-                var error = ikeResult.ErrorMessage ?? "Unknown IKE negotiation error";
-                negotiationErrors.Add($"{attemptSuite}: {error}");
-                _csharpIkeBackend.Dispose();
-                _csharpIkeBackend = null;
-
-                if (!IsProposalNegotiationFailure(error))
+                if (ikeResult is { Success: true, AssignedIp: not null, PcscfIp: not null } || stopEndpointFailover)
                     break;
-
-                EventBus?.Publish("vowifi.ike.retry", "VoWifiManager",
-                    new { FailedSuite = attemptSuite.ToString(), Reason = error });
             }
 
             if (ikeResult == null || !ikeResult.Success || string.IsNullOrEmpty(ikeResult.AssignedIp) || string.IsNullOrEmpty(ikeResult.PcscfIp))
@@ -652,6 +514,7 @@ public class VoWifiManager : IDisposable
             IkeResponderSpi = ikeResult.OutboundSpi;
 
             AssignedIp = ikeResult.AssignedIp;
+            var assignedAddress = IPAddress.Parse(ikeResult.AssignedIp);
             TunnelInfo = new VoWifiIpsecTunnelInfo(
                 AccessStandard: "3GPP TS 24.302 (Untrusted Non-3GPP / S2b Interface)",
                 InboundSpi: ikeResult.InboundSpi,
@@ -660,12 +523,14 @@ public class VoWifiManager : IDisposable
                 IntegrityAlgorithm: ikeResult.EspSuite?.IntegrityId == IkeIntegrityId.HmacSha1_96
                     ? "HMAC-SHA1-96"
                     : "HMAC-SHA256-128",
-                AssignedIPv4: ikeResult.AssignedIp,
-                AssignedIPv6: null,
+                AssignedIPv4: assignedAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? ikeResult.AssignedIp : string.Empty,
+                AssignedIPv6: assignedAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? ikeResult.AssignedIp : null,
                 AssignedDns: ikeResult.DnsIps.FirstOrDefault() ?? string.Empty,
                 PcscfIp: ikeResult.PcscfIp,
                 NatPort: Ikev2Protocol.NattPort
             );
+            try { TunnelEstablished?.Invoke(this, TunnelInfo); } catch { }
+            EventBus?.Publish("vowifi.tunnel.established", "VoWifiManager", TunnelInfo);
 
             SetState(VoWifiState.IpsecTunnelEstablished);
 
@@ -676,9 +541,10 @@ public class VoWifiManager : IDisposable
                 PrivateIdentity: EpdgInfo.Impi,
                 PublicIdentity: EpdgInfo.Impu,
                 HomeDomain: EpdgInfo.ImsDomain,
-                Imei: await ResolveImeiAsync(ct).ConfigureAwait(false),
+                Imei: deviceImei,
                 LocalIp: ikeResult.AssignedIp,
-                LocalPort: 5060
+                LocalPort: 5060,
+                PAccessNetworkInfo: ImsRegisterBuilder.BuildAccessNetworkInfo(EpdgInfo.Impi)
             );
 
             _sipTransport?.Dispose();
@@ -688,6 +554,10 @@ public class VoWifiManager : IDisposable
 
             if (!IPAddress.TryParse(ikeResult.PcscfIp, out var pcscfAddr))
                 throw new InvalidOperationException($"P-CSCF IP '{ikeResult.PcscfIp}' is invalid.");
+            if (assignedAddress.AddressFamily != pcscfAddr.AddressFamily)
+                throw new InvalidOperationException(
+                    $"The ePDG assigned {assignedAddress} but returned P-CSCF {pcscfAddr}. IMS signalling cannot mix " +
+                    "IPv4 and IPv6; the address family requested from this ePDG does not match its IMS PDN.");
 
             if (ikeResult.EspTunnel != null && ikeResult.Transport != null)
             {
@@ -697,6 +567,9 @@ public class VoWifiManager : IDisposable
 
                 if (EnableImsIpsec) _imsIpsec = new ImsIpsecTransport(assignedIp, pcscfAddr);
                 _innerIpv4Reassembler.Clear();
+                _innerIpv6Reassembler.Clear();
+                EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                    $"Tunnel data plane ready: assigned={assignedIp}, P-CSCF={pcscfAddr}, family={assignedIp.AddressFamily}.");
                 var sipChannel = Channel.CreateUnbounded<SipDatagram>();
                 _ctsEspDispatch?.Cancel();
                 _ctsEspDispatch = new CancellationTokenSource();
@@ -715,27 +588,58 @@ public class VoWifiManager : IDisposable
                                 Console.WriteLine($"[VoWifiManager RX ESP] Decrypt failed! len={espBytes.Length}");
                                 continue;
                             }
-                            if (innerNextHeader == 41)
+                            if (innerNextHeader is not (4 or 41))
+                                throw new FormatException($"Unsupported ESP inner protocol {innerNextHeader}; expected IPv4 or IPv6.");
+                            if (innerNextHeader == 4)
                             {
-                                // The negotiated CHILD_SA is dual-stack.  This client has no
-                                // IPv6 IMS data plane yet, but an IPv6 packet is valid ESP
-                                // traffic and must not be reported as a malformed IPv4 packet.
-                                EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
-                                    "Ignored IPv6 inner packet on the IPv4 IMS data plane.");
+                                bool wasFragmented = inner.Length >= 8 &&
+                                    (BinaryPrimitives.ReadUInt16BigEndian(inner.AsSpan(6, 2)) & 0x3fff) != 0;
+                                inner = _innerIpv4Reassembler.Process(inner);
+                                if (inner == null)
+                                    continue;
+                                if (wasFragmented)
+                                    EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                                        $"Reassembled fragmented inner IPv4 packet ({inner.Length} bytes).");
+                            }
+                            else
+                            {
+                                var reassembled = _innerIpv6Reassembler.Process(inner);
+                                if (reassembled == null)
+                                    continue;
+                                if (!ReferenceEquals(reassembled, inner))
+                                    EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                                        $"Reassembled fragmented inner IPv6 packet ({reassembled.Length} bytes).");
+                                inner = reassembled;
+                            }
+                            if (innerNextHeader == 41 &&
+                                IpPacketUtils.TryGetInnerTransport(inner, out var ipv6Protocol) && ipv6Protocol == 58)
+                            {
+                                // A kernel tunnel answers ICMPv6 in the host IPv6 stack. This one
+                                // is user space, so it must answer itself: the ePDG pings the
+                                // assigned address and treats silence as an unreachable UE.
+                                if (IpPacketUtils.TryBuildIcmpv6EchoReply(inner, out var echoReply))
+                                {
+                                    if (Interlocked.Exchange(ref _icmpv6EchoLogged, 1) == 0)
+                                        EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                                            "Answering ePDG ICMPv6 echo requests inside the IPsec tunnel.");
+                                    var outerReply = esp.Seal(echoReply, nextHeader: 41);
+                                    await tr.SendEspAsync(outerReply, dispatchToken).ConfigureAwait(false);
+                                }
+                                // ICMPv6 is control traffic, not a SIP/RTP datagram. Other
+                                // types (errors/ND/status) are consumed without UDP parsing.
                                 continue;
                             }
-                            if (innerNextHeader != 4)
-                                throw new FormatException($"Unsupported ESP inner protocol {innerNextHeader}; expected IPv4.");
-                            bool wasFragmented = inner.Length >= 8 &&
-                                (BinaryPrimitives.ReadUInt16BigEndian(inner.AsSpan(6, 2)) & 0x3fff) != 0;
-                            inner = _innerIpv4Reassembler.Process(inner);
-                            if (inner == null)
-                                continue;
-                            if (wasFragmented)
-                                EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
-                                    $"Reassembled fragmented inner IPv4 packet ({inner.Length} bytes).");
                             if (_imsIpsec != null) inner = _imsIpsec.Unprotect(inner);
-                            var packet = IpPacketUtils.ParseIpv4UdpPacket(inner);
+                            if (!IpPacketUtils.IsUdpInnerPacket(inner))
+                            {
+                                // ICMPv6/ND/MLD, TCP, ESP and other non-UDP traffic is operator
+                                // control traffic. A full OS stack consumes it silently; raising
+                                // an error for every one drowns the real faults in the log.
+                                IpPacketUtils.TryGetInnerTransport(inner, out var ignoredProtocol);
+                                NoteIgnoredInnerProtocol(ignoredProtocol);
+                                continue;
+                            }
+                            var packet = IpPacketUtils.ParseUdpPacket(inner);
                             if (!packet.LocalEndPoint.Address.Equals(assignedIp))
                                 throw new FormatException("Inner packet destination does not match assigned IP.");
                             if (_imsIpsec?.AcceptsPort(packet.LocalEndPoint.Port) ?? packet.LocalEndPoint.Port == imsProfile.LocalPort)
@@ -761,14 +665,22 @@ public class VoWifiManager : IDisposable
                     new IPEndPoint(assignedIp, imsProfile.LocalPort), new IPEndPoint(pcscfAddr, 5060),
                     sender: async (packet, sendCt) =>
                     {
-                        var inner = _imsIpsec?.Protect(packet) ?? IpPacketUtils.BuildIpv4UdpPacket(
+                        var inner = _imsIpsec?.Protect(packet) ?? IpPacketUtils.BuildUdpPacket(
                             packet.LocalEndPoint.Address, packet.RemoteEndPoint.Address,
                             (ushort)packet.LocalEndPoint.Port, (ushort)packet.RemoteEndPoint.Port, packet.Payload);
-                        var outerEsp = esp.Seal(inner, nextHeader: 4);
-                        Console.WriteLine(
-                            $"[VoWiFi SIP TX] {packet.Payload.Length} bytes {packet.LocalEndPoint} -> {packet.RemoteEndPoint}; " +
-                            $"inner={inner.Length}, outer-ESP={outerEsp.Length}");
-                        await tr.SendEspAsync(outerEsp, sendCt).ConfigureAwait(false);
+                        var nextHeader = packet.LocalEndPoint.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? (byte)41 : (byte)4;
+                        var fragments = IpPacketUtils.FragmentForTunnel(inner);
+                        var outerLengths = new List<int>(fragments.Count);
+                        foreach (var fragment in fragments)
+                        {
+                            var outerEsp = esp.Seal(fragment, nextHeader);
+                            outerLengths.Add(outerEsp.Length);
+                            await tr.SendEspAsync(outerEsp, sendCt).ConfigureAwait(false);
+                        }
+                        var detail = $"SIP TX {packet.Payload.Length} bytes {packet.LocalEndPoint} -> {packet.RemoteEndPoint}; " +
+                                     $"inner={inner.Length}, fragments={fragments.Count}, outer-ESP=[{string.Join(',', outerLengths)}]";
+                        Console.WriteLine($"[VoWiFi SIP TX] {detail}");
+                        EventBus?.Publish(EventTopics.SystemLog, "VoWiFi", detail);
                     },
                     receiver: readCt => sipChannel.Reader.ReadAsync(readCt).AsTask(),
                     timeoutMs: 30000
@@ -779,20 +691,13 @@ public class VoWifiManager : IDisposable
                 _sipTransport.Connect(pcscfAddr, remotePort: 5060, localPort: imsProfile.LocalPort);
             }
 
-            // The DITO legacy ePDG path drops fragmented UDP/ESP traffic.  A full six-way
-            // Security-Client offer makes the first REGISTER exceed a typical access MTU;
-            // DITO's legacy profile uses the interoperable SHA-1/AES-CBC mechanism.
-            var compactLegacyImsOffer = string.Equals(
-                EpdgInfo?.MatchedCarrier, "DITO Philippines", StringComparison.OrdinalIgnoreCase);
             var session = new SipRegisterSession(_sipTransport, imsProfile, _imsIpsec?.Proposal,
                 _imsIpsec == null ? null : (agreement, ck, ik) =>
                 {
                     _imsIpsec.Activate(agreement, ck, ik);
                     _sipTransport.SetEndpoints(new IPEndPoint(IPAddress.Parse(AssignedIp!), agreement.Selected.PortClient),
                         new IPEndPoint(pcscfAddr, agreement.PcscfServerPort));
-                },
-                securityIntegrityAlgorithms: compactLegacyImsOffer ? new[] { "hmac-sha-1-96" } : null,
-                securityEncryptionAlgorithms: compactLegacyImsOffer ? new[] { "aes-cbc" } : null);
+                });
             _registerSession = session;
             async Task<(byte[] Res, byte[] Ck, byte[] Ik)> Authenticate(byte[] rand, byte[] autn, CancellationToken token)
             {
@@ -929,7 +834,13 @@ public class VoWifiManager : IDisposable
                 }
 
                 var (success, _, status) = await ProbeLivenessAsync(token).ConfigureAwait(false);
-                if (!success)
+                if (success)
+                {
+                    // Recovery is based on consecutive failures, not two unrelated failures over
+                    // the lifetime of the session.
+                    Interlocked.Exchange(ref _healthFailures, 0);
+                }
+                else
                 {
                     var failures = Interlocked.Increment(ref _healthFailures);
                     if (failures >= 2)
@@ -970,7 +881,7 @@ public class VoWifiManager : IDisposable
             RequestUri = $"sip:{ims.HomeDomain}"
         };
         var cseq = Interlocked.Increment(ref _sipCseq);
-        request.SetHeader("Via", $"SIP/2.0/UDP {local.Address}:{local.Port};branch=z9hG4bK{Guid.NewGuid():N};rport");
+        request.SetHeader("Via", $"SIP/2.0/UDP {ImsRegisterBuilder.FormatHost(local.Address.ToString())}:{local.Port};branch=z9hG4bK{Guid.NewGuid():N};rport");
         request.SetHeader("Max-Forwards", "70");
         request.SetHeader("From", $"<{ims.Impu}>;tag={Guid.NewGuid().ToString("N")[..8]}");
         request.SetHeader("To", $"<{ims.Impu}>");
@@ -979,7 +890,7 @@ public class VoWifiManager : IDisposable
         var privateUser = ims.Impi.StartsWith("sip:", StringComparison.OrdinalIgnoreCase)
             ? ims.Impi[4..].Split('@')[0]
             : ims.Impi.Split('@')[0];
-        request.SetHeader("Contact", $"<sip:{privateUser}@{local.Address}:{local.Port};transport=udp>");
+        request.SetHeader("Contact", $"<sip:{privateUser}@{ImsRegisterBuilder.FormatHost(local.Address.ToString())}:{local.Port};transport=udp>");
         request.SetHeader("Content-Length", "0");
 
         var response = await transport.SendAndReceiveFinalAsync(request, timeoutMs: 12000, ct: token).ConfigureAwait(false);
@@ -1007,6 +918,13 @@ public class VoWifiManager : IDisposable
     {
         if (Volatile.Read(ref _keepOnlineRequested) == 0 || _lastStartOptions == null)
             return;
+        if (IsNonRetryableEpdgRejection(reason))
+        {
+            LastError = reason;
+            EventBus?.Publish(EventTopics.SystemError, "VoWiFi",
+                reason + " Automatic retries are paused; retry manually after the network backoff or after correcting the SIM/APN authorization.");
+            return;
+        }
         if (Interlocked.Exchange(ref _recoveryQueued, 1) != 0)
             return;
 
@@ -1098,6 +1016,37 @@ public class VoWifiManager : IDisposable
         _ => TimeSpan.FromMinutes(5)
     };
 
+    private static bool IsNonRetryableEpdgRejection(string? reason) => reason != null &&
+        (reason.Contains("NON_3GPP_ACCESS_TO_EPC_NOT_ALLOWED", StringComparison.Ordinal) ||
+         reason.Contains("USER_UNKNOWN", StringComparison.Ordinal) ||
+         reason.Contains("NO_APN_SUBSCRIPTION", StringComparison.Ordinal) ||
+         reason.Contains("AUTHORIZATION_REJECTED", StringComparison.Ordinal) ||
+         reason.Contains("ILLEGAL_ME", StringComparison.Ordinal) ||
+         reason.Contains("RAT_TYPE_NOT_ALLOWED", StringComparison.Ordinal) ||
+         reason.Contains("IMEI_NOT_ACCEPTED", StringComparison.Ordinal) ||
+         reason.Contains("PLMN_NOT_ALLOWED", StringComparison.Ordinal) ||
+         reason.Contains("UNAUTHENTICATED_EMERGENCY_NOT_SUPPORTED", StringComparison.Ordinal));
+
+    /// <summary>
+    /// Records the first sighting of a non-UDP inner protocol. Only SIP (and RTP/RTCP) is UDP;
+    /// everything else on the S2b tunnel is operator control traffic that a real IPv6 stack would
+    /// consume without bothering the application.
+    /// </summary>
+    private void NoteIgnoredInnerProtocol(byte protocol)
+    {
+        if (!_ignoredInnerProtocols.TryAdd(protocol, 0)) return;
+        var name = protocol switch
+        {
+            1 => "ICMP",
+            6 => "TCP",
+            50 => "ESP",
+            58 => "ICMPv6",
+            _ => $"protocol {protocol}"
+        };
+        EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+            $"Ignoring non-UDP inner {name} traffic; only SIP/RTP is delivered to the IMS stack.");
+    }
+
     public async Task StopVoWifiAsync(CancellationToken ct = default)
     {
         Volatile.Write(ref _keepOnlineRequested, 0);
@@ -1138,28 +1087,6 @@ public class VoWifiManager : IDisposable
         _registerSession = null;
         SmsCapabilityConfirmed = false;
         _incomingSmsTransactions.Clear();
-        // ── Clean up native resources ───────────────────────────────────────
-        if (UseNativeBackend)
-        {
-            // Terminate IKE SA via VICI
-            if (_vici != null && _activeConnName != null)
-            {
-                try { await _vici.TerminateAsync(ikeName: _activeConnName, ct: ct).ConfigureAwait(false); }
-                catch { /* best-effort */ }
-                try { await _vici.UnloadConnectionAsync(_activeConnName, ct: ct).ConfigureAwait(false); }
-                catch { }
-            }
-            UseNativeBackend = false;
-        }
-
-        _vici?.Dispose();
-        _vici = null;
-
-        // Safe: CharonManager.Stop() only terminates the process we spawned ourselves, so a
-        // charon-svc installed as a Windows service is left alone. Leaving this commented out
-        // leaked a charon-svc.exe on every stop.
-        _charon?.Dispose();
-        _charon = null;
 
         _ctsEspDispatch?.Cancel();
         if (_espDispatchTask != null)
@@ -1169,6 +1096,7 @@ public class VoWifiManager : IDisposable
         }
         _espDispatchTask = null;
         _innerIpv4Reassembler.Clear();
+        _innerIpv6Reassembler.Clear();
         _ctsEspDispatch?.Dispose();
         _ctsEspDispatch = null;
         _imsIpsec?.Dispose();
@@ -1193,7 +1121,6 @@ public class VoWifiManager : IDisposable
         AssignedIp = null;
         TunnelInfo = null;
         ImsInfo = null;
-        _activeConnName = null;
         _sipProbesSent = 0;
         _sipProbesSuccess = 0;
         _sipProbesFailed = 0;
@@ -1214,7 +1141,7 @@ public class VoWifiManager : IDisposable
         var epdgInfo = EpdgInfo;
         return new VoWifiDiagnosticInfo(
             State: State,
-            Standard: UseNativeBackend ? "3GPP TS 24.302 (strongSwan Native)" : "3GPP TS 23.402 / TS 24.302 (Untrusted Non-3GPP Wi-Fi Access)",
+            Standard: "3GPP TS 23.402 / TS 24.302 (Untrusted Non-3GPP Wi-Fi Access)",
             MatchedCarrier: epdgInfo?.MatchedCarrier ?? "Generic 3GPP",
             EpdgFqdn: epdgInfo?.Fqdn ?? "N/A",
             EpdgIp: epdgInfo?.IpAddresses?.FirstOrDefault()?.ToString() ?? "N/A",
@@ -1248,11 +1175,6 @@ public class VoWifiManager : IDisposable
 
     public VoWifiDiagnosticInfo GetStatusInfo() => GetDiagnosticInfo();
 
-    public object? GetCharonDiagnosticInfo()
-    {
-        return _charon?.GetDiagnosticInfo();
-    }
-
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static IReadOnlyList<IkeProposalSuite> GetIkeSuiteAttempts(
@@ -1285,6 +1207,7 @@ public class VoWifiManager : IDisposable
         // safe to retry that timeout with another suite without consuming an AKA
         // vector or hiding an authentication failure.
         return message.Contains("no proposal", StringComparison.OrdinalIgnoreCase) ||
+               message.Contains("NO_PROPOSAL_CHOSEN", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("missing SA payload", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("invalid_ke", StringComparison.OrdinalIgnoreCase) ||
                message.Contains("invalid ke", StringComparison.OrdinalIgnoreCase) ||
@@ -1295,6 +1218,19 @@ public class VoWifiManager : IDisposable
                 (message.Contains("Message ID 0", StringComparison.OrdinalIgnoreCase) ||
                  message.Contains("IKE_SA_INIT", StringComparison.OrdinalIgnoreCase)));
     }
+
+    private static bool IsInitialIkeTimeout(string message) =>
+        message.Contains("timed out", StringComparison.OrdinalIgnoreCase) &&
+        (message.Contains("Message ID 0", StringComparison.OrdinalIgnoreCase) ||
+         message.Contains("IKE_SA_INIT", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsPreAkaRejection(string message) =>
+        message.Contains("EAP-AKA authentication rejected", StringComparison.OrdinalIgnoreCase) &&
+        message.Contains("before AKA challenge response", StringComparison.OrdinalIgnoreCase);
+
+    private static bool CanTryNextIdentity(string? message) => message != null &&
+        (message.Contains("ePDG DNS resolution returned no addresses", StringComparison.OrdinalIgnoreCase) ||
+         message.Contains("IKEv2 session failed", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Reads the device IMEI from the modem. IMS registration sends this in the instance ID,
@@ -1583,9 +1519,8 @@ public class VoWifiManager : IDisposable
 
         var smsc = EpdgInfo?.SmsCenter;
         if (string.IsNullOrWhiteSpace(smsc))
-        {
-            smsc = "+8613800100500";
-        }
+            throw new InvalidOperationException(
+                "The SIM did not provide an SMSC (AT+CSCA). Refusing to route IMS SMS to an unverified service centre.");
 
         var parts = SmsPdu.PrepareSubmitParts(recipient, text, requestStatusReport: requestStatusReport, smsc: smsc);
         var now = DateTime.UtcNow;
@@ -1681,6 +1616,7 @@ public class VoWifiManager : IDisposable
         _sessionCts?.Cancel();
         _ctsEspDispatch?.Cancel();
         _innerIpv4Reassembler.Clear();
+        _innerIpv6Reassembler.Clear();
         ClearRtpSessions();
         _registerSession?.Dispose();
         _imsIpsec?.Dispose();

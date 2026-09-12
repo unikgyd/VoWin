@@ -105,7 +105,11 @@ public static class SecurityAgreementBuilder
     /// Parses <c>Security-Server</c>, picks the highest-q mechanism we actually offered, and
     /// returns the value to echo in <c>Security-Verify</c>.
     /// </summary>
-    public static SecurityAgreement? ParseSecurityServer(string headerValue, SecurityProposal offered)
+    public static SecurityAgreement? ParseSecurityServer(
+        string headerValue,
+        SecurityProposal offered,
+        IReadOnlyList<string>? offeredIntegrityAlgorithms = null,
+        IReadOnlyList<string>? offeredEncryptionAlgorithms = null)
     {
         if (string.IsNullOrWhiteSpace(headerValue))
             return null;
@@ -115,6 +119,8 @@ public static class SecurityAgreementBuilder
             return null;
 
         var candidates = new List<(double Q, SecurityAgreement Agreement)>();
+        var allowedIntegrity = offeredIntegrityAlgorithms ?? DefaultIntegrityAlgorithms;
+        var allowedEncryption = offeredEncryptionAlgorithms ?? DefaultEncryptionAlgorithms;
 
         foreach (var item in items)
         {
@@ -132,11 +138,13 @@ public static class SecurityAgreementBuilder
                 continue;
 
             if (!TryGet(parameters, "alg", out var alg) ||
-                !Contains(DefaultIntegrityAlgorithms, alg))
+                !Contains(allowedIntegrity, alg))
                 continue;
             if (!TryGet(parameters, "ealg", out var ealg) ||
-                !Contains(DefaultEncryptionAlgorithms, ealg))
+                !Contains(allowedEncryption, ealg))
                 continue;
+            alg = alg.ToLowerInvariant();
+            ealg = ealg.ToLowerInvariant();
 
             if (!TryGetUint(parameters, "spi-c", out var pcscfClientSpi) ||
                 !TryGetUint(parameters, "spi-s", out var pcscfServerSpi) ||
@@ -320,7 +328,7 @@ public static class SecurityAgreementBuilder
                int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
     }
 
-    private static bool Contains(string[] set, string value) =>
+    private static bool Contains(IReadOnlyList<string> set, string value) =>
         set.Any(x => x.Equals(value, StringComparison.OrdinalIgnoreCase));
 
     private static byte[] Concat(byte[] first, byte[] second)

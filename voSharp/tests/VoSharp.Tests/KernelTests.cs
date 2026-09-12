@@ -65,9 +65,10 @@ public class KernelTests
         var sigRes = await kernel.ExecuteCommandAsync("signal");
         Assert.True(sigRes.Success);
 
-        // SIM identity
+        // Never fabricate a SIM identity when no modem is attached.
         var simRes = await kernel.ExecuteCommandAsync("sim");
-        Assert.True(simRes.Success);
+        Assert.False(simRes.Success);
+        Assert.Contains("No physical SIM", simRes.Message);
 
         // Reset
         var resetRes = await kernel.ExecuteCommandAsync("reset");

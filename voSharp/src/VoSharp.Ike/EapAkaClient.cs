@@ -279,8 +279,9 @@ public sealed class EapAkaClient
 
         var expectedMac = ComputeMac(keys.KAut, zeroed, isPrime);
         var actualMac = macAttr.Raw.AsSpan(4, 16);
-        Console.WriteLine($"[EapAkaClient] Server AT_MAC match: {CryptographicOperations.FixedTimeEquals(expectedMac, actualMac)}, Expected={Convert.ToHexString(expectedMac)}, Actual={Convert.ToHexString(actualMac)}");
-        if (!CryptographicOperations.FixedTimeEquals(expectedMac, actualMac))
+        var serverMacValid = CryptographicOperations.FixedTimeEquals(expectedMac, actualMac);
+        Console.WriteLine($"[EapAkaClient] Server AT_MAC valid={serverMacValid}");
+        if (!serverMacValid)
             throw new AuthenticationException("EAP-AKA server AT_MAC verification failed.");
 
         // Build Response: RES + optional RESULT_IND + AT_KDF (if prime) + AT_MAC

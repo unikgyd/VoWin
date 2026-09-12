@@ -784,7 +784,7 @@ namespace VoWin.ViewModels.Pages
             {
                 var fakeNode = ProxyNodeModel.FromUrl(targetSlot.ProxyUrl);
                 var rtt = await _kernelService.TestProxyConnectivityAsync(fakeNode);
-                targetSlot.LastTestResult = rtt > 0 ? $"{rtt} ms" : "超时/不可达";
+                targetSlot.LastTestResult = rtt > 0 ? $"{rtt} ms" : fakeNode.Status;
                 StatusMessage = $"卡槽 [{targetSlot.Name}] 代理测试完成: {targetSlot.LastTestResult}";
             }
             catch (Exception ex)
@@ -812,7 +812,7 @@ namespace VoWin.ViewModels.Pages
                 int ms = await _kernelService.TestProxyConnectivityAsync(p);
                 StatusMessage = ms >= 0
                     ? $"代理 [{p.Name}] 连通正常，握手延迟: {ms} ms。"
-                    : $"代理 [{p.Name}] 连接超时或失败。";
+                    : $"代理 [{p.Name}] 检测未通过：{p.Status}";
                 UpdateSummaries();
             }
             catch (Exception ex)

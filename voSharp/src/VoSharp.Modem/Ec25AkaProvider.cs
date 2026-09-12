@@ -91,9 +91,10 @@ public sealed class Ec25AkaProvider : IAkaProvider
             return AkaResult.Failed("Modem returned no APDU response for USIM AUTHENTICATE.");
         }
 
-        Console.WriteLine($"[Ec25AkaProvider] APDU Response: {Convert.ToHexString(response)}");
+        // Never log the raw AUTHENTICATE APDU response: a successful response contains RES, CK
+        // and IK, and a synchronization response contains AUTS. Only status and lengths are safe.
         var parsed = HardwareAka.ParseAuthenticateResponse(response).ToAkaResult();
-        Console.WriteLine($"[Ec25AkaProvider] Parsed Result: Success={parsed.Success}, SyncFail={parsed.SynchronizationFailure}, Err={parsed.ErrorMessage}");
+        Console.WriteLine($"[Ec25AkaProvider] USIM AUTHENTICATE completed: bytes={response.Length}, Success={parsed.Success}, SyncFail={parsed.SynchronizationFailure}, Err={parsed.ErrorMessage}");
         return parsed;
     }
 

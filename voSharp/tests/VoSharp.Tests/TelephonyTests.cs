@@ -1,7 +1,6 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
 using VoSharp.Common.Events;
-using VoSharp.Native.Interop;
 using VoSharp.Sim;
 using VoSharp.Telephony.Audio;
 using VoSharp.Telephony.Calls;
@@ -162,29 +161,23 @@ public class TelephonyTests
     [Fact]
     public void TestVoWifi_EpdgResolver_BuildsStandardDomain()
     {
-        var fqdn = EpdgResolver.BuildEpdgDomain("515", "05");
-        Assert.Equal("epdg.epc.mnc005.mcc515.pub.3gppnetwork.org", fqdn);
+        var fqdn = EpdgResolver.BuildEpdgDomain("999", "12");
+        Assert.Equal("epdg.epc.mnc012.mcc999.pub.3gppnetwork.org", fqdn);
 
-        var imsDomain = EpdgResolver.BuildImsDomain("515", "05");
-        Assert.Equal("ims.mnc005.mcc515.3gppnetwork.org", imsDomain);
+        var imsDomain = EpdgResolver.BuildImsDomain("999", "12");
+        Assert.Equal("ims.mnc012.mcc999.3gppnetwork.org", imsDomain);
     }
 
     [Fact]
-    public async Task TestVoWifi_CarrierProfileDatabase_AutoMatchesDitoAndCtexcel()
+    public void TestVoWifi_HomePlmnUsesAuthoritativeEfAdMncLength()
     {
-        // 1. DITO Philippines matching
-        var ditoSim = SimIdentity.FromImsiAndIccid("515661042965283", "89636626000114868473", "DITO");
-        var ditoRes = await EpdgResolver.ResolveAsync(ditoSim.Imsi, null, ditoSim.Iccid, ditoSim.OperatorName);
-        Assert.Equal("DITO Philippines", ditoRes.MatchedCarrier);
-        Assert.Equal("epdg.epc.mnc066.mcc515.pub.3gppnetwork.org", ditoRes.Fqdn);
-        Assert.Equal(IkeProposalSuite.Legacy, ditoRes.PreferredSuite);
-        Assert.Equal("ims", ditoRes.Apn);
+        var twoDigit = SimIdentity.FromImsiAndIccid("999121234567890", "8900000000000000000", mncLength: 2);
+        var threeDigit = SimIdentity.FromImsiAndIccid("999123123456789", "8900000000000000001", mncLength: 3);
 
-        // 2. CTExcel UK matching
-        var ctexcelSim = SimIdentity.FromImsiAndIccid("234320000000001", "8944305293607018294", "CTExcel");
-        var ctexcelRes = await EpdgResolver.ResolveAsync(ctexcelSim.Imsi, null, ctexcelSim.Iccid, ctexcelSim.OperatorName);
-        Assert.Equal("CTExcel UK", ctexcelRes.MatchedCarrier);
-        Assert.Equal("epdg.epc.mnc030.mcc234.pub.3gppnetwork.org", ctexcelRes.Fqdn);
+        Assert.Equal(new[] { ("999", "12") }, EpdgResolver.BuildHomePlmnCandidates(twoDigit));
+        Assert.Equal(new[] { ("999", "123") }, EpdgResolver.BuildHomePlmnCandidates(threeDigit));
+        Assert.True(twoDigit.IsHomePlmnAuthoritative);
+        Assert.True(threeDigit.IsHomePlmnAuthoritative);
     }
 
     [Fact]
@@ -249,16 +242,60 @@ public class TelephonyTests
     }
 
     [Fact]
-    public void TestCarrierProfile_ScoringPriority_SpnOverPlmn()
+    public void TestVoWifi_HomePlmnFallsBackToBothLegalMncLengthsWithoutEfAd()
     {
-        // EE and CTExcel share PLMN 23430
-        var eeMatch = CarrierProfileDatabase.FindProfile("234300000000000", opName: "EE");
-        Assert.NotNull(eeMatch);
-        Assert.Equal("ee-uk", eeMatch.Id);
+        var sim = SimIdentity.FromImsiAndIccid(
+            "999123123456789",
+            "8900000000000000000",
+            "Live SPN");
 
-        var ctexcelMatch = CarrierProfileDatabase.FindProfile("234300000000000", opName: "CTExcel");
-        Assert.NotNull(ctexcelMatch);
-        Assert.Equal("ctexcel-uk", ctexcelMatch.Id);
+        Assert.Equal(
+            new[] { ("999", "12"), ("999", "123") },
+            EpdgResolver.BuildHomePlmnCandidates(sim));
+        Assert.False(sim.IsHomePlmnAuthoritative);
+        Assert.Equal("Live SPN", sim.OperatorName);
+    }
+
+    [Fact]
+    public void TestVoWifi_CardHomePlmnListTakesPriorityWithoutCarrierData()
+    {
+        var sim = SimIdentity.FromImsiAndIccid(
+            "999123123456789",
+            "8900000000000000000",
+            "Live SPN",
+            mncLength: 3,
+            homePlmns: new[] { "00101", "999123" });
+
+        Assert.Equal(
+            new[] { ("999", "123") },
+            EpdgResolver.BuildHomePlmnCandidates(sim));
+    }
+
+    [Fact]
+    public void TestVoWifi_IdentityHistoryLearnsPerIccidWithoutCarrierTable()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"vowifi-identities-{Guid.NewGuid():N}.json");
+        try
+        {
+            var store = new SimIdentityHistoryStore(path);
+            var earlier = SimIdentity.FromImsiAndIccid(
+                "999123123456789", "8900000000000000000", "Live SPN", mncLength: 3);
+            var current = SimIdentity.FromImsiAndIccid(
+                "001011234567890", "8900000000000000000", "Live SPN", mncLength: 2);
+            store.MarkSuccessful(earlier);
+            store.Observe(current);
+
+            var reloaded = new SimIdentityHistoryStore(path).GetCandidates(current);
+
+            Assert.Equal(earlier.Imsi, reloaded[0].Imsi);
+            Assert.Contains(reloaded, candidate => candidate.Imsi == current.Imsi);
+            Assert.DoesNotContain(current.Iccid, File.ReadAllText(path), StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+            if (File.Exists(path + ".tmp")) File.Delete(path + ".tmp");
+        }
     }
 
     [Fact]

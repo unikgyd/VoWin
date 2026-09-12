@@ -1,5 +1,6 @@
 using System.Net;
-using System.Text.RegularExpressions;
+using System.Net.Sockets;
+using VoSharp.Sim;
 
 namespace VoSharp.Telephony.VoWifi;
 
@@ -12,109 +13,151 @@ public record EpdgResolutionResult(
     string? MatchedCarrier = null,
     IkeProposalSuite PreferredSuite = IkeProposalSuite.Standard,
     string? Apn = null,
-    string? SmsCenter = null
+    string? SmsCenter = null,
+    string HomeMcc = "",
+    string HomeMnc = ""
 );
 
+/// <summary>
+/// Standards-based ePDG discovery. All network identities are derived from the
+/// active USIM; no ICCID, SPN, operator, gateway, or algorithm table is used.
+/// </summary>
 public static class EpdgResolver
 {
+    public static string BuildEpdgDomain(string mcc, string mnc) =>
+        $"epdg.epc.mnc{NormalizeMnc(mnc)}.mcc{NormalizeMcc(mcc)}.pub.3gppnetwork.org";
+
+    public static string BuildImsDomain(string mcc, string mnc) =>
+        $"ims.mnc{NormalizeMnc(mnc)}.mcc{NormalizeMcc(mcc)}.3gppnetwork.org";
+
     /// <summary>
-    /// Constructs 3GPP standard ePDG FQDN and IMS identities from IMSI.
-    /// Standard 3GPP TS 23.003 format: epdg.epc.mnc<MNC3>.mcc<MCC3>.pub.3gppnetwork.org
+    /// Returns USIM-derived home-PLMN candidates. EF_AD makes the first and only
+    /// candidate authoritative. If EF_AD was unavailable, both legal IMSI MNC
+    /// lengths are returned and DNS decides which standard ePDG exists.
     /// </summary>
-    public static string BuildEpdgDomain(string mcc, string mnc)
+    public static IReadOnlyList<(string Mcc, string Mnc)> BuildHomePlmnCandidates(SimIdentity sim)
     {
-        var mncPadded = mnc.Length == 2 ? $"0{mnc}" : mnc;
-        var mccPadded = mcc.Length == 2 ? $"0{mcc}" : mcc;
-        return $"epdg.epc.mnc{mncPadded}.mcc{mccPadded}.pub.3gppnetwork.org";
+        ArgumentNullException.ThrowIfNull(sim);
+        var imsi = new string((sim.Imsi ?? string.Empty).Where(char.IsAsciiDigit).ToArray());
+        if (imsi.Length is < 5 or > 16)
+            throw new ArgumentException("Invalid IMSI length for VoWiFi home-PLMN discovery.", nameof(sim));
+
+        var mcc = imsi[..3];
+        var candidates = new List<(string Mcc, string Mnc)>();
+
+        foreach (var plmn in sim.HomePlmns ?? Array.Empty<string>())
+        {
+            if (plmn.Length is 5 or 6 && plmn.All(char.IsAsciiDigit) &&
+                imsi.StartsWith(plmn, StringComparison.Ordinal))
+                AddCandidate(plmn[..3], plmn[3..]);
+        }
+
+        if (sim.Mnc.Length is 2 or 3 && imsi.StartsWith(mcc + sim.Mnc, StringComparison.Ordinal))
+            AddCandidate(mcc, sim.Mnc);
+
+        if (sim.IsHomePlmnAuthoritative && candidates.Count > 0)
+        {
+            return candidates;
+        }
+
+        AddCandidate(mcc, imsi.Substring(3, 2));
+        if (imsi.Length >= 6)
+            AddCandidate(mcc, imsi.Substring(3, 3));
+        return candidates;
+
+        void AddCandidate(string candidateMcc, string candidateMnc)
+        {
+            if (!candidates.Any(candidate => candidate.Mcc == candidateMcc && candidate.Mnc == candidateMnc))
+                candidates.Add((candidateMcc, candidateMnc));
+        }
     }
 
-    public static string BuildImsDomain(string mcc, string mnc)
-    {
-        var mncPadded = mnc.Length == 2 ? $"0{mnc}" : mnc;
-        var mccPadded = mcc.Length == 2 ? $"0{mcc}" : mcc;
-        return $"ims.mnc{mncPadded}.mcc{mccPadded}.3gppnetwork.org";
-    }
+    public static (string Mcc, string Mnc) ResolveHomePlmn(SimIdentity sim) =>
+        BuildHomePlmnCandidates(sim)[0];
 
     public static async Task<EpdgResolutionResult> ResolveAsync(
-        string imsi,
+        SimIdentity sim,
         string? customEpdg = null,
-        string? iccid = null,
-        string? opName = null,
         CancellationToken ct = default)
     {
-        var cleanImsi = Regex.Replace(imsi, @"\D", "");
-        if (cleanImsi.Length < 5)
-            throw new ArgumentException("Invalid IMSI length for VoWiFi ePDG resolution", nameof(imsi));
-
-        var mcc = cleanImsi[..3];
-        // Standard 2-digit vs 3-digit MNC partition (North American Plan uses 3-digit MNC)
-        var mnc = cleanImsi.Length >= 6 && (mcc is "302" or "310" or "311" or "312" or "313" or "314" or "315" or "316" or "334") 
-            ? cleanImsi.Substring(3, 3) 
-            : cleanImsi.Substring(3, 2);
-
-        // 1. Query global carrier profile database for optimal carrier matching
-        var matchedProfile = CarrierProfileDatabase.FindProfile(cleanImsi, iccid, opName);
-
-        string fqdn;
-        IkeProposalSuite preferredSuite;
-        string? apn;
-        string? smsCenter;
-        string? carrierName = matchedProfile?.Name;
+        ArgumentNullException.ThrowIfNull(sim);
+        var cleanImsi = new string(sim.Imsi.Where(char.IsAsciiDigit).ToArray());
+        var candidates = BuildHomePlmnCandidates(sim);
+        var selected = candidates[0];
+        var fqdn = string.IsNullOrWhiteSpace(customEpdg)
+            ? BuildEpdgDomain(selected.Mcc, selected.Mnc)
+            : customEpdg.Trim();
+        var addresses = Array.Empty<IPAddress>();
 
         if (!string.IsNullOrWhiteSpace(customEpdg))
         {
-            fqdn = customEpdg.Trim();
-            preferredSuite = matchedProfile?.PreferredSuite ?? IkeProposalSuite.Standard;
-            apn = matchedProfile?.Apn ?? "ims";
-            smsCenter = matchedProfile?.SmsCenter;
-        }
-        else if (matchedProfile != null)
-        {
-            fqdn = matchedProfile.EpdgHostname;
-            preferredSuite = matchedProfile.PreferredSuite;
-            apn = matchedProfile.Apn;
-            smsCenter = matchedProfile.SmsCenter;
+            addresses = await ResolveAddressesAsync(fqdn, ct).ConfigureAwait(false);
         }
         else
         {
-            fqdn = BuildEpdgDomain(mcc, mnc);
-            preferredSuite = IkeProposalSuite.Standard;
-            apn = "ims";
-            smsCenter = null;
-        }
-
-        var imsDomain = BuildImsDomain(mcc, mnc);
-        var impi = $"{cleanImsi}@{imsDomain}";
-        var impu = $"sip:{cleanImsi}@{imsDomain}";
-
-        IPAddress[] addrs = Array.Empty<IPAddress>();
-        try
-        {
-            addrs = await Dns.GetHostAddressesAsync(fqdn, ct).ConfigureAwait(false);
-        }
-        catch
-        {
-        }
-
-        // If DNS failed or returned dummy loopback (e.g. DNS pollution/NXDOMAIN), fallback to verified carrier ePDG gateway IPs
-        if (addrs.Length == 0 || addrs.All(IPAddress.IsLoopback))
-        {
-            if (matchedProfile?.KnownEpdgIps != null && matchedProfile.KnownEpdgIps.Length > 0)
+            foreach (var candidate in candidates)
             {
-                addrs = matchedProfile.KnownEpdgIps.Select(IPAddress.Parse).ToArray();
+                ct.ThrowIfCancellationRequested();
+                var candidateFqdn = BuildEpdgDomain(candidate.Mcc, candidate.Mnc);
+                var candidateAddresses = await ResolveAddressesAsync(candidateFqdn, ct).ConfigureAwait(false);
+                if (candidateAddresses.Length == 0)
+                    continue;
+
+                selected = candidate;
+                fqdn = candidateFqdn;
+                addresses = candidateAddresses;
+                break;
             }
         }
 
+        var imsDomain = BuildImsDomain(selected.Mcc, selected.Mnc);
+        var impi = $"{cleanImsi}@{imsDomain}";
         return new EpdgResolutionResult(
             Fqdn: fqdn,
             ImsDomain: imsDomain,
             Impi: impi,
-            Impu: impu,
-            IpAddresses: addrs,
-            MatchedCarrier: carrierName,
-            PreferredSuite: preferredSuite,
-            Apn: apn,
-            SmsCenter: smsCenter
-        );
+            Impu: $"sip:{impi}",
+            IpAddresses: addresses,
+            MatchedCarrier: string.IsNullOrWhiteSpace(sim.OperatorName) ? null : sim.OperatorName.Trim(),
+            PreferredSuite: IkeProposalSuite.Standard,
+            Apn: "ims",
+            SmsCenter: null,
+            HomeMcc: selected.Mcc,
+            HomeMnc: selected.Mnc);
+    }
+
+    private static async Task<IPAddress[]> ResolveAddressesAsync(string host, CancellationToken ct)
+    {
+        try
+        {
+            var addresses = await Dns.GetHostAddressesAsync(host, ct).ConfigureAwait(false);
+            return addresses
+                .Where(address => !IPAddress.IsLoopback(address) && !address.Equals(IPAddress.Any) &&
+                                  !address.Equals(IPAddress.IPv6Any))
+                .Distinct()
+                .ToArray();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (SocketException)
+        {
+            return Array.Empty<IPAddress>();
+        }
+    }
+
+    private static string NormalizeMcc(string mcc)
+    {
+        if (string.IsNullOrWhiteSpace(mcc) || mcc.Length is < 2 or > 3 || !mcc.All(char.IsAsciiDigit))
+            throw new ArgumentException("MCC must contain two or three digits.", nameof(mcc));
+        return mcc.PadLeft(3, '0');
+    }
+
+    private static string NormalizeMnc(string mnc)
+    {
+        if (string.IsNullOrWhiteSpace(mnc) || mnc.Length is < 2 or > 3 || !mnc.All(char.IsAsciiDigit))
+            throw new ArgumentException("MNC must contain two or three digits.", nameof(mnc));
+        return mnc.PadLeft(3, '0');
     }
 }

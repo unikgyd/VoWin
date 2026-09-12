@@ -35,6 +35,7 @@ public sealed class CSharpIkeBackend : IIkeBackend
         string? fallbackPcscf = null,
         IkeProposalSuite suite = IkeProposalSuite.Auto,
         string? proxyUrl = null,
+        string? imei = null,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(sim);
@@ -53,33 +54,91 @@ public sealed class CSharpIkeBackend : IIkeBackend
                 nameof(proxyUrl));
         }
 
-        // Map proposal suite
-        var ikeSuite = suite switch
+        var homePlmn = EpdgResolver.ResolveHomePlmn(sim);
+
+        var legacyIkeSuite = new IkeSuite(
+            IkeEncryptionId.AesCbc, 128, IkePrfId.HmacSha1,
+            IkeIntegrityId.HmacSha1_96, IkeDhGroupId.Modp1024);
+        var configuredIkeSuite = suite switch
         {
-            IkeProposalSuite.Legacy => new IkeSuite(
-                IkeEncryptionId.AesCbc, 128, IkePrfId.HmacSha1, IkeIntegrityId.HmacSha1_96, IkeDhGroupId.Modp1024),
+            IkeProposalSuite.Legacy => legacyIkeSuite,
             IkeProposalSuite.Modern => new IkeSuite(
                 IkeEncryptionId.AesCbc, 256, IkePrfId.HmacSha2_256, IkeIntegrityId.HmacSha2_256_128, IkeDhGroupId.Ecp256),
             _ => IkeSuite.Preferred
         };
 
-        var childSuite = EspSuite.Preferred;
+        // Offer a broad standards-compatible proposal set. A single KE can serve
+        // all four proposals because every proposal in this request uses MODP-2048.
+        IReadOnlyList<IkeSuite> ikeSuites = suite is IkeProposalSuite.Legacy or IkeProposalSuite.Modern
+            ? new[] { configuredIkeSuite }
+            : new[]
+            {
+                IkeSuite.Preferred,
+                new IkeSuite(IkeEncryptionId.AesCbc, 128, IkePrfId.HmacSha2_256,
+                    IkeIntegrityId.HmacSha2_256_128, IkeDhGroupId.Modp2048),
+                new IkeSuite(IkeEncryptionId.AesCbc, 256, IkePrfId.HmacSha1,
+                    IkeIntegrityId.HmacSha1_96, IkeDhGroupId.Modp2048),
+                new IkeSuite(IkeEncryptionId.AesCbc, 128, IkePrfId.HmacSha1,
+                    IkeIntegrityId.HmacSha1_96, IkeDhGroupId.Modp2048)
+            };
+        IReadOnlyList<EspSuite> childSuites = new[]
+        {
+            new EspSuite(IkeEncryptionId.AesCbc, 128, IkeIntegrityId.HmacSha1_96),
+            new EspSuite(IkeEncryptionId.AesCbc, 256, IkeIntegrityId.HmacSha2_256_128),
+            new EspSuite(IkeEncryptionId.AesCbc, 128, IkeIntegrityId.HmacSha2_256_128),
+            new EspSuite(IkeEncryptionId.AesCbc, 256, IkeIntegrityId.HmacSha1_96)
+        };
 
-        var request = new IkeSessionRequest(
-            EpdgIp: remoteIp,
-            AkaProvider: akaProvider,
-            Imsi: sim.Imsi,
-            HomeMcc: sim.Mcc,
-            HomeMnc: sim.Mnc,
-            ExpectedIccid: sim.Iccid,
-            Apn: apn,
-            FallbackPcscf: fallbackPcscf,
-            Suite: ikeSuite,
-            ChildSuite: childSuite,
-            ProxyUrl: proxyUrl
-        );
+        IkeSessionResult? result = null;
+        var familyErrors = new List<string>();
+        foreach (var addressFamily in new[]
+                 {
+                     IkeAddressFamilyMode.Ipv6,
+                     IkeAddressFamilyMode.Dual,
+                     IkeAddressFamilyMode.Ipv4
+                 })
+        {
+            result = await IkeSession.EstablishAsync(new IkeSessionRequest(
+                EpdgIp: remoteIp,
+                AkaProvider: akaProvider,
+                Imsi: sim.Imsi,
+                HomeMcc: homePlmn.Mcc,
+                HomeMnc: homePlmn.Mnc,
+                ExpectedIccid: sim.Iccid,
+                Apn: apn,
+                Imei: imei,
+                FallbackPcscf: fallbackPcscf,
+                Suite: configuredIkeSuite,
+                ChildSuite: EspSuite.Preferred,
+                ProxyUrl: proxyUrl,
+                Suites: ikeSuites,
+                ChildSuites: childSuites,
+                AddressFamilyMode: addressFamily), ct).ConfigureAwait(false);
 
-        var result = await IkeSession.EstablishAsync(request, ct).ConfigureAwait(false);
+            // An ePDG that answers a dual-family CFG_REQUEST with a mismatched pair (an IPv6
+            // address but an IPv4 P-CSCF) succeeds at IKE_AUTH yet leaves a tunnel that cannot
+            // carry IMS signalling, so this rung is not a usable PDN — keep searching, as the
+            // reference engine does when a family yields no usable P-CSCF.
+            var usablePdn = result.Success &&
+                            !string.IsNullOrEmpty(result.AssignedIp) &&
+                            !string.IsNullOrEmpty(result.PcscfIp) &&
+                            IkeSession.IsUsablePdn(result.AssignedIp, result.PcscfIp);
+            if (usablePdn)
+                break;
+
+            familyErrors.Add(result.Success && !string.IsNullOrEmpty(result.AssignedIp)
+                ? $"{addressFamily}: ePDG assigned {result.AssignedIp} but returned P-CSCF {result.PcscfIp} (address families differ)"
+                : $"{addressFamily}: {result.ErrorMessage ?? "no usable assigned IP/P-CSCF"}");
+            result.Transport?.Dispose();
+
+            // As in the reference engine, only change CP/TS family after the
+            // SIM has authenticated. Earlier rejection is identity/AAA, not PDN family.
+            if (!result.EapSucceeded)
+                break;
+        }
+
+        if (result == null)
+            throw new InvalidOperationException("IKE address-family discovery did not run.");
         if (!result.Success || result.AssignedIp == null || result.PcscfIp == null)
         {
             return new IkeBackendResult(
@@ -89,7 +148,9 @@ public sealed class CSharpIkeBackend : IIkeBackend
                 DnsIps: Array.Empty<string>(),
                 InboundSpi: 0,
                 OutboundSpi: 0,
-                ErrorMessage: result.ErrorMessage ?? "IKE session establishment failed."
+                ErrorMessage: familyErrors.Count > 0
+                    ? string.Join(" | ", familyErrors)
+                    : result.ErrorMessage ?? "IKE session establishment failed."
             );
         }
 

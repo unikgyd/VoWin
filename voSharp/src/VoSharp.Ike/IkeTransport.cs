@@ -47,20 +47,26 @@ public sealed class IkeTransport : IDisposable
     private void InitSocket(int bindPort)
     {
         _socket?.Dispose();
-        _socket = new Socket(_remoteIp.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        _socket = null;
 
         if (_socks5Client != null)
         {
             try
             {
                 _socks5RelayEndpoint = _socks5Client.UdpAssociateAsync().GetAwaiter().GetResult();
-                _socket.Bind(new IPEndPoint(_remoteIp.AddressFamily == AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0));
+                // The UDP socket talks to the SOCKS relay, not directly to the ePDG. Its address
+                // family therefore follows the relay endpoint; an IPv4 proxy can carry an IPv6
+                // ePDG target inside the RFC 1928 datagram header and vice versa.
+                _socket = new Socket(_socks5RelayEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+                var any = _socks5RelayEndpoint.AddressFamily == AddressFamily.InterNetwork
+                    ? IPAddress.Any : IPAddress.IPv6Any;
+                _socket.Bind(new IPEndPoint(any, 0));
                 _socket.Connect(_socks5RelayEndpoint);
                 return;
             }
             catch (Exception ex)
             {
-                _socket.Dispose();
+                _socket?.Dispose();
                 _socket = null;
                 throw new InvalidOperationException(
                     $"SOCKS5 UDP ASSOCIATE failed for {_socks5Client.ProxyHost}:{_socks5Client.ProxyPort}. " +
@@ -68,6 +74,7 @@ public sealed class IkeTransport : IDisposable
             }
         }
 
+        _socket = new Socket(_remoteIp.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
         if (bindPort > 0)
         {
             try

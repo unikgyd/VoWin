@@ -1,10 +1,13 @@
+using System.Buffers.Binary;
 using System.Collections.ObjectModel;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Ports;
+using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using System.Windows.Threading;
@@ -1424,29 +1427,72 @@ namespace VoWin.Services
         public async Task<int> TestProxyConnectivityAsync(ProxyNodeModel node, string targetHost = "8.8.8.8", int targetPort = 53)
         {
             var sw = Stopwatch.StartNew();
-            node.Status = "正在验证 SOCKS5 UDP...";
+            node.Status = "正在验证 SOCKS5 公网 UDP 收发...";
+            IPEndPoint? relay = null;
 
             try
             {
                 using var proxy = Socks5Client.TryParse(node.ToProxyUrl())
                     ?? throw new InvalidOperationException("VoWiFi 需要 socks5:// 或 socks5h:// 代理；HTTP 代理不支持 IKEv2/ESP UDP。");
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                var relay = await proxy.UdpAssociateAsync(cts.Token);
+                relay = await proxy.UdpAssociateAsync(cts.Token);
+
+                var targetIp = IPAddress.TryParse(targetHost, out var parsedTarget)
+                    ? parsedTarget
+                    : (await Dns.GetHostAddressesAsync(targetHost, cts.Token).ConfigureAwait(false))
+                        .FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetwork)
+                        ?? throw new InvalidOperationException($"无法解析 UDP 探测目标 {targetHost}。");
+
+                var transactionId = (ushort)Random.Shared.Next(1, ushort.MaxValue + 1);
+                var dnsQuery = BuildDnsHealthQuery(transactionId);
+                var dnsResponse = await proxy.UdpRoundTripAsync(
+                    dnsQuery,
+                    new IPEndPoint(targetIp, targetPort),
+                    cts.Token).ConfigureAwait(false);
+                if (dnsResponse.Length < 12 ||
+                    BinaryPrimitives.ReadUInt16BigEndian(dnsResponse.AsSpan(0, 2)) != transactionId ||
+                    (dnsResponse[2] & 0x80) == 0)
+                {
+                    throw new InvalidOperationException("SOCKS5 公网 UDP 返回了无效的 DNS 响应。");
+                }
+
                 sw.Stop();
                 int ms = (int)sw.ElapsedMilliseconds;
                 node.LatencyMs = ms;
-                node.Status = $"SOCKS5 UDP 就绪 ({ms}ms)";
-                AddLog("INFO", "Proxy", $"SOCKS5 UDP ASSOCIATE ready for {node.Name} ({node.Host}:{node.Port}); relay {relay} in {ms}ms");
+                node.Status = $"SOCKS5 公网 UDP 正常 ({ms}ms)";
+                AddLog("INFO", "Proxy",
+                    $"SOCKS5 UDP data plane healthy for {node.Name} ({node.Host}:{node.Port}); relay {relay}, DNS {targetIp}:{targetPort}, RTT {ms}ms");
                 return ms;
             }
             catch (Exception ex)
             {
                 sw.Stop();
                 node.LatencyMs = -1;
-                node.Status = $"SOCKS5 UDP 不可用: {ex.Message}";
-                AddLog("WARN", "Proxy", $"SOCKS5 UDP ASSOCIATE failed for {node.Name} ({node.Host}:{node.Port}): {ex.Message}");
+                node.Status = relay == null
+                    ? $"SOCKS5 UDP 关联失败: {ex.Message}"
+                    : $"SOCKS5 UDP 已关联，但公网 DNS 探测无响应: {ex.Message}";
+                AddLog("WARN", "Proxy",
+                    $"SOCKS5 UDP health check failed for {node.Name} ({node.Host}:{node.Port}); " +
+                    $"relay={(relay == null ? "not established" : relay)}, error={ex.Message}");
                 return -1;
             }
+        }
+
+        private static byte[] BuildDnsHealthQuery(ushort transactionId)
+        {
+            // Minimal recursive A query for example.com.
+            var query = new byte[29];
+            BinaryPrimitives.WriteUInt16BigEndian(query.AsSpan(0, 2), transactionId);
+            BinaryPrimitives.WriteUInt16BigEndian(query.AsSpan(2, 2), 0x0100);
+            BinaryPrimitives.WriteUInt16BigEndian(query.AsSpan(4, 2), 1);
+            query[12] = 7;
+            Encoding.ASCII.GetBytes("example").CopyTo(query, 13);
+            query[20] = 3;
+            Encoding.ASCII.GetBytes("com").CopyTo(query, 21);
+            query[24] = 0;
+            BinaryPrimitives.WriteUInt16BigEndian(query.AsSpan(25, 2), 1);
+            BinaryPrimitives.WriteUInt16BigEndian(query.AsSpan(27, 2), 1);
+            return query;
         }
 
         public void AddProxyPreset(ProxyNodeModel node)
@@ -1641,7 +1687,10 @@ namespace VoWin.Services
                 // A SIM preference follows the card and overrides the module
                 // default. Restore RF state before starting any background work
                 // that could report cellular registration or signal state.
-                bool? preferredFlightMode = simPref?.DefaultFlightMode ?? modPref?.DefaultFlightMode;
+                // Radio/data/VoWiFi switches belong to the SIM, never to the
+                // physical slot.  A SIM without a saved record starts with all
+                // switches off so moving it to another modem is predictable.
+                bool? preferredFlightMode = simPref?.DefaultFlightMode ?? false;
                 if (preferredFlightMode.HasValue && slot.IsFlightMode != preferredFlightMode.Value)
                 {
                     try
@@ -1666,7 +1715,7 @@ namespace VoWin.Services
 
                 if (!slot.IsFlightMode)
                 {
-                    bool? preferredRoaming = simPref?.DefaultDataRoaming ?? modPref?.DefaultDataRoaming;
+                    bool? preferredRoaming = simPref?.DefaultDataRoaming ?? false;
                     if (preferredRoaming.HasValue)
                     {
                         try
@@ -1682,7 +1731,7 @@ namespace VoWin.Services
                         }
                     }
 
-                    bool? preferredCellularData = simPref?.DefaultCellularData ?? modPref?.DefaultCellularData;
+                    bool? preferredCellularData = simPref?.DefaultCellularData ?? false;
                     if (preferredCellularData.HasValue)
                     {
                         try
@@ -1704,7 +1753,7 @@ namespace VoWin.Services
 
                 if (restoreAutoVoWifi)
                 {
-                    var autoVoWifi = simPref?.DefaultVoWifi ?? modPref?.DefaultVoWifi ?? false;
+                    var autoVoWifi = simPref?.DefaultVoWifi ?? false;
                     if (autoVoWifi)
                     {
                         QueueAutoVoWifiStart(slot);
@@ -1733,7 +1782,6 @@ namespace VoWin.Services
 
         private void ApplyVoWifiHomeIdentity(ModemSlot slot, SimPreferenceModel? simPref)
         {
-            slot.VoWifiIdentityOverride = null;
             var reported = slot.Sim;
             var savedImsi = simPref?.Imsi?.Trim();
             if (reported == null || string.IsNullOrWhiteSpace(savedImsi) ||
@@ -1742,17 +1790,19 @@ namespace VoWin.Services
                 return;
             }
 
-            // Do not treat arbitrary saved data as an authentication identity.
-            // It must be a valid permanent IMSI for the carrier profile that
-            // also matches the inserted SIM's ICCID.
+            // The preference record is selected by the live ICCID. Preserve a
+            // previously observed permanent IMSI for a multi-IMSI profile without
+            // consulting a bundled carrier/ICCID table.
             if (savedImsi.Length is < 5 or > 16 || !savedImsi.All(char.IsAsciiDigit))
                 return;
-            var homeProfile = CarrierProfileDatabase.FindProfile(savedImsi, reported.Iccid, null);
-            var homePlmn = savedImsi[..5];
-            if (homeProfile == null || !homeProfile.HomePlmns.Contains(homePlmn, StringComparer.Ordinal))
-                return;
-
-            slot.VoWifiIdentityOverride = SimIdentity.FromImsiAndIccid(savedImsi, reported.Iccid, homeProfile.Name);
+            var learnedIdentity = SimIdentity.FromImsiAndIccid(
+                savedImsi,
+                reported.Iccid,
+                reported.OperatorName,
+                reported.PhoneNumber,
+                reported.IsHomePlmnAuthoritative ? reported.Mnc.Length : null,
+                reported.HomePlmns);
+            slot.RememberVoWifiIdentity(learnedIdentity);
             AddLog("INFO", "VoWiFi", $"检测到临时 IMSI，已为卡槽 [{slot.Name}] 恢复已验证的归属网络 EAP-AKA 身份。");
         }
 

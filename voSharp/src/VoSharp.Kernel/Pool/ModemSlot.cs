@@ -32,6 +32,7 @@ public enum SlotState
 public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 {
     private readonly SemaphoreSlim _profileSwitchGate = new(1, 1);
+    private readonly SimIdentityHistoryStore _identityHistory;
     private int _profileSwitchInProgress;
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -128,8 +129,19 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
                     CardNickname = null;
                 }
                 OnPropertyChanged();
+                OnPropertyChanged(nameof(CarrierName));
                 OnPropertyChanged(nameof(DisplayTitle));
             }
+        }
+    }
+
+    public string CarrierName
+    {
+        get
+        {
+            if (Sim == null)
+                return string.Empty;
+            return Sim.OperatorName;
         }
     }
 
@@ -140,8 +152,8 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             var moduleName = !string.IsNullOrWhiteSpace(Name) ? Name : "模组";
             var cardName = !string.IsNullOrWhiteSpace(CardNickname)
                 ? CardNickname
-                : !string.IsNullOrWhiteSpace(Sim?.OperatorName)
-                    ? Sim.OperatorName
+                : !string.IsNullOrWhiteSpace(CarrierName)
+                    ? CarrierName
                     : null;
             return !string.IsNullOrWhiteSpace(cardName) &&
                    !string.Equals(cardName, moduleName, StringComparison.OrdinalIgnoreCase)
@@ -156,9 +168,8 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     public SmsService? Sms { get; private set; }
 
     // Some roaming and multi-IMSI profiles report a temporary serving IMSI to
-    // AT+CIMI.  Their home ePDG still requires the permanent home identity for
-    // EAP-AKA.  The GUI only sets this after validating a persisted identity
-    // against the same ICCID and carrier profile.
+    // AT+CIMI. Their home ePDG still requires the permanent identity for EAP-AKA;
+    // the UI may restore a previously observed IMSI keyed by the same ICCID.
     public SimIdentity? VoWifiIdentityOverride { get; set; }
 
     private SignalQuality? _signal;
@@ -260,7 +271,8 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         int baudRate = 115200,
         string? name = null,
         string? proxyUrl = null,
-        AsyncEventBus? eventBus = null)
+        AsyncEventBus? eventBus = null,
+        SimIdentityHistoryStore? identityHistory = null)
     {
         Id = id ?? throw new ArgumentNullException(nameof(id));
         PortName = portName ?? throw new ArgumentNullException(nameof(portName));
@@ -268,6 +280,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         Name = name ?? $"Slot {id} ({portName})";
         ProxyUrl = proxyUrl;
         _eventBus = eventBus ?? new AsyncEventBus();
+        _identityHistory = identityHistory ?? new SimIdentityHistoryStore();
 
         VoWifi = new VoWifiManager(_eventBus)
         {
@@ -561,15 +574,25 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             // Probe device metadata
             await driver.GetFirmwareRevisionAsync(ct).ConfigureAwait(false);
             Imei = await driver.GetImeiAsync(ct).ConfigureAwait(false);
-            var imsi = await driver.GetImsiAsync(ct).ConfigureAwait(false);
+            var reportedImsi = await driver.GetImsiAsync(ct).ConfigureAwait(false);
+            var permanentImsi = await driver.GetPermanentImsiAsync(ct).ConfigureAwait(false);
+            var imsi = !string.IsNullOrWhiteSpace(permanentImsi) ? permanentImsi : reportedImsi;
             var iccid = await driver.GetIccidAsync(ct).ConfigureAwait(false);
             var phoneNumber = await driver.GetPhoneNumberAsync(ct).ConfigureAwait(false);
+            var providerName = await driver.GetServiceProviderNameAsync(ct).ConfigureAwait(false);
+            var mncLength = await driver.GetHomeMncLengthAsync(ct).ConfigureAwait(false);
+            var homePlmns = await driver.GetHomePlmnsAsync(ct).ConfigureAwait(false);
 
             if (!string.IsNullOrEmpty(imsi))
             {
-                Sim = SimIdentity.FromImsiAndIccid(imsi, iccid, phoneNumber: phoneNumber);
-                try { SimChanged?.Invoke(this, new SimStateChangedEventArgs(Sim, 1, "READY", Id)); } catch { }
-                _eventBus.Publish(EventTopics.ModemSim, Id, "READY");
+                var identity = SimIdentity.FromImsiAndIccid(
+                    imsi,
+                    iccid,
+                    string.IsNullOrWhiteSpace(providerName) ? null : providerName,
+                    phoneNumber,
+                    mncLength,
+                    homePlmns);
+                SetVerifiedSimIdentity(identity);
             }
 
             // Initialize 3GPP Phase 2+ SMS mode, storage, and real-time indications (AT+CNMI)
@@ -704,18 +727,32 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             throw new InvalidOperationException($"Slot {Id} has no active SIM identity.");
 
         VoWifi.ProxyUrl = ProxyUrl;
-        var voWifiIdentity = VoWifiIdentityOverride ?? Sim;
-        if (!await Aka.CheckReadyAsync(voWifiIdentity.Iccid, ct).ConfigureAwait(false))
+        if (!await Aka.CheckReadyAsync(Sim.Iccid, ct).ConfigureAwait(false))
             throw new InvalidOperationException(
                 $"Slot {Id} live USIM does not match the refreshed VoWiFi identity. Registration was blocked before EAP-AKA.");
-        if (VoWifiIdentityOverride != null)
-            _eventBus.Publish(EventTopics.SystemLog, "VoWiFi", $"Slot {Id} is using its validated home identity for EAP-AKA.");
-        bool started = await VoWifi.StartVoWifiAsync(voWifiIdentity, customEpdg, suite, proxyUrl: ProxyUrl, ct: ct).ConfigureAwait(false);
+
+        var candidates = new List<SimIdentity>();
+        AddCandidate(VoWifiIdentityOverride);
+        foreach (var learned in _identityHistory.GetCandidates(Sim)) AddCandidate(learned);
+        AddCandidate(Sim);
+
+        bool started = await VoWifi.StartVoWifiAsync(candidates, customEpdg, suite, proxyUrl: ProxyUrl, ct: ct).ConfigureAwait(false);
         if (started)
         {
             LastSeen = DateTime.UtcNow;
+            var successfulImsi = VoWifi.EpdgInfo?.Impi.Split('@')[0];
+            var successfulIdentity = candidates.FirstOrDefault(candidate => candidate.Imsi == successfulImsi);
+            if (successfulIdentity != null)
+                _identityHistory.MarkSuccessful(successfulIdentity);
         }
         return started;
+
+        void AddCandidate(SimIdentity? identity)
+        {
+            if (identity != null && identity.Iccid == Sim.Iccid &&
+                candidates.All(candidate => candidate.Imsi != identity.Imsi))
+                candidates.Add(identity);
+        }
     }
 
     /// <summary>
@@ -1261,11 +1298,22 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
             if (isExpectedCard)
             {
-                var imsi = await Modem.GetImsiAsync(ct).ConfigureAwait(false);
+                var reportedImsi = await Modem.GetImsiAsync(ct).ConfigureAwait(false);
+                var permanentImsi = await Modem.GetPermanentImsiAsync(ct).ConfigureAwait(false);
+                var imsi = !string.IsNullOrWhiteSpace(permanentImsi) ? permanentImsi : reportedImsi;
                 if (imsi.Length is >= 5 and <= 16 && imsi.All(char.IsAsciiDigit))
                 {
                     var phoneNumber = await Modem.GetPhoneNumberAsync(ct).ConfigureAwait(false);
-                    return SimIdentity.FromImsiAndIccid(imsi, normalizedIccid!, phoneNumber: phoneNumber);
+                    var providerName = await Modem.GetServiceProviderNameAsync(ct).ConfigureAwait(false);
+                    var mncLength = await Modem.GetHomeMncLengthAsync(ct).ConfigureAwait(false);
+                    var homePlmns = await Modem.GetHomePlmnsAsync(ct).ConfigureAwait(false);
+                    return SimIdentity.FromImsiAndIccid(
+                        imsi,
+                        normalizedIccid!,
+                        string.IsNullOrWhiteSpace(providerName) ? null : providerName,
+                        phoneNumber,
+                        mncLength,
+                        homePlmns);
                 }
             }
 
@@ -1285,8 +1333,20 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     private void SetVerifiedSimIdentity(SimIdentity identity)
     {
         Sim = identity;
+        _identityHistory.Observe(identity);
+        VoWifiIdentityOverride = _identityHistory.GetCandidates(identity)
+            .FirstOrDefault(candidate => candidate.Imsi != identity.Imsi);
         try { SimChanged?.Invoke(this, new SimStateChangedEventArgs(identity, 1, "READY", Id)); } catch { }
         _eventBus.Publish(EventTopics.ModemSim, Id, "READY");
+    }
+
+    public void RememberVoWifiIdentity(SimIdentity identity, bool succeeded = false)
+    {
+        if (Sim == null || identity.Iccid != Sim.Iccid)
+            throw new ArgumentException("The learned identity must belong to the live ICCID.", nameof(identity));
+        if (succeeded) _identityHistory.MarkSuccessful(identity);
+        else _identityHistory.Observe(identity);
+        VoWifiIdentityOverride = identity;
     }
 
     private static string? NormalizeIccidCandidate(string? value)
@@ -1356,7 +1416,8 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
                 Sim.PhoneNumber,
                 Sim.Mcc,
                 Sim.Mnc,
-                Sim.OperatorName
+                Sim.OperatorName,
+                DetectedCarrier = CarrierName
             } : null,
             Signal = Signal != null ? new
             {

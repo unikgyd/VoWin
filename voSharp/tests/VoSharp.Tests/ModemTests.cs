@@ -7,6 +7,24 @@ namespace VoSharp.Tests;
 
 public class ModemTests
 {
+
+    [Fact]
+    public void ParseSmsCenterAcceptsStandardCscaResponse()
+    {
+        Assert.Equal("+447700900123", ModemDriver.ParseSmsCenter([
+            "+CSCA: \"+447700900123\",145",
+            "OK"
+        ]));
+    }
+
+    [Theory]
+    [InlineData("+CSCA: \"not-a-number\",145")]
+    [InlineData("+CSCA: \"+447700900123\"")]
+    [InlineData("OK")]
+    public void ParseSmsCenterRejectsMalformedResponse(string line)
+    {
+        Assert.Equal(string.Empty, ModemDriver.ParseSmsCenter([line]));
+    }
     [Theory]
     [InlineData("+CNUM: \"\",\"+12025550123\",145", "+12025550123")]
     [InlineData("+CNUM: ,\"85255550123\",145", "+85255550123")]
@@ -22,6 +40,63 @@ public class ModemTests
     public void CnumParser_ReturnsEmptyWhenCardDoesNotSupplyNumber(string response)
     {
         Assert.Equal(string.Empty, ModemDriver.ParseOwnPhoneNumber(new[] { response }));
+    }
+
+    [Theory]
+    [InlineData("+QSPN: \"Host\",\"Host\",\"Retail\",0,\"99912\"", "Retail")]
+    [InlineData("+QSPN: \"Host\",\"Host\",\"00520065007400610069006C\",1,\"99912\"", "Retail")]
+    [InlineData("+QSPN: \"Host\",\"Host\",\"\",0,\"99912\"", "")]
+    public void QspnParser_PrefersRetailServiceProviderName(string response, string expected)
+    {
+        Assert.Equal(expected, ModemDriver.ParseServiceProviderName(new[] { response, "OK" }));
+    }
+
+    [Theory]
+    [InlineData("+CRSM: 144,0,\"00000002\"", 2)]
+    [InlineData("+CRSM: 144,0,\"00000003\"", 3)]
+    [InlineData("+CRSM: 159,0,\"FFFFFFF3\"", 3)]
+    public void EfAdParser_ReturnsAuthoritativeMncLength(string response, int expected)
+    {
+        Assert.Equal(expected, ModemDriver.ParseHomeMncLength(new[] { response, "OK" }));
+    }
+
+    [Theory]
+    [InlineData("+CRSM: 106,130")]
+    [InlineData("+CRSM: 144,0,\"0000000F\"")]
+    [InlineData("OK")]
+    public void EfAdParser_RejectsUnavailableOrInvalidMncLength(string response)
+    {
+        Assert.Null(ModemDriver.ParseHomeMncLength(new[] { response }));
+    }
+
+    [Theory]
+    [InlineData("+CRSM: 144,0,\"085951660124692538\"", "515661042965283")]
+    [InlineData("+CRSM: 144,0,\"0819325476981032F4\"", "12345678901234")]
+    public void EfImsiParser_DecodesPermanentSubscriberIdentity(string response, string expected)
+    {
+        Assert.Equal(expected, ModemDriver.ParsePermanentImsi(new[] { response, "OK" }));
+    }
+
+    [Theory]
+    [InlineData("+CRSM: 106,130")]
+    [InlineData("+CRSM: 144,0,\"01FF\"")]
+    public void EfImsiParser_RejectsUnavailableOrMalformedIdentity(string response)
+    {
+        Assert.Equal(string.Empty, ModemDriver.ParsePermanentImsi(new[] { response }));
+    }
+
+    [Fact]
+    public void HomePlmnParser_DecodesTwoAndThreeDigitMncEntries()
+    {
+        var twoDigit = ModemDriver.ParsePlmnList(
+            new[] { "+CRSM: 144,0,\"21F354C080FFFFFFFFFF\"" },
+            recordLength: 5);
+        var threeDigit = ModemDriver.ParsePlmnList(
+            new[] { "+CRSM: 144,0,\"130062\"" },
+            recordLength: 3);
+
+        Assert.Equal(new[] { "12345" }, twoDigit);
+        Assert.Equal(new[] { "310260" }, threeDigit);
     }
 
     [Theory]

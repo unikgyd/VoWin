@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="VoSharp.Ike.Tests" />
     <ProjectReference Include="..\VoSharp.Common\VoSharp.Common.csproj" />
     <ProjectReference Include="..\VoSharp.Ipsec\VoSharp.Ipsec.csproj" />
   </ItemGroup>

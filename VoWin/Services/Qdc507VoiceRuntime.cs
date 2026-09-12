@@ -203,7 +203,8 @@ internal sealed class Qdc507VoiceRuntime
     }
 
     private static async Task<ProcessResult> RunAdbAsync(
-        IReadOnlyList<string> arguments, TimeSpan timeout, CancellationToken ct, bool throwOnFailure = true)
+        IReadOnlyList<string> arguments, TimeSpan timeout, CancellationToken ct, bool throwOnFailure = true,
+        bool resolveDevice = true)
     {
         var adb = FindAdb();
         var startInfo = new ProcessStartInfo(adb)
@@ -213,6 +214,15 @@ internal sealed class Qdc507VoiceRuntime
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        if (resolveDevice)
+        {
+            var serial = await ResolveAdbSerialAsync(ct).ConfigureAwait(false);
+            if (!string.IsNullOrEmpty(serial))
+            {
+                startInfo.ArgumentList.Add("-s");
+                startInfo.ArgumentList.Add(serial);
+            }
+        }
         foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
         using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Unable to start adb.exe.");
         var stdout = process.StandardOutput.ReadToEndAsync(ct);
@@ -229,9 +239,69 @@ internal sealed class Qdc507VoiceRuntime
             throw;
         }
         var output = (await stdout.ConfigureAwait(false)) + (await stderr.ConfigureAwait(false));
+        if (process.ExitCode != 0 && output.Contains("device not found", StringComparison.OrdinalIgnoreCase))
+            Volatile.Write(ref _adbSerial, null); // The modem re-enumerated; pick the target again next time.
         if (throwOnFailure && process.ExitCode != 0)
             throw new InvalidOperationException($"adb {string.Join(' ', arguments.Take(2))} failed ({process.ExitCode}): {output.Trim()}");
         return new ProcessResult(process.ExitCode, output);
+    }
+
+    private static string? _adbSerial;
+
+    /// <summary>
+    /// adb refuses every command with "more than one device/emulator" as soon as a phone and the
+    /// QDC507 module (or an emulator) are attached at the same time. Resolve one target —
+    /// ANDROID_SERIAL first, then a single attached device, then the first non-emulator device —
+    /// and pass -s on every invocation so the rest of the runtime keeps working unchanged.
+    /// </summary>
+    private static async Task<string?> ResolveAdbSerialAsync(CancellationToken ct)
+    {
+        var configured = Environment.GetEnvironmentVariable("ANDROID_SERIAL");
+        if (!string.IsNullOrWhiteSpace(configured))
+            return configured.Trim();
+
+        var cached = Volatile.Read(ref _adbSerial);
+        if (!string.IsNullOrEmpty(cached)) return cached;
+
+        var output = (await RunAdbAsync(["devices"], TimeSpan.FromSeconds(10), ct, false, resolveDevice: false)
+            .ConfigureAwait(false)).Output;
+        var devices = new List<string>();
+        foreach (var line in output.Split('\n'))
+        {
+            var fields = line.Trim().Split('\t', StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length < 2) continue;
+            if (!fields[1].Trim().Equals("device", StringComparison.OrdinalIgnoreCase)) continue;
+            var serial = fields[0].Trim();
+            if (serial.Length > 0) devices.Add(serial);
+        }
+
+        // A modem never shows up as an emulator; a phone left plugged in is not the voice runtime.
+        var candidates = devices.Where(d => !d.StartsWith("emulator-", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (candidates.Count == 0) candidates = devices;
+
+        var selected = candidates.Count == 1 ? candidates[0] : await SelectQdc507Async(candidates, ct).ConfigureAwait(false);
+        Volatile.Write(ref _adbSerial, selected);
+        return selected;
+    }
+
+    /// <summary>
+    /// Picks the attached device that really is the QDC507 module. The phone and any emulator
+    /// that happen to be plugged in report a different kernel, so the voice runtime binds to the
+    /// one running 3.18.44 instead of whichever adb lists first.
+    /// </summary>
+    private static async Task<string?> SelectQdc507Async(List<string> candidates, CancellationToken ct)
+    {
+        foreach (var serial in candidates)
+        {
+            try
+            {
+                var result = await RunAdbAsync(["-s", serial, "shell", "uname", "-r"], TimeSpan.FromSeconds(8), ct,
+                    throwOnFailure: false, resolveDevice: false).ConfigureAwait(false);
+                if (result.Output.Contains("3.18.44", StringComparison.Ordinal)) return serial;
+            }
+            catch { }
+        }
+        return candidates.FirstOrDefault();
     }
 
     private static string FindAdb()

@@ -10,10 +10,10 @@ public class Socks5Tests
     [Fact]
     public void ParseProxyUrl_ValidUrls_ParsesCorrectly()
     {
-        var client1 = Socks5Client.TryParse("socks5://127.0.0.1:10808");
+        var client1 = Socks5Client.TryParse("socks5://127.0.0.1:1080");
         Assert.NotNull(client1);
         Assert.Equal("127.0.0.1", client1.ProxyHost);
-        Assert.Equal(10808, client1.ProxyPort);
+        Assert.Equal(1080, client1.ProxyPort);
         Assert.Null(client1.Username);
         Assert.Null(client1.Password);
 
@@ -150,5 +150,64 @@ public class Socks5Tests
 
         listener.Stop();
         await serverTask;
+    }
+
+    [Fact]
+    public async Task Socks5Client_UdpRoundTrip_ProvesRelayDataPlane()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var proxyPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var udpRelay = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        udpRelay.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        var relayPort = ((IPEndPoint)udpRelay.LocalEndPoint!).Port;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        var serverTask = Task.Run(async () =>
+        {
+            using var client = await listener.AcceptTcpClientAsync(timeout.Token);
+            using var stream = client.GetStream();
+            var greeting = new byte[3];
+            await stream.ReadExactlyAsync(greeting, timeout.Token);
+            await stream.WriteAsync(new byte[] { 0x05, 0x00 }, timeout.Token);
+
+            var associate = new byte[10];
+            await stream.ReadExactlyAsync(associate, timeout.Token);
+            await stream.WriteAsync(new byte[]
+            {
+                0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1,
+                (byte)(relayPort >> 8), (byte)relayPort
+            }, timeout.Token);
+
+            var relayBuffer = new byte[1024];
+            EndPoint clientEndpoint = new IPEndPoint(IPAddress.Any, 0);
+            var datagram = await udpRelay.ReceiveFromAsync(
+                relayBuffer, SocketFlags.None, clientEndpoint, timeout.Token);
+            var payload = Socks5Client.DecapsulateUdpDatagram(
+                relayBuffer.AsMemory(0, datagram.ReceivedBytes));
+            Assert.NotNull(payload);
+
+            var response = Socks5Client.EncapsulateUdpDatagram(
+                payload.Value.Span,
+                new IPEndPoint(IPAddress.Parse("8.8.8.8"), 53));
+            await udpRelay.SendToAsync(
+                response, SocketFlags.None, datagram.RemoteEndPoint, timeout.Token);
+        }, timeout.Token);
+
+        var expected = new byte[] { 0x12, 0x34, 0x81, 0x80 };
+        byte[] actual;
+        using (var socks = new Socks5Client("127.0.0.1", proxyPort))
+        {
+            var associatedRelay = await socks.UdpAssociateAsync(timeout.Token);
+            Assert.Equal(relayPort, associatedRelay.Port);
+            actual = await socks.UdpRoundTripAsync(
+                expected,
+                new IPEndPoint(IPAddress.Parse("8.8.8.8"), 53),
+                timeout.Token);
+        }
+
+        Assert.Equal(expected, actual);
+        await serverTask;
+        listener.Stop();
     }
 }

@@ -12,12 +12,12 @@ public class ModemPoolTests
     public async Task ModemSlot_ConfigurationAndDiagnostics_WorksCorrectly()
     {
         var bus = new AsyncEventBus();
-        var slot = new ModemSlot("slot-ph", "COM10", 115200, "DITO PH", "socks5://127.0.0.1:10808", bus);
+        var slot = new ModemSlot("slot-test", "COM10", 115200, "Test SIM", "socks5://127.0.0.1:1080", bus);
 
-        Assert.Equal("slot-ph", slot.Id);
+        Assert.Equal("slot-test", slot.Id);
         Assert.Equal("COM10", slot.PortName);
-        Assert.Equal("socks5://127.0.0.1:10808", slot.ProxyUrl);
-        Assert.Equal("socks5://127.0.0.1:10808", slot.VoWifi.ProxyUrl);
+        Assert.Equal("socks5://127.0.0.1:1080", slot.ProxyUrl);
+        Assert.Equal("socks5://127.0.0.1:1080", slot.VoWifi.ProxyUrl);
         Assert.Equal(SlotState.Offline, slot.State);
 
         var diag = slot.GetDiagnosticInfo();
@@ -33,8 +33,8 @@ public class ModemPoolTests
         var pool = new ModemPool(bus);
 
         // Add virtual / mock slots
-        var slot1 = new ModemSlot("slot-1", "COM21", 115200, "China Mobile", null, bus);
-        var slot2 = new ModemSlot("slot-2", "COM22", 115200, "DITO Telecommunity", "socks5://127.0.0.1:10808", bus);
+        var slot1 = new ModemSlot("slot-1", "COM21", 115200, "Test SIM A", null, bus);
+        var slot2 = new ModemSlot("slot-2", "COM22", 115200, "Test SIM B", "socks5://127.0.0.1:1080", bus);
 
         // Test slot selection
         Assert.True(pool.Slots.Count == 0);
@@ -58,7 +58,7 @@ public class ModemPoolTests
         Assert.Contains("Modem Pool", resList.Message);
 
         // 2. slot proxy configuration
-        var resProxy = await kernel.ExecuteCommandAsync("slot proxy slot-1 socks5://127.0.0.1:10808");
+        var resProxy = await kernel.ExecuteCommandAsync("slot proxy slot-1 socks5://127.0.0.1:1080");
         Assert.False(resProxy.Success); // Slot not found yet
 
         // 3. vowifi status contains proxy info

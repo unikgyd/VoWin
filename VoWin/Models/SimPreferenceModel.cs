@@ -17,13 +17,13 @@ namespace VoWin.Models
         private bool _defaultFlightMode = false;
 
         [ObservableProperty]
-        private bool _defaultVoWifi = true;
+        private bool _defaultVoWifi = false;
 
         [ObservableProperty]
-        private bool _defaultCellularData = true;
+        private bool _defaultCellularData = false;
 
         [ObservableProperty]
-        private bool _defaultDataRoaming = true;
+        private bool _defaultDataRoaming = false;
 
         [ObservableProperty]
         private string? _dedicatedProxyUrl;
