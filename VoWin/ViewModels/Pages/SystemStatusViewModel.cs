@@ -719,8 +719,60 @@ namespace VoWin.ViewModels.Pages
             await _simSwitchGate.WaitAsync();
             try
             {
-                // A toggle always writes the complete four-switch policy. Keep
-                // unrelated SIM metadata such as nickname and proxy untouched.
+                if (!ReferenceEquals(slot, SelectedSlot)) return;
+
+                if (slot.IsFlightMode != FlightModeSwitchEnabled)
+                {
+                    StatusMessage = FlightModeSwitchEnabled ? "正在开启飞行模式并确认模组状态..." : "正在关闭飞行模式并确认模组状态...";
+                    var flightApplied = await _kernelService.SetFlightModeAsync(FlightModeSwitchEnabled, slot.Id);
+                    if (!flightApplied || slot.IsFlightMode != FlightModeSwitchEnabled)
+                    {
+                        // Keep the UI and future per-SIM restoration policy in
+                        // sync with the actual modem state.  Setting this flag
+                        // suppresses a second apply operation from the binding.
+                        _isLoadingSimSwitches = true;
+                        FlightModeSwitchEnabled = slot.IsFlightMode;
+                        _isLoadingSimSwitches = false;
+                        StatusMessage = "飞行模式切换未获模组确认，开关已恢复为实际状态。";
+                        return;
+                    }
+                }
+
+                if (!FlightModeSwitchEnabled)
+                {
+                    var roamingApplied = await slot.SetDataRoamingEnabledAsync(DataRoamingSwitchEnabled);
+                    var cellularDataApplied = await slot.SetCellularDataEnabledAsync(CellularDataSwitchEnabled);
+                    if (!roamingApplied || !cellularDataApplied)
+                    {
+                        StatusMessage = "飞行模式已切换，但部分蜂窝数据/漫游设置未获模组确认。";
+                        return;
+                    }
+                    await slot.RefreshMetricsAsync();
+                }
+
+                if (VoWifiSwitchEnabled)
+                {
+                    if (slot.VoWifi.State == VoWifiState.Disconnected)
+                    {
+                        if (!await _kernelService.StartVoWifiAsync(slot.Id))
+                        {
+                            StatusMessage = "开关已应用，但 VoWiFi 未能启动；请导出本次诊断日志。";
+                            return;
+                        }
+                    }
+                }
+                else if (slot.VoWifi.State != VoWifiState.Disconnected)
+                {
+                    if (!await _kernelService.StopVoWifiAsync(slot.Id))
+                    {
+                        StatusMessage = "开关已应用，但 VoWiFi 未能正常停止。";
+                        return;
+                    }
+                }
+
+                // Save only after the hardware actions above are confirmed.
+                // A toggle always writes the complete four-switch policy while
+                // keeping unrelated SIM metadata such as nickname and proxy.
                 var existing = await _kernelService.Preferences.GetSimPreferenceAsync(iccid);
                 await _kernelService.SaveSimPreferencesAsync(
                     iccid,
@@ -730,28 +782,6 @@ namespace VoWin.ViewModels.Pages
                     DataRoamingSwitchEnabled,
                     existing?.DedicatedProxyUrl,
                     existing?.CardNickname);
-
-                if (!ReferenceEquals(slot, SelectedSlot)) return;
-
-                if (slot.IsFlightMode != FlightModeSwitchEnabled)
-                    await slot.SetFlightModeAsync(FlightModeSwitchEnabled);
-
-                if (!FlightModeSwitchEnabled)
-                {
-                    await slot.SetDataRoamingEnabledAsync(DataRoamingSwitchEnabled);
-                    await slot.SetCellularDataEnabledAsync(CellularDataSwitchEnabled);
-                    await slot.RefreshMetricsAsync();
-                }
-
-                if (VoWifiSwitchEnabled)
-                {
-                    if (slot.VoWifi.State == VoWifiState.Disconnected)
-                        await _kernelService.StartVoWifiAsync(slot.Id);
-                }
-                else if (slot.VoWifi.State != VoWifiState.Disconnected)
-                {
-                    await _kernelService.StopVoWifiAsync(slot.Id);
-                }
 
                 StatusMessage = "已保存并应用此 SIM 卡的开关。";
                 NotifyAll();

@@ -1017,8 +1017,13 @@ namespace VoWin.Services
 
                 if (slot != null)
                 {
-                    return await slot.SetFlightModeAsync(enable);
+                    var applied = await slot.SetFlightModeAsync(enable);
+                    AddLog(applied ? "INFO" : "WARN", "Modem", applied
+                        ? $"飞行模式已确认{(enable ? "开启 (CFUN=4)" : "关闭 (CFUN=1)")}。"
+                        : $"飞行模式未生效：模组没有确认 CFUN={(enable ? 4 : 1)}。偏好未更新。");
+                    return applied;
                 }
+                AddLog("WARN", "Modem", "设置飞行模式失败：未找到目标卡槽。");
                 return false;
             }
             catch (Exception ex)
@@ -1508,6 +1513,7 @@ namespace VoWin.Services
             report.AppendLine("=== VoWiFi / IMS snapshot ===");
             report.AppendLine($"State: {diag?.State.ToString() ?? "unavailable"}");
             report.AppendLine($"Last error: {DiagnosticLogRedactor.Redact(diag?.LastError ?? "none")}");
+            report.AppendLine($"Failure classification: stage={diag?.FailureStage ?? "none"}; category={diag?.FailureCategory ?? "none"}");
             report.AppendLine($"ePDG: {diag?.EpdgFqdn ?? "unknown"} ({diag?.EpdgIp ?? "unknown"}:{diag?.EpdgPort})");
             report.AppendLine($"IKE suite: {diag?.Suite.ToString() ?? "unknown"}; DH: {diag?.DhGroup ?? "unknown"}; EAP: {diag?.EapMethod ?? "unknown"}");
             report.AppendLine($"Tunnel: {(diag?.Tunnel is null ? "not established" : $"assigned={diag.Tunnel.AssignedIPv4 ?? diag.Tunnel.AssignedIPv6 ?? "unknown"}; P-CSCF={diag.Tunnel.PcscfIp}; ESP={diag.Tunnel.EncryptionAlgorithm}/{diag.Tunnel.IntegrityAlgorithm}")}");

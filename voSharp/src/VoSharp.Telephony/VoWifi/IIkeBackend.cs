@@ -33,6 +33,7 @@ public interface IIkeBackend : IDisposable
         IkeProposalSuite suite = IkeProposalSuite.Auto,
         string? proxyUrl = null,
         string? imei = null,
+        Action<string>? diagnosticLog = null,
         CancellationToken ct = default);
 
     Task StopTunnelAsync(CancellationToken ct = default);

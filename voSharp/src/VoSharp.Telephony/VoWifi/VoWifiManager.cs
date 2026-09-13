@@ -82,7 +82,9 @@ public record VoWifiDiagnosticInfo(
     int SipProbesFailed = 0,
     long LastProbeRttMs = 0,
     DateTime? LastProbeTime = null,
-    string? LastProbeResult = null
+    string? LastProbeResult = null,
+    string? FailureStage = null,
+    string? FailureCategory = null
 );
 
 public class VoWifiManager : IDisposable
@@ -95,6 +97,8 @@ public class VoWifiManager : IDisposable
     public string? AssignedIp { get; private set; }
     public DateTime? ConnectedAt { get; private set; }
     public string? LastError { get; private set; }
+    public string? LastFailureStage { get; private set; }
+    public string? LastFailureCategory { get; private set; }
 
     public event EventHandler<VoWifiStateChangedEventArgs>? StateChanged;
     public event EventHandler<VoWifiIpsecTunnelInfo>? TunnelEstablished;
@@ -361,6 +365,9 @@ public class VoWifiManager : IDisposable
             _sipOptionsRejectedByNetwork = false;
             SetState(VoWifiState.ResolvingEpdg);
             LastError = null;
+            LastFailureStage = null;
+            LastFailureCategory = null;
+            var attemptTimer = System.Diagnostics.Stopwatch.StartNew();
 
             var effectiveProxy = proxyUrl ?? ProxyUrl;
             if (!string.IsNullOrWhiteSpace(effectiveProxy) &&
@@ -379,6 +386,9 @@ public class VoWifiManager : IDisposable
             }
 
             // ── 1. Resolve 3GPP ePDG FQDN & DNS ─────────────────────────────
+            var homePlmnCandidates = EpdgResolver.BuildHomePlmnCandidates(sim);
+            EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                $"Stage 1/4 ePDG discovery started; home-PLMN candidates=[{string.Join(',', homePlmnCandidates.Select(candidate => $"{candidate.Mcc}-{candidate.Mnc}"))}]; custom-ePDG={!string.IsNullOrWhiteSpace(customEpdg)}.");
             EpdgInfo = await EpdgResolver.ResolveAsync(sim, customEpdg, ct)
                                          .ConfigureAwait(false);
             // TS 24.011 RP-DATA must use the SMSC provisioned by this SIM.  Do
@@ -395,6 +405,8 @@ public class VoWifiManager : IDisposable
                 $"Resolved ePDG: carrier={EpdgInfo.MatchedCarrier ?? "unmatched"}, " +
                 $"fqdn={EpdgInfo.Fqdn}, apn={EpdgInfo.Apn ?? "ims"}, " +
                 $"addresses=[{string.Join(", ", EpdgInfo.IpAddresses.Select(address => address.ToString()))}].");
+            EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                $"Stage 1/4 ePDG discovery completed; elapsed={attemptTimer.ElapsedMilliseconds}ms; addresses={EpdgInfo.IpAddresses.Length}; ipv4={EpdgInfo.IpAddresses.Count(address => address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)}; ipv6={EpdgInfo.IpAddresses.Count(address => address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)}.");
 
             var chosenSuite = suite == IkeProposalSuite.Auto ? EpdgInfo.PreferredSuite : suite;
 
@@ -413,6 +425,8 @@ public class VoWifiManager : IDisposable
                 throw new InvalidOperationException(
                     "The live USIM ICCID does not match the identity selected for VoWiFi. Authentication was blocked before EAP-AKA; refresh the SIM identity after switching profiles.");
             var deviceImei = await ResolveImeiAsync(ct).ConfigureAwait(false);
+            EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                "Stage 2/4 USIM preflight completed; CPIN/ICCID verified and device identity is available (values redacted).");
 
             // ── 3. IKEv2 / EAP-AKA Handshake & Child SA (C# Full Stack) ─────
             string? fallbackPcscf = null;
@@ -436,6 +450,8 @@ public class VoWifiManager : IDisposable
                     ct.ThrowIfCancellationRequested();
                     attemptedSuites.Add($"{targetIp}/{attemptSuite}");
                     CurrentSuite = attemptSuite;
+                    EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                        $"Stage 2/4 IKE attempt {attemptedSuites.Count}; suite={attemptSuite}; endpoint-family={targetIp.AddressFamily}; address-family-order=IPv6,Dual,IPv4.");
                     EventBus?.Publish("vowifi.ike.attempt", "VoWifiManager",
                         new { Endpoint = targetIp.ToString(), Suite = attemptSuite.ToString(), Attempt = attemptedSuites.Count });
 
@@ -450,7 +466,8 @@ public class VoWifiManager : IDisposable
                         attemptSuite,
                         effectiveProxy,
                         deviceImei,
-                        ct).ConfigureAwait(false);
+                        diagnosticLog: message => EventBus?.Publish(EventTopics.SystemLog, "IKE", message),
+                        ct: ct).ConfigureAwait(false);
 
                     if (ikeResult.Success && !string.IsNullOrEmpty(ikeResult.AssignedIp) && !string.IsNullOrEmpty(ikeResult.PcscfIp))
                         break;
@@ -531,6 +548,8 @@ public class VoWifiManager : IDisposable
             );
             try { TunnelEstablished?.Invoke(this, TunnelInfo); } catch { }
             EventBus?.Publish("vowifi.tunnel.established", "VoWifiManager", TunnelInfo);
+            EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                $"Stage 3/4 IPsec tunnel completed; elapsed={attemptTimer.ElapsedMilliseconds}ms; assigned-family={assignedAddress.AddressFamily}; DNS-count={ikeResult.DnsIps.Count}; P-CSCF-family={IPAddress.Parse(ikeResult.PcscfIp).AddressFamily}; ESP={TunnelInfo.EncryptionAlgorithm}/{TunnelInfo.IntegrityAlgorithm}.");
 
             SetState(VoWifiState.IpsecTunnelEstablished);
 
@@ -745,6 +764,8 @@ public class VoWifiManager : IDisposable
             try { ImsRegistered?.Invoke(this, ImsInfo); } catch { }
             SetState(VoWifiState.ImsRegistered);
             ConnectedAt = DateTime.UtcNow;
+            EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                $"Stage 4/4 IMS registration completed; elapsed={attemptTimer.ElapsedMilliseconds}ms; SIP registration accepted.");
             session.StartRefreshing(Authenticate);
             StartHealthMonitor();
 
@@ -753,8 +774,11 @@ public class VoWifiManager : IDisposable
         catch (Exception ex)
         {
             var failure = ex.Message;
+            var failedState = State;
+            LastFailureStage = DescribeFailureStage(failedState);
+            LastFailureCategory = DescribeFailureCategory(failedState, failure);
             EventBus?.Publish(EventTopics.SystemError, "IMS",
-                $"IMS registration/startup failed while stage={State}; error={failure}");
+                $"VoWiFi failure; stage={LastFailureStage}; category={LastFailureCategory}; state={failedState}; error={failure}");
             try { await StopVoWifiCoreAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
             LastError = failure;
             SetState(VoWifiState.Failed);
@@ -1169,6 +1193,8 @@ public class VoWifiManager : IDisposable
             ConnectedAt: connectedAt,
             Uptime: uptimeStr,
             LastError: LastError,
+            FailureStage: LastFailureStage,
+            FailureCategory: LastFailureCategory,
             SipProbesSent: _sipProbesSent,
             SipProbesSuccess: _sipProbesSuccess,
             SipProbesFailed: _sipProbesFailed,
@@ -1201,6 +1227,49 @@ public class VoWifiManager : IDisposable
             if (!attempts.Contains(candidate)) attempts.Add(candidate);
         }
         return attempts;
+    }
+
+    private static string DescribeFailureStage(VoWifiState state) => state switch
+    {
+        VoWifiState.ResolvingEpdg => "Stage 1/4 ePDG discovery",
+        VoWifiState.ConnectingIkev2 or VoWifiState.AuthenticatingEapAka => "Stage 2/4 IKEv2 / EAP-AKA",
+        VoWifiState.IpsecTunnelEstablished => "Stage 3/4 IPsec tunnel",
+        VoWifiState.ImsRegistering => "Stage 4/4 IMS SIP registration",
+        _ => "VoWiFi startup"
+    };
+
+    private static string DescribeFailureCategory(VoWifiState state, string error)
+    {
+        if (state == VoWifiState.ResolvingEpdg)
+        {
+            if (error.Contains("no addresses", StringComparison.OrdinalIgnoreCase) || error.Contains("DNS", StringComparison.OrdinalIgnoreCase))
+                return "DNS/ePDG discovery";
+            if (error.Contains("USIM modem", StringComparison.OrdinalIgnoreCase) || error.Contains("ICCID", StringComparison.OrdinalIgnoreCase))
+                return "USIM availability/identity";
+            return "ePDG discovery setup";
+        }
+        if (state is VoWifiState.ConnectingIkev2 or VoWifiState.AuthenticatingEapAka)
+        {
+            if (error.Contains("RES is unavailable", StringComparison.OrdinalIgnoreCase) || error.Contains("USIM AUTHENTICATE", StringComparison.OrdinalIgnoreCase))
+                return "USIM AKA result unavailable";
+            if (error.Contains("AUTHENTICATION_FAILED", StringComparison.OrdinalIgnoreCase) &&
+                error.Contains("local SIM was not queried", StringComparison.OrdinalIgnoreCase))
+                return "ePDG/AAA identity or non-3GPP access policy";
+            if (error.Contains("AT_MAC", StringComparison.OrdinalIgnoreCase)) return "EAP-AKA server MAC verification";
+            if (error.Contains("EAP-AKA authentication rejected", StringComparison.OrdinalIgnoreCase)) return "ePDG/AAA EAP rejection";
+            if (error.Contains("proposal", StringComparison.OrdinalIgnoreCase) || error.Contains("DH group", StringComparison.OrdinalIgnoreCase)) return "IKE proposal negotiation";
+            if (error.Contains("timed out", StringComparison.OrdinalIgnoreCase)) return "IKE transport timeout";
+            if (error.Contains("P-CSCF", StringComparison.OrdinalIgnoreCase) || error.Contains("assigned", StringComparison.OrdinalIgnoreCase)) return "IPsec configuration payload";
+            return "IKEv2/EAP-AKA negotiation";
+        }
+        if (state == VoWifiState.ImsRegistering)
+        {
+            if (error.Contains("Security mechanism", StringComparison.OrdinalIgnoreCase) || error.Contains("Security-Client", StringComparison.OrdinalIgnoreCase)) return "IMS security agreement";
+            if (error.Contains("SIP REGISTER", StringComparison.OrdinalIgnoreCase)) return "SIP registration exchange";
+            if (error.Contains("AKA", StringComparison.OrdinalIgnoreCase)) return "IMS AKA authentication";
+            return "IMS registration/data plane";
+        }
+        return "unclassified";
     }
 
     private static bool IsProposalNegotiationFailure(string message)

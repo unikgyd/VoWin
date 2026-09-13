@@ -172,6 +172,9 @@ public static class HardwareAka
         if (sw == 0x6982)
             return new HardwareAkaResult(false, false, null, null, null, null,
                 "USIM security status not satisfied (SW=6982). CHV1/PIN may be required.");
+        if (sw == 0x6985)
+            return new HardwareAkaResult(false, false, null, null, null, null,
+                "USIM conditions of use not satisfied (SW=6985). The selected logical channel or authentication context was rejected.");
         if (sw == 0x6A82)
             return new HardwareAkaResult(false, false, null, null, null, null,
                 "USIM application not found (SW=6A82). Is this a 3G/4G USIM?");

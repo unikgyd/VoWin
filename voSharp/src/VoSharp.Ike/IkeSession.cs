@@ -31,7 +31,8 @@ public sealed record IkeSessionRequest(
     IReadOnlyList<IkeSuite>? Suites = null,
     IReadOnlyList<EspSuite>? ChildSuites = null,
     string? Imeisv = null,
-    IkeAddressFamilyMode AddressFamilyMode = IkeAddressFamilyMode.Ipv6
+    IkeAddressFamilyMode AddressFamilyMode = IkeAddressFamilyMode.Ipv6,
+    Action<string>? DiagnosticLog = null
 );
 
 public sealed record IkeSessionResult(
@@ -104,6 +105,8 @@ public static class IkeSession
         var socksClient = request.Socks5Client ?? VoSharp.Ike.Transport.Socks5Client.TryParse(request.ProxyUrl);
         var transport = new IkeTransport(request.EpdgIp, initialPort: request.EpdgPort, socks5Client: socksClient);
         var eapSucceeded = false;
+        var stage = "IKE_SA_INIT";
+        void Trace(string message) => request.DiagnosticLog?.Invoke(message);
         try
         {
             // ── 1. IKE_SA_INIT ──────────────────────────────────────────────
@@ -152,6 +155,7 @@ public static class IkeSession
             initRequest.Payloads.AddRange(initPayloads);
 
             var initReqBytes = IkeWire.SerializeMessage(initRequest);
+            Trace($"IKE stage=IKE_SA_INIT send; endpoint-family={request.EpdgIp.AddressFamily}; port={request.EpdgPort}; dh={ikeSuite.DhGroupId}; proposals={ikeSuites.Count()}; proxy={socksClient is not null}; packet-bytes={initReqBytes.Length}.");
             var initRespBytes = await transport.RoundTripAsync(initReqBytes, ct).ConfigureAwait(false);
             var initResp = IkeWire.ParseMessage(initRespBytes);
 
@@ -172,6 +176,7 @@ public static class IkeSession
                 initRequest.Payloads.Add(MakeNotify(NotifyCookie, cookiePayload.Body[4..]));
                 initRequest.Payloads.AddRange(initPayloads);
                 initReqBytes = IkeWire.SerializeMessage(initRequest);
+                Trace($"IKE stage=IKE_SA_INIT retry-cookie; attempt={cookieAttempt + 1}; packet-bytes={initReqBytes.Length}.");
                 initRespBytes = await transport.RoundTripAsync(initReqBytes, ct).ConfigureAwait(false);
                 initResp = IkeWire.ParseMessage(initRespBytes);
             }
@@ -215,14 +220,17 @@ public static class IkeSession
             {
                 transport.FloatTo4500();
             }
+            Trace($"IKE stage=IKE_SA_INIT complete; negotiated-dh={negotiatedSuite.DhGroupId}; nat-detected={isNatDetected}; transport-port={(isNatDetected ? 4500 : request.EpdgPort)}; response-payloads={currentPayloadNames(initResp.Payloads)}.");
 
             // ── 2. First IKE_AUTH request (EAP-AKA start) ────────────────────
+            stage = "IKE_AUTH/EAP-AKA";
             var eapClient = new EapAkaClient(
                 request.AkaProvider,
                 request.Imsi,
                 request.HomeMcc,
                 request.HomeMnc,
-                request.ExpectedIccid);
+                request.ExpectedIccid,
+                message => Trace($"EAP-AKA {message}"));
 
             var childInboundSpis = new Dictionary<byte, uint>();
             var childProposals = childSuites.Select((candidate, index) =>
@@ -273,6 +281,7 @@ public static class IkeSession
             };
 
             var firstAuthEncrypted = IkeCrypto.EncryptPayloads(firstAuthMsg, firstAuthInner, negotiatedSuite, ikeKeys.SkEi, ikeKeys.SkAi);
+            Trace($"IKE stage=IKE_AUTH send initial EAP request; address-family={request.AddressFamilyMode}; apn={request.Apn}; child-proposals={childSuites.Count()}; packet-bytes={firstAuthEncrypted.Length}.");
             var firstAuthRespBytes = await transport.RoundTripAsync(firstAuthEncrypted, ct).ConfigureAwait(false);
 
             var (_, currentInnerPayloads) = IkeCrypto.DecryptPayloads(firstAuthRespBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
@@ -293,14 +302,21 @@ public static class IkeSession
                         .Select(DescribeNotify)
                         .ToList();
                     var types = string.Join(", ", currentInnerPayloads.Select(p => p.Type.ToString()));
+                    if (!string.IsNullOrWhiteSpace(eapClient.LastAkaFailure))
+                    {
+                        throw new IkeFormatException(
+                            $"IKE_AUTH round {round + 1} received no EAP payload after a local EAP-AKA response. " +
+                            $"{eapClient.LastAkaFailure} ePDG response payloads: [{types}], Notifies: [{string.Join(", ", notifyList)}]");
+                    }
                     throw new IkeFormatException($"IKE_AUTH round {round + 1} did not contain an EAP payload. Inner payloads: [{types}], Notifies: [{string.Join(", ", notifyList)}]");
                 }
 
-                Console.WriteLine($"[IKE] Round {round + 1}: EAP Body Len={eapPayload.Body.Length}, Hex={Convert.ToHexString(eapPayload.Body)}");
+                Trace($"IKE stage=IKE_AUTH EAP round={round + 1}; payload-bytes={eapPayload.Body.Length}.");
                 var (eapResponse, isSuccess) = await eapClient.HandleAsync(eapPayload.Body, ct).ConfigureAwait(false);
                 if (isSuccess)
                 {
                     eapSucceeded = true;
+                    Trace($"IKE stage=IKE_AUTH EAP mutual authentication complete; rounds={round + 1}; result-indication={eapClient.ResultIndication}; protected-success={eapClient.ProtectedSuccess}.");
                     break;
                 }
 
@@ -330,6 +346,7 @@ public static class IkeSession
                 };
 
                 var encNext = IkeCrypto.EncryptPayloads(nextReq, nextReqInner, negotiatedSuite, ikeKeys.SkEi, ikeKeys.SkAi);
+                Trace($"IKE stage=IKE_AUTH send EAP response; round={round + 1}; response-bytes={eapResponse.Length}; device-identity={deviceRequest is not null && !string.IsNullOrWhiteSpace(request.Imei)}.");
                 var respBytes = await transport.RoundTripAsync(encNext, ct).ConfigureAwait(false);
 
                 var (_, inner) = IkeCrypto.DecryptPayloads(respBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
@@ -344,6 +361,7 @@ public static class IkeSession
                 throw new InvalidOperationException("EAP-AKA finished without producing an authenticated MSK.");
 
             // ── 4. Final IKE_AUTH: Initiator AUTH payload ────────────────────
+            stage = "IKE_AUTH/final-AUTH";
             authMsgId++;
             var msk = eapClient.Keys.Msk;
 
@@ -370,6 +388,7 @@ public static class IkeSession
             };
 
             var finalEnc = IkeCrypto.EncryptPayloads(finalReq, new[] { initiatorAuthPayload }, negotiatedSuite, ikeKeys.SkEi, ikeKeys.SkAi);
+            Trace($"IKE stage=final-AUTH send; packet-bytes={finalEnc.Length}.");
             var finalRespBytes = await transport.RoundTripAsync(finalEnc, ct).ConfigureAwait(false);
 
             var (_, finalPayloads) = IkeCrypto.DecryptPayloads(finalRespBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
@@ -399,6 +418,7 @@ public static class IkeSession
             }
 
             // ── 6. Parse CHILD_SA, CP, and Key Material ──────────────────────
+            stage = "CHILD_SA/configuration";
             var finalSaPayload = finalPayloads.FirstOrDefault(p => p.Type == IkePayloadType.SecurityAssociation)
                 ?? throw new IkeFormatException("Final IKE_AUTH response missing SA payload.");
             var finalProposals = IkeWire.DecodeProposals(finalSaPayload.Body);
@@ -422,6 +442,13 @@ public static class IkeSession
             var finalPcscf = PickPcscf(pcscfList, assignedIp) ?? request.FallbackPcscf;
             if (string.IsNullOrEmpty(finalPcscf))
                 throw new InvalidOperationException("P-CSCF IP was not provided by ePDG and no fallback was configured.");
+            var assignedFamily = IPAddress.TryParse(assignedIp, out var assignedAddress)
+                ? assignedAddress.AddressFamily.ToString()
+                : "unknown";
+            var pcscfFamily = IPAddress.TryParse(finalPcscf, out var pcscfAddress)
+                ? pcscfAddress.AddressFamily.ToString()
+                : "unknown";
+            Trace($"IKE stage=CHILD_SA complete; esp-encryption={negotiatedChildSuite.EncryptionId}-{negotiatedChildSuite.EncryptionBits}; esp-integrity={negotiatedChildSuite.IntegrityId}; assigned-family={assignedFamily}; dns-count={dnsList.Count}; pcscf-family={pcscfFamily}.");
 
             return new IkeSessionResult(
                 Success: true,
@@ -448,6 +475,7 @@ public static class IkeSession
         }
         catch (Exception ex)
         {
+            Trace($"IKE stage={stage} failed; exception={ex.GetType().Name}; detail={ex.Message}");
             transport.Dispose();
             return new IkeSessionResult(
                 Success: false,
@@ -469,6 +497,9 @@ public static class IkeSession
                 AddressFamilyMode: request.AddressFamilyMode
             );
         }
+
+        static string currentPayloadNames(IEnumerable<IkePayload> payloads) =>
+            string.Join(',', payloads.Select(payload => payload.Type.ToString()));
     }
 
     internal static bool DetectNat(
@@ -562,6 +593,16 @@ public static class IkeSession
             NotifyAuthorizationRejected or NotifyIllegalMe or NotifyNetworkFailure or
             NotifyRatTypeNotAllowed or NotifyImeiNotAccepted or NotifyPlmnNotAllowed or
             NotifyUnauthenticatedEmergencyNotSupported);
+        var authenticationFailed = notifications.FirstOrDefault(notification => notification.Type == 24);
+        if (authenticationFailed != null)
+        {
+            return "ePDG rejected the initial IKE_AUTH with AUTHENTICATION_FAILED (Notify 24) " +
+                   "before sending an EAP-AKA challenge; the local SIM was not queried. " +
+                   "This is an ePDG/AAA identity or access-policy decision (for example VoWiFi " +
+                   "provisioning, non-3GPP access policy, or the current exit IP), not a SOCKS5 " +
+                   "reachability or USIM-AKA calculation failure.";
+        }
+
         if (error == null)
             return null;
 
@@ -600,6 +641,7 @@ public static class IkeSession
 
     private static string Get3GppNotifyName(ushort notifyType) => notifyType switch
     {
+        24 => "AUTHENTICATION_FAILED",
         NotifyNon3GppAccessNotAllowed => "NON_3GPP_ACCESS_TO_EPC_NOT_ALLOWED",
         NotifyUserUnknown => "USER_UNKNOWN",
         NotifyNoApnSubscription => "NO_APN_SUBSCRIPTION",
@@ -611,6 +653,8 @@ public static class IkeSession
         NotifyPlmnNotAllowed => "PLMN_NOT_ALLOWED",
         NotifyUnauthenticatedEmergencyNotSupported => "UNAUTHENTICATED_EMERGENCY_NOT_SUPPORTED",
         NotifyBackoffTimer => "BACKOFF_TIMER",
+        _ when notifyType is >= 8192 and <= 16383 => "PRIVATE_USE_ERROR_NOTIFY",
+        _ when notifyType >= 40960 => "PRIVATE_USE_STATUS_NOTIFY",
         _ => $"NotifyType={notifyType}"
     };
 

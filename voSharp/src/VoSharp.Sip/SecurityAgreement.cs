@@ -33,6 +33,15 @@ public sealed record SecurityAgreement(
     int PcscfServerPort);
 
 /// <summary>
+/// Result of evaluating a P-CSCF <c>Security-Server</c> header.  The diagnostic
+/// messages intentionally contain only mechanism metadata and validation
+/// outcomes; they never contain SPI values or complete SIP header contents.
+/// </summary>
+public sealed record SecurityAgreementEvaluation(
+    SecurityAgreement? Agreement,
+    IReadOnlyList<string> CandidateDiagnostics);
+
+/// <summary>
 /// Security agreement (sec-agree) for IMS registration.
 /// </summary>
 /// <remarks>
@@ -109,40 +118,78 @@ public static class SecurityAgreementBuilder
         string headerValue,
         SecurityProposal offered,
         IReadOnlyList<string>? offeredIntegrityAlgorithms = null,
+        IReadOnlyList<string>? offeredEncryptionAlgorithms = null) =>
+        EvaluateSecurityServer(
+            headerValue,
+            offered,
+            offeredIntegrityAlgorithms,
+            offeredEncryptionAlgorithms).Agreement;
+
+    /// <summary>
+    /// Evaluates a <c>Security-Server</c> header while retaining a safe,
+    /// shareable explanation for every accepted or rejected candidate.  This is
+    /// intended for field diagnostics when a carrier uses a non-standard or
+    /// previously unsupported IMS security agreement.
+    /// </summary>
+    public static SecurityAgreementEvaluation EvaluateSecurityServer(
+        string headerValue,
+        SecurityProposal offered,
+        IReadOnlyList<string>? offeredIntegrityAlgorithms = null,
         IReadOnlyList<string>? offeredEncryptionAlgorithms = null)
     {
+        var diagnostics = new List<string>();
         if (string.IsNullOrWhiteSpace(headerValue))
-            return null;
+            return new(null, ["Security-Server header was empty."]);
 
         var items = SplitHeaderValues(headerValue);
         if (items.Count == 0)
-            return null;
+            return new(null, ["Security-Server contained no parseable mechanisms."]);
 
         var candidates = new List<(double Q, SecurityAgreement Agreement)>();
         var allowedIntegrity = offeredIntegrityAlgorithms ?? DefaultIntegrityAlgorithms;
         var allowedEncryption = offeredEncryptionAlgorithms ?? DefaultEncryptionAlgorithms;
 
-        foreach (var item in items)
+        for (var index = 0; index < items.Count; index++)
         {
+            var item = items[index];
+            var label = $"candidate {index + 1}";
             var parameters = ParseMechanism(item, out var name, out var q);
             if (parameters is null)
+            {
+                diagnostics.Add($"{label}: rejected (malformed mechanism).");
                 continue;
+            }
             if (!name.Equals(MechanismName, StringComparison.OrdinalIgnoreCase))
+            {
+                diagnostics.Add($"{label}: ignored (mechanism={name}).");
                 continue;
+            }
 
             if (!TryGet(parameters, "prot", out var prot) ||
                 !prot.Equals("esp", StringComparison.OrdinalIgnoreCase))
+            {
+                diagnostics.Add($"{label}: rejected (prot={prot ?? "missing"}; expected esp).");
                 continue;
+            }
             if (!TryGet(parameters, "mod", out var mod) ||
                 !mod.Equals("trans", StringComparison.OrdinalIgnoreCase))
+            {
+                diagnostics.Add($"{label}: rejected (mod={mod ?? "missing"}; expected trans).");
                 continue;
+            }
 
             if (!TryGet(parameters, "alg", out var alg) ||
                 !Contains(allowedIntegrity, alg))
+            {
+                diagnostics.Add($"{label}: rejected (alg={alg ?? "missing"}; offered=[{string.Join(',', allowedIntegrity)}]).");
                 continue;
+            }
             if (!TryGet(parameters, "ealg", out var ealg) ||
                 !Contains(allowedEncryption, ealg))
+            {
+                diagnostics.Add($"{label}: rejected (ealg={ealg ?? "missing"}; offered=[{string.Join(',', allowedEncryption)}]).");
                 continue;
+            }
             alg = alg.ToLowerInvariant();
             ealg = ealg.ToLowerInvariant();
 
@@ -150,16 +197,25 @@ public static class SecurityAgreementBuilder
                 !TryGetUint(parameters, "spi-s", out var pcscfServerSpi) ||
                 !TryGetInt(parameters, "port-c", out var pcscfClientPort) ||
                 !TryGetInt(parameters, "port-s", out var pcscfServerPort))
+            {
+                diagnostics.Add($"{label}: rejected (missing or invalid SPI/port field).");
                 continue;
+            }
 
             // All four SPIs must be distinct, and the P-CSCF must not reuse ours.
             var spis = new[] { pcscfClientSpi, pcscfServerSpi, offered.SpiClient, offered.SpiServer };
             if (spis.Distinct().Count() != spis.Length)
+            {
+                diagnostics.Add($"{label}: rejected (P-CSCF SPI collides with another security association).");
                 continue;
+            }
 
             if (!IsValidProtectedPort(pcscfClientPort) || !IsValidProtectedPort(pcscfServerPort) ||
                 pcscfClientPort == pcscfServerPort)
+            {
+                diagnostics.Add($"{label}: rejected (invalid or duplicate protected ports).");
                 continue;
+            }
 
             var selected = offered with
             {
@@ -176,11 +232,17 @@ public static class SecurityAgreementBuilder
                 PcscfServerSpi: pcscfServerSpi,
                 PcscfClientPort: pcscfClientPort,
                 PcscfServerPort: pcscfServerPort)));
+            diagnostics.Add($"{label}: compatible (q={q.ToString(CultureInfo.InvariantCulture)}; alg={alg}; ealg={ealg}; prot=esp; mod=trans; ports valid).");
         }
 
-        return candidates.Count == 0
+        var agreement = candidates.Count == 0
             ? null
             : candidates.OrderByDescending(c => c.Q).First().Agreement;
+        if (agreement is null)
+            diagnostics.Add("No Security-Server candidate was compatible with Security-Client.");
+        else
+            diagnostics.Add($"Selected highest-q compatible candidate: alg={agreement.Selected.IntegrityAlgorithm}; ealg={agreement.Selected.EncryptionAlgorithm}.");
+        return new(agreement, diagnostics);
     }
 
     /// <summary>

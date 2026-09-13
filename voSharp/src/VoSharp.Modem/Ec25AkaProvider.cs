@@ -93,7 +93,34 @@ public sealed class Ec25AkaProvider : IAkaProvider
 
         // Never log the raw AUTHENTICATE APDU response: a successful response contains RES, CK
         // and IK, and a synchronization response contains AUTS. Only status and lengths are safe.
-        var parsed = HardwareAka.ParseAuthenticateResponse(response).ToAkaResult();
+        var parsedResponse = HardwareAka.ParseAuthenticateResponse(response);
+        // Some eUICCs accept CCHO but reject AUTHENTICATE on that logical channel
+        // with 6985.  The same applet can still accept the basic-channel CSIM
+        // exchange.  The command was not executed, so this one safe fallback
+        // does not consume a second AKA vector.
+        var usedBasicChannelFallback = false;
+        if (channelId > 0 && IsConditionsNotSatisfied(response))
+        {
+            Console.WriteLine("[Ec25AkaProvider] Logical-channel USIM AUTHENTICATE returned SW=6985; retrying once through basic-channel CSIM.");
+            usedBasicChannelFallback = true;
+            response = await ExchangeAsync(apdu, channelId: 0, ct).ConfigureAwait(false);
+            if (response is null || response.Length == 0)
+                return AkaResult.Failed("USIM AUTHENTICATE basic-channel fallback returned no APDU response.");
+            parsedResponse = HardwareAka.ParseAuthenticateResponse(response);
+        }
+
+        var fallbackNote = usedBasicChannelFallback
+            ? "Logical-channel AUTHENTICATE returned SW=6985; basic-channel CSIM fallback was used."
+            : null;
+        var parsed = parsedResponse.Success
+            ? AkaResult.Succeeded(parsedResponse.Res!, parsedResponse.Ck!, parsedResponse.Ik!, fallbackNote)
+            : parsedResponse.SyncFailure
+                ? AkaResult.SyncFailed(parsedResponse.Auts!, fallbackNote)
+                : AkaResult.Failed(
+                    usedBasicChannelFallback
+                        ? $"Basic-channel CSIM fallback failed after logical-channel SW=6985: {parsedResponse.ErrorMessage}"
+                        : parsedResponse.ErrorMessage ?? "USIM AUTHENTICATE failed.",
+                    fallbackNote);
         Console.WriteLine($"[Ec25AkaProvider] USIM AUTHENTICATE completed: bytes={response.Length}, Success={parsed.Success}, SyncFail={parsed.SynchronizationFailure}, Err={parsed.ErrorMessage}");
         return parsed;
     }
@@ -226,6 +253,9 @@ public sealed class Ec25AkaProvider : IAkaProvider
 
     private static readonly Regex CchoPattern =
         new(@"\+CCHO:\s*(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static bool IsConditionsNotSatisfied(byte[] response) =>
+        response.Length >= 2 && response[^2] == 0x69 && response[^1] == 0x85;
 
     /// <summary>Matches <c>+QCCID</c>, <c>+CCID</c> and <c>+ICCID</c> responses.</summary>
     private static readonly Regex IccidPattern =

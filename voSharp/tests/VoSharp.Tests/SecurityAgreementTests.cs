@@ -90,6 +90,22 @@ public class SecurityAgreementTests
     }
 
     [Fact]
+    public void EvaluationExplainsAnUnsupportedAlgorithmWithoutLeakingSpiValues()
+    {
+        const string securityServer =
+            "ipsec-3gpp;q=1.000;alg=hmac-sha-2-256;prot=esp;mod=trans;ealg=aes-cbc;" +
+            "spi-c=2001;spi-s=2002;port-c=50601;port-s=50600";
+
+        var evaluation = SecurityAgreementBuilder.EvaluateSecurityServer(securityServer, Proposal);
+
+        Assert.Null(evaluation.Agreement);
+        Assert.Contains(evaluation.CandidateDiagnostics, message =>
+            message.Contains("alg=hmac-sha-2-256", StringComparison.Ordinal));
+        Assert.DoesNotContain(evaluation.CandidateDiagnostics, message =>
+            message.Contains("2001", StringComparison.Ordinal) || message.Contains("2002", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void RejectsTunnelModeAndNonEsp()
     {
         const string tunnelMode =

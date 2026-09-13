@@ -86,6 +86,8 @@ public class SipRegisterSession : IDisposable
         var initReq = ImsRegisterBuilder.BuildInitialRegister(_profile, _callId, _cseq++, _fromTag);
         AddSecurityHeaders(initReq);
         WriteDiagnostic($"REGISTER step=1/5 send initial request; local={ImsRegisterBuilder.FormatHost(_profile.LocalIp)}:{_profile.LocalPort}; security-client={_securityProposal is not null}.");
+        if (_securityProposal is not null)
+            WriteDiagnostic($"REGISTER step=1/5 Security-Client offer: {DescribeSecurityClientOffer()}.");
         var requestTimer = Stopwatch.StartNew();
         var resp1 = await _transport.SendAndReceiveAsync(initReq, ct).ConfigureAwait(false)
                       ?? throw new InvalidOperationException("SIP REGISTER: no response from P-CSCF.");
@@ -144,9 +146,11 @@ public class SipRegisterSession : IDisposable
             {
                 if (_securityProposal == null || _activateSecurity == null)
                     throw new InvalidOperationException("P-CSCF requires IMS IPsec, but this transport has no IMS security data plane.");
-                var agreement = SecurityAgreementBuilder.ParseSecurityServer(
+                var evaluation = SecurityAgreementBuilder.EvaluateSecurityServer(
                     string.Join(", ", offered), _securityProposal,
-                    _securityIntegrityAlgorithms, _securityEncryptionAlgorithms)
+                    _securityIntegrityAlgorithms, _securityEncryptionAlgorithms);
+                WriteDiagnostic($"REGISTER step=4/5 Security-Server compatibility: {string.Join(" | ", evaluation.CandidateDiagnostics)}");
+                var agreement = evaluation.Agreement
                     ?? throw new InvalidOperationException("P-CSCF offered no IMS security mechanism that was present in Security-Client.");
                 _activateSecurity(agreement, ck, ik);
                 Agreement = agreement;
@@ -195,6 +199,14 @@ public class SipRegisterSession : IDisposable
 
     private static string? GetHeaderValue(SipMessage message, string name) =>
         message.Headers.TryGetValue(name, out var values) ? values.FirstOrDefault() : null;
+
+    private string DescribeSecurityClientOffer()
+    {
+        if (_securityProposal is null) return "disabled";
+        var integrity = _securityIntegrityAlgorithms ?? SecurityAgreementBuilder.DefaultIntegrityAlgorithms;
+        var encryption = _securityEncryptionAlgorithms ?? SecurityAgreementBuilder.DefaultEncryptionAlgorithms;
+        return $"mechanisms={integrity.Count * encryption.Count}; alg=[{string.Join(',', integrity)}]; ealg=[{string.Join(',', encryption)}]; prot=esp; mod=trans; protected-ports=valid; SPI values redacted";
+    }
 
     /// <summary>
     /// Decodes the IMS AKA nonce. Some P-CSCFs use Base64(RAND || AUTN); others send the same

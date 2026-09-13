@@ -161,6 +161,39 @@ public class EapAkaTests
         Assert.Null(successResp);
     }
 
+    [Fact]
+    public async Task EapAkaClient_ReportsFailedUsimResultWithoutReadingUnavailableKeys()
+    {
+        var diagnostics = new List<string>();
+        var failedProvider = new FailedAkaProvider();
+        var client = new EapAkaClient(
+            failedProvider, "460001234567890", "460", "00", diagnosticLog: diagnostics.Add);
+
+        var randAttr = EapAkaClient.MarshalAkaAttribute(AkaAttributeType.Rand, new byte[18]);
+        var autnAttr = EapAkaClient.MarshalAkaAttribute(AkaAttributeType.Autn, new byte[18]);
+        var macAttr = EapAkaClient.MarshalAkaAttribute(AkaAttributeType.Mac, new byte[18]);
+        var challenge = EapAkaClient.MarshalEapPacket(new EapPacket(
+            EapCode.Request, 3, EapType.Aka,
+            Combine(new byte[] { AkaSubtype.Challenge, 0, 0 }, randAttr, autnAttr, macAttr)));
+
+        var (response, isSuccess) = await client.HandleAsync(challenge);
+
+        Assert.False(isSuccess);
+        Assert.NotNull(response);
+        var parsed = EapAkaClient.ParseEapPacket(response!);
+        Assert.Equal(AkaSubtype.AuthenticationReject, parsed.Data[0]);
+        Assert.Contains(diagnostics, line => line.Contains("success=False", StringComparison.Ordinal));
+        Assert.DoesNotContain(diagnostics, line => line.Contains("RES is unavailable", StringComparison.Ordinal));
+    }
+
+    private sealed class FailedAkaProvider : IAkaProvider
+    {
+        public Task<bool> CheckReadyAsync(string? expectedIccid = null, CancellationToken ct = default) => Task.FromResult(true);
+
+        public Task<AkaResult> AuthenticateAsync(AkaChallenge challenge, CancellationToken ct = default) =>
+            Task.FromResult(AkaResult.Failed("USIM authentication command returned a non-success status."));
+    }
+
     private static byte[] Combine(params byte[][] arrays)
     {
         var total = arrays.Sum(a => a.Length);

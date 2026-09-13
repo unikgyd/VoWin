@@ -469,6 +469,19 @@ public class ModemDriver : IAsyncDisposable
             var resp = await _session.ExecuteCommandAsync(cmd, 3000, ct).ConfigureAwait(false);
             if (resp.Success)
             {
+                // An OK only confirms that the command was accepted.  Confirm
+                // the resulting functional level so callers never persist a
+                // misleading flight-mode state when the modem declines or
+                // defers the radio transition.
+                var verifiedCfun = await GetFlightModeAsync(ct).ConfigureAwait(false);
+                var verified = enable ? verifiedCfun is 0 or 4 : verifiedCfun == 1;
+                if (!verified)
+                {
+                    _isRadioStateKnown = previousKnown;
+                    _isRadioDisabled = previousDisabled;
+                    _radioStatusReportingEnabled = previousReportingEnabled;
+                    return false;
+                }
                 _eventBus?.Publish("modem.flightmode", "Modem", enable ? "ON" : "OFF");
                 try { FlightModeChanged?.Invoke(this, new FlightModeChangedEventArgs(enable, enable ? 4 : 1)); } catch { }
                 return true;

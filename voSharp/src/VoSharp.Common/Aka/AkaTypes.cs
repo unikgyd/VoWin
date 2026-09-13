@@ -38,18 +38,21 @@ public sealed class AkaResult
     public bool Success { get; }
     public bool SynchronizationFailure { get; }
     public string? ErrorMessage { get; }
+    /// <summary>Safe transport-path note; never contains AKA material.</summary>
+    public string? DiagnosticMessage { get; }
 
     private readonly byte[]? _res;
     private readonly byte[]? _ck;
     private readonly byte[]? _ik;
     private readonly byte[]? _auts;
 
-    private AkaResult(bool success, bool syncFailure, byte[]? res, byte[]? ck, byte[]? ik, byte[]? auts, string? error)
+    private AkaResult(bool success, bool syncFailure, byte[]? res, byte[]? ck, byte[]? ik, byte[]? auts, string? error, string? diagnostic = null)
     {
         Success = success;
         SynchronizationFailure = syncFailure;
         _res = res; _ck = ck; _ik = ik; _auts = auts;
         ErrorMessage = error;
+        DiagnosticMessage = diagnostic;
     }
 
     /// <summary>Authentication response (4..16 bytes). Null unless <see cref="Success"/>.</summary>
@@ -92,14 +95,14 @@ public sealed class AkaResult
         }
     }
 
-    public static AkaResult Succeeded(byte[] res, byte[] ck, byte[] ik) =>
-        new(true, false, res, ck, ik, null, null);
+    public static AkaResult Succeeded(byte[] res, byte[] ck, byte[] ik, string? diagnostic = null) =>
+        new(true, false, res, ck, ik, null, null, diagnostic);
 
-    public static AkaResult SyncFailed(byte[] auts) =>
-        new(false, true, null, null, null, auts, "USIM reported synchronization failure (AUTS).");
+    public static AkaResult SyncFailed(byte[] auts, string? diagnostic = null) =>
+        new(false, true, null, null, null, auts, "USIM reported synchronization failure (AUTS).", diagnostic);
 
-    public static AkaResult Failed(string message) =>
-        new(false, false, null, null, null, null, message);
+    public static AkaResult Failed(string message, string? diagnostic = null) =>
+        new(false, false, null, null, null, null, message, diagnostic);
 
     /// <summary>Wipes key material. Call once CK/IK have been consumed.</summary>
     public void Clear()

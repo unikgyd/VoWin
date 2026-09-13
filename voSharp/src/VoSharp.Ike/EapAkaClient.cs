@@ -70,25 +70,29 @@ public sealed class EapAkaClient
     private readonly string _homeMnc;
     private readonly string _homeMcc;
     private readonly string? _expectedIccid;
+    private readonly Action<string>? _diagnosticLog;
 
     public byte[] Identity { get; }
     public AkaDerivedKeys? Keys { get; private set; }
     public bool ChallengeComplete { get; private set; }
     public bool ResultIndication { get; private set; }
     public bool ProtectedSuccess { get; private set; }
+    public string? LastAkaFailure { get; private set; }
 
     public EapAkaClient(
         IAkaProvider akaProvider,
         string imsi,
         string homeMcc,
         string homeMnc,
-        string? expectedIccid = null)
+        string? expectedIccid = null,
+        Action<string>? diagnosticLog = null)
     {
         _akaProvider = akaProvider ?? throw new ArgumentNullException(nameof(akaProvider));
         _imsi = imsi?.Trim() ?? throw new ArgumentNullException(nameof(imsi));
         _homeMcc = homeMcc?.Trim() ?? throw new ArgumentNullException(nameof(homeMcc));
         _homeMnc = homeMnc?.Trim() ?? throw new ArgumentNullException(nameof(homeMnc));
         _expectedIccid = expectedIccid;
+        _diagnosticLog = diagnosticLog;
 
         Identity = BuildPermanentIdentity(_imsi, _homeMcc, _homeMnc);
     }
@@ -122,12 +126,13 @@ public sealed class EapAkaClient
         CancellationToken ct = default)
     {
         var packet = ParseEapPacket(encodedPacket);
-        Console.WriteLine($"[EAP] Inbound: Code={packet.Code}, Id={packet.Identifier}, Type={packet.Type}, DataLen={packet.Data.Length}");
+        Trace($"inbound code={DescribeCode(packet.Code)}; id={packet.Identifier}; type={DescribeType(packet.Type)}; data-bytes={packet.Data.Length}.");
 
         switch (packet.Code)
         {
             case EapCode.Failure:
                 var stage = ChallengeComplete ? "after AKA challenge response" : "before AKA challenge response";
+                Trace($"server rejected authentication {stage}.");
                 throw new AuthenticationException($"EAP-AKA authentication rejected by ePDG ({stage}).");
 
             case EapCode.Success:
@@ -135,6 +140,7 @@ public sealed class EapAkaClient
                     throw new AuthenticationException("EAP Success received before authenticated AKA challenge.");
                 if (ResultIndication && !ProtectedSuccess)
                     throw new AuthenticationException("Unprotected EAP Success received after AT_RESULT_IND.");
+                Trace($"server returned EAP Success; challenge-complete={ChallengeComplete}; protected-success={ProtectedSuccess}.");
                 return (null, true);
 
             case EapCode.Request:
@@ -147,6 +153,7 @@ public sealed class EapAkaClient
         switch (packet.Type)
         {
             case EapType.Identity:
+                Trace("responding with permanent 3GPP NAI identity (identity value redacted).");
                 var idResp = MarshalEapPacket(new EapPacket(
                     Code: EapCode.Response,
                     Identifier: packet.Identifier,
@@ -171,6 +178,7 @@ public sealed class EapAkaClient
 
         var subtype = packet.Data[0];
         var attributes = ParseAkaAttributes(packet.Data.AsSpan(3));
+        Trace($"request subtype={DescribeSubtype(subtype)}; attributes=[{string.Join(',', attributes.Select(attribute => DescribeAttribute(attribute.Type)))}].");
 
         switch (subtype)
         {
@@ -216,12 +224,23 @@ public sealed class EapAkaClient
         var autn = autnAttr.Raw[4..20];
         var challenge = AkaChallenge.Create(rand, autn);
 
+        Trace("AKA challenge complete; invoking USIM AUTHENTICATE (RAND/AUTN redacted).");
         var result = await _akaProvider.AuthenticateAsync(challenge, ct).ConfigureAwait(false);
-
-        Console.WriteLine($"[EapAkaClient] AuthenticateAsync returned: Success={result.Success}, SyncFail={result.SynchronizationFailure}, ResLen={result.Res?.Length}");
+        // AkaResult deliberately throws when AUTS is read outside a sync-failure
+        // response.  Diagnostics must observe that contract rather than turning
+        // a successful AKA exchange into a logging failure.
+        var autsPresent = result.SynchronizationFailure && result.Auts is not null;
+        // RES/CK/IK have the same guarded-access contract as AUTS: a failed
+        // AKA result must be classified and answered, not accidentally
+        // converted into "RES is unavailable" by diagnostic formatting.
+        var resLength = result.Success ? result.Res?.Length ?? 0 : 0;
+        var ckLength = result.Success ? result.Ck?.Length ?? 0 : 0;
+        var ikLength = result.Success ? result.Ik?.Length ?? 0 : 0;
+        Trace($"USIM AUTHENTICATE result: success={result.Success}; sync-failure={result.SynchronizationFailure}; res-bytes={resLength}; ck-bytes={ckLength}; ik-bytes={ikLength}; auts-present={autsPresent}; error={result.ErrorMessage ?? "none"}; transport-note={result.DiagnosticMessage ?? "none"}.");
 
         if (result.SynchronizationFailure)
         {
+            LastAkaFailure = "USIM AUTHENTICATE reported synchronization failure; AUTS was returned to the ePDG.";
             var auts = result.Auts ?? throw new AuthenticationException("SIM reported sync failure without AUTS.");
             var autsAttr = MarshalAkaAttribute(AkaAttributeType.Auts, auts);
             var syncData = Combine(new byte[] { AkaSubtype.SynchronizationFailure, 0, 0 }, autsAttr);
@@ -230,7 +249,8 @@ public sealed class EapAkaClient
 
         if (!result.Success || result.Res == null || result.Ck == null || result.Ik == null)
         {
-            Console.WriteLine("[EapAkaClient] SIM returned failure or null keys, sending AuthenticationReject");
+            LastAkaFailure = $"USIM AUTHENTICATE failed: {result.ErrorMessage ?? "no authentication vector was returned"}";
+            Trace("USIM result cannot form EAP-AKA response; sending AuthenticationReject.");
             // Authentication reject
             var rejData = new byte[] { AkaSubtype.AuthenticationReject, 0, 0 };
             return MarshalEapPacket(new EapPacket(EapCode.Response, request.Identifier, request.Type, rejData));
@@ -239,6 +259,7 @@ public sealed class EapAkaClient
         var res = result.Res;
         var ck = result.Ck;
         var ik = result.Ik;
+        LastAkaFailure = null;
 
         // Derive keys based on EAP type (type 23 vs type 50)
         var isPrime = request.Type == EapType.AkaPrime;
@@ -280,7 +301,7 @@ public sealed class EapAkaClient
         var expectedMac = ComputeMac(keys.KAut, zeroed, isPrime);
         var actualMac = macAttr.Raw.AsSpan(4, 16);
         var serverMacValid = CryptographicOperations.FixedTimeEquals(expectedMac, actualMac);
-        Console.WriteLine($"[EapAkaClient] Server AT_MAC valid={serverMacValid}");
+        Trace($"server AT_MAC verified={serverMacValid}.");
         if (!serverMacValid)
             throw new AuthenticationException("EAP-AKA server AT_MAC verification failed.");
 
@@ -322,9 +343,54 @@ public sealed class EapAkaClient
         Keys = keys;
         ChallengeComplete = true;
         ResultIndication = hasResultInd;
+        Trace($"AKA challenge response prepared; res-bytes={res.Length}; aka-prime={isPrime}; result-indication={hasResultInd}.");
 
         return responseBytes;
     }
+
+    private void Trace(string message) => _diagnosticLog?.Invoke(message);
+
+    private static string DescribeCode(byte code) => code switch
+    {
+        EapCode.Request => "Request",
+        EapCode.Response => "Response",
+        EapCode.Success => "Success",
+        EapCode.Failure => "Failure",
+        _ => $"Unknown({code})"
+    };
+
+    private static string DescribeType(byte type) => type switch
+    {
+        EapType.Identity => "Identity",
+        EapType.Aka => "AKA",
+        EapType.AkaPrime => "AKA-prime",
+        _ => $"Unknown({type})"
+    };
+
+    private static string DescribeSubtype(byte subtype) => subtype switch
+    {
+        AkaSubtype.Identity => "Identity",
+        AkaSubtype.Challenge => "Challenge",
+        AkaSubtype.Notification => "Notification",
+        AkaSubtype.SynchronizationFailure => "SynchronizationFailure",
+        AkaSubtype.AuthenticationReject => "AuthenticationReject",
+        _ => $"Unknown({subtype})"
+    };
+
+    private static string DescribeAttribute(byte type) => type switch
+    {
+        AkaAttributeType.Rand => "AT_RAND",
+        AkaAttributeType.Autn => "AT_AUTN",
+        AkaAttributeType.Res => "AT_RES",
+        AkaAttributeType.Auts => "AT_AUTS",
+        AkaAttributeType.Mac => "AT_MAC",
+        AkaAttributeType.Identity => "AT_IDENTITY",
+        AkaAttributeType.Notification => "AT_NOTIFICATION",
+        AkaAttributeType.ResultInd => "AT_RESULT_IND",
+        AkaAttributeType.Kdf => "AT_KDF",
+        AkaAttributeType.KdfInput => "AT_KDF_INPUT",
+        _ => $"AT_{type}"
+    };
 
     private byte[] RespondAkaNotification(EapPacket request, List<AkaAttribute> attributes)
     {
