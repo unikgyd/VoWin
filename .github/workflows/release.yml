@@ -1,0 +1,120 @@
+name: Build and release VoWin
+
+on:
+  # Every push to the main branch is compiled and packaged as an Actions artifact.
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  # Allows a release to be made from the Actions page without creating a tag locally.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 1.2.3"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark this release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+
+# The built-in token is sufficient; no personal access token is required.
+permissions:
+  contents: write
+
+concurrency:
+  group: vowin-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Resolve release version
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $tag = 'v${{ inputs.version }}'
+            $version = $tag -replace '^[vV]', ''
+          }
+          elseif ('${{ github.ref_type }}' -eq 'tag') {
+            $tag = '${{ github.ref_name }}'
+            $version = $tag -replace '^[vV]', ''
+          }
+          else {
+            # A normal main-branch build is an artifact, not a public release.
+            $tag = "build-$env:GITHUB_RUN_NUMBER"
+            $version = "0.1.0.$env:GITHUB_RUN_NUMBER"
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "Version must be numeric in the form 1.2.3 or 1.2.3.4; received '$tag'."
+          }
+
+          "TAG=$tag" >> $env:GITHUB_ENV
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Restore dependencies
+        run: dotnet restore VoWin.slnx
+
+      - name: Build release configuration
+        run: dotnet build VoWin.slnx --configuration Release --no-restore
+
+      - name: Publish single-file Windows application
+        shell: pwsh
+        run: |
+          dotnet publish VoWin/VoWin.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --no-restore `
+            --self-contained false `
+            --property:Version=$env:VERSION `
+            --output publish/win-x64
+
+      - name: Create release archive and checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $archive = "artifacts/VoWin-$env:TAG-win-x64.zip"
+          Compress-Archive -Path 'publish/win-x64/*' -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $archive)" | Set-Content -NoNewline "${archive}.sha256"
+          "ARCHIVE=$archive" >> $env:GITHUB_ENV
+          "CHECKSUM=${archive}.sha256" >> $env:GITHUB_ENV
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoWin-${{ env.TAG }}-win-x64
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ inputs.prerelease || 'false' }}
+        run: |
+          $arguments = @(
+            'release', 'create', $env:TAG,
+            $env:ARCHIVE, $env:CHECKSUM,
+            '--title', "VoWin $env:TAG",
+            '--generate-notes'
+          )
+          if ($env:PRERELEASE -eq 'true') {
+            $arguments += '--prerelease'
+          }
+          gh @arguments

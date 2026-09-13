@@ -1,5 +1,7 @@
 # VoWin：还在为没有Linux或mac而无法用上vowifi而困扰？
 
+[![Build and release VoWin](https://github.com/unikgyd/VoWin/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/unikgyd/VoWin/actions/workflows/release.yml)
+
 <p align="center">
   <img src="VoWin/Assets/vowin.png" alt="VoWin Logo" width="128" height="128" />
 </p>
@@ -159,10 +161,23 @@ dotnet test VoWin.slnx --no-restore
 dotnet run --project VoWin/VoWin.csproj
 
 # 生成 framework-dependent 单文件发布包
-.\publish-single-file.bat
+.\publish-single-file.bat 1.2.3
 ```
 
 发布结果位于 `publish/win-x64/VoWin.exe`。它是 framework-dependent 发布包，目标电脑仍需安装对应的 .NET 10 Windows Desktop Runtime。
+
+### 自动构建与 GitHub Release
+
+推送到 `main` 后，GitHub Actions 会自动编译并上传 Windows x64 的 ZIP 包和 SHA-256 校验文件，可在对应工作流运行的 **Artifacts** 中下载。
+
+发布正式版本时，创建并推送一个符合 `v1.2.3` 格式的标签；工作流会自动打包并创建 GitHub Release：
+
+```powershell
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+也可以在仓库的 **Actions → Build and release VoWin → Run workflow** 中输入版本号来发布。发布包内含 `VoWin.exe`，目标电脑需要 .NET 10 Windows Desktop Runtime x64。
 
 ## 项目结构
 
@@ -217,3 +232,7 @@ mdd-sim-gateway:三代目，也是借鉴他的代码
 ![验证码远程查看示例](docs/images/验证码.png)
 
 ![VoWin 程序页面](docs/images/页面.png)
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=unikgyd/VoWin&type=Date)](https://www.star-history.com/#unikgyd/VoWin&Date)
