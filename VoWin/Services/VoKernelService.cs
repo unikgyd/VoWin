@@ -228,6 +228,7 @@ namespace VoWin.Services
                 await Preferences.InitializeAsync();
                 _callExperience = await _callExperienceStore.LoadAsync();
                 ApplyVolteAudioPrewarmPreference();
+                ApplyCallRecordingPreference();
 
                 // 1. Load Call Records from SQLite
                 var callHistory = await Preferences.GetCallRecordsAsync(300);
@@ -598,11 +599,14 @@ namespace VoWin.Services
                     Slots.Add(k);
                 }
             }
+
+            ApplyCallRecordingPreference();
         }
 
         private void AddLog(string level, string source, string message)
         {
             var now = DateTime.Now;
+            message = DiagnosticLogRedactor.Redact(message);
             _pendingUiLogs.Enqueue(new LogEntryModel
             {
                 Timestamp = now,
@@ -1478,6 +1482,116 @@ namespace VoWin.Services
             }
         }
 
+        public async Task<string> BuildImsDiagnosticReportAsync(string? slotId = null)
+        {
+            var slot = (!string.IsNullOrWhiteSpace(slotId)
+                ? Slots.FirstOrDefault(s => s.Id == slotId)
+                : ActiveSlot) ?? Slots.FirstOrDefault();
+            var diag = slot?.VoWifiDiag ?? VoWifiDiag;
+            var report = new StringBuilder();
+            var appVersion = typeof(VoKernelService).Assembly.GetName().Version?.ToString() ?? "unknown";
+
+            report.AppendLine("VoWin IMS diagnostic report");
+            report.AppendLine("This report automatically redacts subscriber identities, phone numbers, AKA material, and proxy credentials.");
+            report.AppendLine($"Generated (local): {DateTimeOffset.Now:O}");
+            report.AppendLine($"App version: {appVersion}");
+            report.AppendLine($"OS: {Environment.OSVersion}");
+            report.AppendLine();
+            report.AppendLine("=== Selected modem / SIM context ===");
+            report.AppendLine($"Slot: {slot?.Id ?? "none"}");
+            report.AppendLine($"Port: {slot?.PortName ?? "unknown"}");
+            report.AppendLine($"Firmware: {slot?.Modem?.FirmwareRevision ?? "unknown"}");
+            report.AppendLine($"Flight mode: {slot?.IsFlightMode.ToString() ?? "unknown"}");
+            report.AppendLine($"SIM PLMN: {slot?.Sim?.Mcc ?? "?"}-{slot?.Sim?.Mnc ?? "?"}");
+            report.AppendLine($"SOCKS route configured: {!string.IsNullOrWhiteSpace(slot?.ProxyUrl)}");
+            report.AppendLine();
+            report.AppendLine("=== VoWiFi / IMS snapshot ===");
+            report.AppendLine($"State: {diag?.State.ToString() ?? "unavailable"}");
+            report.AppendLine($"Last error: {DiagnosticLogRedactor.Redact(diag?.LastError ?? "none")}");
+            report.AppendLine($"ePDG: {diag?.EpdgFqdn ?? "unknown"} ({diag?.EpdgIp ?? "unknown"}:{diag?.EpdgPort})");
+            report.AppendLine($"IKE suite: {diag?.Suite.ToString() ?? "unknown"}; DH: {diag?.DhGroup ?? "unknown"}; EAP: {diag?.EapMethod ?? "unknown"}");
+            report.AppendLine($"Tunnel: {(diag?.Tunnel is null ? "not established" : $"assigned={diag.Tunnel.AssignedIPv4 ?? diag.Tunnel.AssignedIPv6 ?? "unknown"}; P-CSCF={diag.Tunnel.PcscfIp}; ESP={diag.Tunnel.EncryptionAlgorithm}/{diag.Tunnel.IntegrityAlgorithm}")}");
+            report.AppendLine($"IMS result: {diag?.Ims?.RegistrationState ?? "not registered"}; security={diag?.Ims?.SecurityAssociation ?? "n/a"}; expiry={diag?.Ims?.ExpiresSeconds.ToString() ?? "n/a"}");
+            report.AppendLine($"SIP probes: sent={diag?.SipProbesSent ?? 0}; success={diag?.SipProbesSuccess ?? 0}; failed={diag?.SipProbesFailed ?? 0}; last={diag?.LastProbeResult ?? "none"}");
+            report.AppendLine();
+            report.AppendLine("=== Latest IMS registration chain ===");
+            report.AppendLine("Only the most recent VoWiFi start attempt and its ePDG / IKE / EAP / tunnel / IMS / SIP events are included.");
+
+            try
+            {
+                var persisted = await ReadTailLinesAsync(GetLogFilePath(), 5000).ConfigureAwait(false);
+                var live = Logs.Select(entry =>
+                    $"[{entry.Timestamp:yyyy-MM-dd HH:mm:ss.fff}] [{entry.Level}] [{entry.Source}] {entry.Message}");
+                var chain = ExtractLatestImsRegistrationChain(persisted.Concat(live));
+                foreach (var line in chain)
+                    report.AppendLine(DiagnosticLogRedactor.Redact(line));
+            }
+            catch (Exception ex)
+            {
+                report.AppendLine($"[WARN] Could not read persisted log: {DiagnosticLogRedactor.Redact(ex.Message)}");
+            }
+
+            AddLog("INFO", "Diagnostics", "A concise IMS registration-chain diagnostic report was generated (sensitive fields redacted).");
+            return report.ToString();
+        }
+
+        private static IReadOnlyList<string> ExtractLatestImsRegistrationChain(IEnumerable<string> source)
+        {
+            var allLines = source
+                .Where(line => !string.IsNullOrWhiteSpace(line))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            var startIndex = allLines.FindLastIndex(IsImsRegistrationStart);
+            // Keep the few setup events immediately before the start marker so
+            // the selected SOCKS/direct route is visible with the attempt.
+            var attemptLines = startIndex >= 0
+                ? allLines.Skip(Math.Max(0, startIndex - 5))
+                : allLines;
+            var relevant = attemptLines.Where(IsImsRegistrationEvent).ToList();
+
+            if (relevant.Count == 0)
+                return ["No VoWiFi registration event was recorded yet. Reproduce the failure once, then export the report immediately."];
+
+            // An ESP-heavy trace can be noisy. Preserve the beginning (DNS/IKE)
+            // and the end (the actual failure) while keeping the report shareable.
+            const int maxLines = 420;
+            if (relevant.Count <= maxLines) return relevant;
+
+            var excerpt = relevant.Take(100).ToList();
+            excerpt.Add($"[INFO] [Diagnostics] {relevant.Count - maxLines} registration-chain events omitted; showing setup and final failure.");
+            excerpt.AddRange(relevant.TakeLast(maxLines - excerpt.Count));
+            return excerpt;
+        }
+
+        private static bool IsImsRegistrationStart(string line) =>
+            line.Contains("Starting VoWiFi on slot", StringComparison.OrdinalIgnoreCase) ||
+            line.Contains("VoWiFi state: ResolvingEpdg", StringComparison.OrdinalIgnoreCase) ||
+            line.Contains("REGISTER diagnostics started", StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsImsRegistrationEvent(string line) =>
+            line.Contains("[VoWiFi]", StringComparison.OrdinalIgnoreCase) ||
+            line.Contains("[IMS]", StringComparison.OrdinalIgnoreCase) ||
+            line.Contains("[SIP]", StringComparison.OrdinalIgnoreCase) ||
+            line.Contains("[IKE", StringComparison.OrdinalIgnoreCase) ||
+            line.Contains("[IPsec", StringComparison.OrdinalIgnoreCase) ||
+            line.Contains("[Proxy]", StringComparison.OrdinalIgnoreCase) ||
+            line.Contains("[StateMachine]", StringComparison.OrdinalIgnoreCase);
+
+        private static async Task<IReadOnlyList<string>> ReadTailLinesAsync(string path, int maxLines)
+        {
+            if (!File.Exists(path)) return Array.Empty<string>();
+
+            var lines = new Queue<string>(maxLines);
+            await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 16 * 1024, useAsync: true);
+            using var reader = new StreamReader(stream);
+            while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+            {
+                if (lines.Count == maxLines) lines.Dequeue();
+                lines.Enqueue(line);
+            }
+            return lines.ToArray();
+        }
+
         private static byte[] BuildDnsHealthQuery(ushort transactionId)
         {
             // Minimal recursive A query for example.com.
@@ -2105,6 +2219,8 @@ namespace VoWin.Services
         public Task<CallExperienceSettings> GetCallExperienceSettingsAsync() => Task.FromResult(new CallExperienceSettings
         {
             VolteAudioPrewarmEnabled = _callExperience.VolteAudioPrewarmEnabled,
+            SaveCallRecordings = _callExperience.SaveCallRecordings,
+            RecordingDirectory = _callExperience.RecordingDirectory,
             AutoAnswerEnabled = _callExperience.AutoAnswerEnabled,
             AutoAnswerDelaySeconds = _callExperience.AutoAnswerDelaySeconds,
             AutoAnswerMessagePath = _callExperience.AutoAnswerMessagePath
@@ -2116,6 +2232,7 @@ namespace VoWin.Services
             _callExperience = settings;
             await _callExperienceStore.SaveAsync(settings);
             ApplyVolteAudioPrewarmPreference();
+            ApplyCallRecordingPreference();
         }
 
         private void ApplyVolteAudioPrewarmPreference()
@@ -2128,6 +2245,14 @@ namespace VoWin.Services
 
             if (CurrentCallState is CallState.Idle or CallState.Ended or CallState.Incoming)
                 _callAlerting.PrewarmHostAudio();
+        }
+
+        private void ApplyCallRecordingPreference()
+        {
+            var directory = _callExperience.RecordingDirectory;
+            Kernel.Calls.ConfigureAudioRecording(_callExperience.SaveCallRecordings, directory);
+            foreach (var slot in Kernel.GetSlots())
+                slot.Calls.ConfigureAudioRecording(_callExperience.SaveCallRecordings, directory);
         }
 
         private void StartIncomingAlertingAndAutoAnswer(string? slotId)

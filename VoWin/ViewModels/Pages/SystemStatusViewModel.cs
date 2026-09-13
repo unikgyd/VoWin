@@ -1,6 +1,7 @@
 using System;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -8,6 +9,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Data;
 using System.Windows.Media;
+using Microsoft.Win32;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using VoSharp.Kernel.Pool;
@@ -620,6 +622,7 @@ namespace VoWin.ViewModels.Pages
             _kernelService.Kernel.VoWifiStateChanged += (s, e) => NotifyAll();
             _kernelService.Kernel.SignalQualityChanged += (s, e) => NotifyAll();
             _kernelService.Kernel.NetworkRegistrationChanged += (s, e) => NotifyAll();
+            ThemeBrushes.ThemeResourcesRefreshed += NotifyAll;
             _kernelService.Kernel.SimStateChanged += (s, e) =>
             {
                 NotifyAll();
@@ -1015,6 +1018,37 @@ namespace VoWin.ViewModels.Pages
             catch (Exception ex)
             {
                 StatusMessage = $"复制失败: {ex.Message}";
+            }
+        }
+
+        [RelayCommand]
+        private async Task ExportImsDiagnosticsAsync()
+        {
+            try
+            {
+                StatusMessage = "正在整理 IMS 注册诊断报告…";
+                var report = await _kernelService.BuildImsDiagnosticReportAsync(SelectedSlot?.Id);
+                var dialog = new SaveFileDialog
+                {
+                    FileName = $"VoWin-IMS-Diagnostic-{DateTime.Now:yyyyMMdd-HHmmss}.txt",
+                    DefaultExt = ".txt",
+                    Filter = "VoWin 诊断报告 (*.txt)|*.txt|所有文件 (*.*)|*.*"
+                };
+
+                if (dialog.ShowDialog() != true)
+                {
+                    StatusMessage = "已取消导出诊断报告。";
+                    return;
+                }
+
+                await File.WriteAllTextAsync(dialog.FileName, report);
+                StatusMessage = "IMS 诊断报告已导出，可发送给技术支持分析。";
+                AppToast.Show("诊断报告已导出", "报告已经过身份与密钥脱敏，可安全分享。", ControlAppearance.Success);
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = $"导出 IMS 诊断报告失败: {ex.Message}";
+                AppToast.Show("导出失败", "未能生成 IMS 诊断报告，请查看实时日志。", ControlAppearance.Danger);
             }
         }
     }

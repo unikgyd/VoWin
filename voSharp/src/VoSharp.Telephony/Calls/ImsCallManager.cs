@@ -26,6 +26,8 @@ public class ImsCallManager : IDisposable
     public CallInfo? ActiveCall { get; private set; }
     public AsyncEventBus? EventBus { get; }
     public bool IsIncoming => ActiveCall != null && !ActiveCall.IsOutgoing;
+    public bool SaveAudioRecordings { get; private set; } = true;
+    public string? RecordingDirectory { get; private set; }
 
     public event EventHandler<CallStateChangedEventArgs>? CallStateChanged;
     public event EventHandler<IncomingCallEventArgs>? IncomingCall;
@@ -56,6 +58,8 @@ public class ImsCallManager : IDisposable
     private string? _lastInviteVia;
     private readonly object _prackGate = new();
     private readonly HashSet<string> _reliableProvisionals = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _recordingRetentionGate = new(1, 1);
+    private const int MaxSavedRecordingCalls = 20;
 
     private SipMessage? _incomingInvite;
     private Func<SipMessage, Task>? _incomingReplySender;
@@ -65,6 +69,13 @@ public class ImsCallManager : IDisposable
     {
         EventBus = eventBus;
         _audio   = new WindowsAudioDevice(sampleRate: 8000);
+    }
+
+    /// <summary>Configures whether completed IMS calls are written to WAV/AMR files.</summary>
+    public void ConfigureAudioRecording(bool enabled, string? directory)
+    {
+        SaveAudioRecordings = enabled;
+        RecordingDirectory = string.IsNullOrWhiteSpace(directory) ? null : directory.Trim();
     }
 
     /// <summary>
@@ -239,9 +250,7 @@ public class ImsCallManager : IDisposable
 
         Console.WriteLine($"[ImsCallManager] INVITE prepared for {targetUri} via IMS signalling port {signalingEndpoint.Port}.");
 
-        var wavPath = Path.Combine(
-            Directory.GetCurrentDirectory(),
-            $"call_{cleanNumber}_{DateTime.Now:yyyyMMdd_HHmmss}.wav");
+        var wavPath = CreateRecordingPath(cleanNumber, isIncoming: false);
 
         var call = new CallInfo(
             CallId:           _currentCallId,
@@ -458,9 +467,7 @@ public class ImsCallManager : IDisposable
         var oldState = State;
         State = CallState.Ringing;
         var startedAt = DateTime.UtcNow;
-        var wavPath = Path.Combine(
-            Directory.GetCurrentDirectory(),
-            $"call_incoming_{callerNumber}_{DateTime.Now:yyyyMMdd_HHmmss}.wav");
+        var wavPath = CreateRecordingPath(callerNumber, isIncoming: true);
 
         ActiveCall = new CallInfo(
             CallId: _currentCallId,
@@ -679,17 +686,7 @@ public class ImsCallManager : IDisposable
         {
             var wavPath = ActiveCall.WavRecordingPath;
             var rtpToSave = _rtp;
-            _ = Task.Run(() =>
-            {
-                try
-                {
-                    if (rtpToSave != null)
-                        rtpToSave.SaveAudioRecording(wavPath);
-                    else
-                        _audio.SaveToWavFile(wavPath);
-                }
-                catch { }
-            });
+            _ = Task.Run(() => SaveRecordingAndPrune(wavPath, rtpToSave));
         }
 
         ReleaseRtpSession();
@@ -745,17 +742,7 @@ public class ImsCallManager : IDisposable
         {
             var wavPath = ActiveCall.WavRecordingPath;
             var rtpToSave = _rtp;
-            _ = Task.Run(() =>
-            {
-                try
-                {
-                    if (rtpToSave != null)
-                        rtpToSave.SaveAudioRecording(wavPath);
-                    else
-                        _audio.SaveToWavFile(wavPath);
-                }
-                catch { }
-            });
+            _ = Task.Run(() => SaveRecordingAndPrune(wavPath, rtpToSave));
         }
 
         if (ActiveCall != null)
@@ -1066,6 +1053,88 @@ public class ImsCallManager : IDisposable
         cancel.SetHeader("Content-Length", "0");
         return cancel;
     }
+
+    private string? CreateRecordingPath(string remoteNumber, bool isIncoming)
+    {
+        if (!SaveAudioRecordings) return null;
+
+        try
+        {
+            var directory = string.IsNullOrWhiteSpace(RecordingDirectory)
+                ? Directory.GetCurrentDirectory()
+                : RecordingDirectory;
+            Directory.CreateDirectory(directory);
+            var safeNumber = Regex.Replace(remoteNumber, @"[^0-9A-Za-z+_-]", "_");
+            var direction = isIncoming ? "incoming" : "outgoing";
+            return Path.Combine(directory, $"call_{direction}_{safeNumber}_{DateTime.Now:yyyyMMdd_HHmmss}.wav");
+        }
+        catch (Exception ex)
+        {
+            EventBus?.Publish(EventTopics.SystemError, "ImsCallManager",
+                $"Call recording was enabled but its folder is unavailable: {ex.Message}");
+            return null;
+        }
+    }
+
+    private void SaveRecordingAndPrune(string wavPath, RtpSession? rtpToSave)
+    {
+        try
+        {
+            if (rtpToSave != null)
+                rtpToSave.SaveAudioRecording(wavPath);
+            else
+                _audio.SaveToWavFile(wavPath);
+
+            PruneSavedRecordings(Path.GetDirectoryName(wavPath));
+        }
+        catch (Exception ex)
+        {
+            EventBus?.Publish(EventTopics.SystemError, "ImsCallManager", $"Could not save call recording: {ex.Message}");
+        }
+    }
+
+    private void PruneSavedRecordings(string? directory)
+    {
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory)) return;
+        _recordingRetentionGate.Wait();
+        try
+        {
+            var recordings = Directory.EnumerateFiles(directory, "call_*.*", SearchOption.TopDirectoryOnly)
+                .Where(path => IsRecordingExtension(Path.GetExtension(path)))
+                .GroupBy(Path.GetFileNameWithoutExtension, StringComparer.OrdinalIgnoreCase)
+                .Select(group => new
+                {
+                    BaseName = group.Key,
+                    Files = group.ToArray(),
+                    OldestWriteTime = group.Min(path => File.GetLastWriteTimeUtc(path))
+                })
+                .OrderBy(recording => recording.OldestWriteTime)
+                .ThenBy(recording => recording.BaseName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            foreach (var recording in recordings.Take(Math.Max(0, recordings.Count - MaxSavedRecordingCalls)))
+            {
+                foreach (var path in recording.Files)
+                {
+                    try { File.Delete(path); }
+                    catch (Exception ex)
+                    {
+                        EventBus?.Publish(EventTopics.SystemError, "ImsCallManager",
+                            $"Could not remove expired call recording '{Path.GetFileName(path)}': {ex.Message}");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            _recordingRetentionGate.Release();
+        }
+    }
+
+    private static bool IsRecordingExtension(string extension) =>
+        extension.Equals(".wav", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".amr", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".mp3", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Parses the remote SDP Answer and configures the RTP session endpoint.

@@ -14,7 +14,7 @@ namespace VoWin.ViewModels.Pages
         public SettingsViewModel(IVoKernelService kernel) => _kernel = kernel;
 
         [ObservableProperty]
-        private string _appVersion = "VoWin v1.0.0";
+        private string _appVersion = "VoWin";
 
         [ObservableProperty]
         private ApplicationTheme _currentTheme = ApplicationTheme.Unknown;
@@ -30,8 +30,10 @@ namespace VoWin.ViewModels.Pages
 
         [ObservableProperty] private bool _autoAnswerEnabled;
         [ObservableProperty] private bool _volteAudioPrewarmEnabled = true;
+        [ObservableProperty] private bool _saveCallRecordings = true;
         [ObservableProperty] private int _autoAnswerDelaySeconds = 30;
         [ObservableProperty] private string _autoAnswerMessagePath = string.Empty;
+        [ObservableProperty] private string _recordingDirectory = string.Empty;
         [ObservableProperty] private string _callSettingsStatus = string.Empty;
 
         public async Task OnNavigatedToAsync()
@@ -42,9 +44,11 @@ namespace VoWin.ViewModels.Pages
             {
                 var settings = await _kernel.GetCallExperienceSettingsAsync();
                 VolteAudioPrewarmEnabled = settings.VolteAudioPrewarmEnabled;
+                SaveCallRecordings = settings.SaveCallRecordings;
                 AutoAnswerEnabled = settings.AutoAnswerEnabled;
                 AutoAnswerDelaySeconds = settings.AutoAnswerDelaySeconds;
                 AutoAnswerMessagePath = settings.AutoAnswerMessagePath ?? string.Empty;
+                RecordingDirectory = settings.RecordingDirectory ?? GetDefaultRecordingDirectory();
                 _callSettingsLoaded = true;
             }
         }
@@ -54,14 +58,14 @@ namespace VoWin.ViewModels.Pages
         private void InitializeViewModel()
         {
             CurrentTheme = ApplicationThemeManager.GetAppTheme();
-            AppVersion = $"VoWin v1.0.0 (Build {GetAssemblyVersion()})";
+            AppVersion = $"VoWin v{GetAssemblyVersion()}";
             _isInitialized = true;
         }
 
         private string GetAssemblyVersion()
         {
-            return System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString()
-                ?? "1.0.0";
+            var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+            return version?.ToString(3) ?? "0.1.0";
         }
 
         [RelayCommand]
@@ -104,6 +108,18 @@ namespace VoWin.ViewModels.Pages
         }
 
         [RelayCommand]
+        private void BrowseRecordingDirectory()
+        {
+            var dialog = new Microsoft.Win32.OpenFolderDialog
+            {
+                Title = "选择通话录音保存文件夹",
+                InitialDirectory = Directory.Exists(RecordingDirectory) ? RecordingDirectory : GetDefaultRecordingDirectory()
+            };
+            if (dialog.ShowDialog() == true)
+                RecordingDirectory = dialog.FolderName;
+        }
+
+        [RelayCommand]
         private async Task SaveCallSettingsAsync()
         {
             var path = string.IsNullOrWhiteSpace(AutoAnswerMessagePath) ? null : AutoAnswerMessagePath.Trim();
@@ -112,14 +128,34 @@ namespace VoWin.ViewModels.Pages
                 CallSettingsStatus = "启用自动接听前，请选择存在的录音文件。";
                 return;
             }
+            var recordingDirectory = string.IsNullOrWhiteSpace(RecordingDirectory)
+                ? GetDefaultRecordingDirectory()
+                : RecordingDirectory.Trim();
+            if (SaveCallRecordings)
+            {
+                try
+                {
+                    Directory.CreateDirectory(recordingDirectory);
+                }
+                catch (Exception ex)
+                {
+                    CallSettingsStatus = $"无法使用录音保存文件夹: {ex.Message}";
+                    return;
+                }
+            }
             await _kernel.SaveCallExperienceSettingsAsync(new CallExperienceSettings
             {
                 VolteAudioPrewarmEnabled = VolteAudioPrewarmEnabled,
+                SaveCallRecordings = SaveCallRecordings,
+                RecordingDirectory = recordingDirectory,
                 AutoAnswerEnabled = AutoAnswerEnabled,
                 AutoAnswerDelaySeconds = AutoAnswerDelaySeconds,
                 AutoAnswerMessagePath = path
             });
             CallSettingsStatus = "通话与来电设置已保存。";
         }
+
+        private static string GetDefaultRecordingDirectory() => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VoWin", "Recordings");
     }
 }

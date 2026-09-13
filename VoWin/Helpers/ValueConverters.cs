@@ -11,6 +11,8 @@ namespace VoWin.Helpers
 {
     internal static class ThemeBrushes
     {
+        public static event Action? ThemeResourcesRefreshed;
+
         public static Brush Get(string key, Color fallback) =>
             Application.Current?.TryFindResource(key) as Brush ?? new SolidColorBrush(fallback);
 
@@ -19,6 +21,8 @@ namespace VoWin.Helpers
         public static Brush Warning => Get("AppWarningBrush", Color.FromRgb(0xC6, 0x6A, 0x08));
         public static Brush Danger => Get("AppDangerBrush", Color.FromRgb(0xD9, 0x2D, 0x4C));
         public static Brush Muted => Get("AppTextTertiaryBrush", Color.FromRgb(0x71, 0x83, 0x9A));
+
+        public static void NotifyThemeResourcesRefreshed() => ThemeResourcesRefreshed?.Invoke();
     }
 
     public class BoolToVisibilityConverter : IValueConverter

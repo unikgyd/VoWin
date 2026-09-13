@@ -294,6 +294,14 @@
 
                   <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
                     <ui:Button
+                      Appearance="Secondary"
+                      Padding="10,4"
+                      Margin="0,0,6,0"
+                      Command="{Binding ExportImsDiagnosticsCommand}"
+                      Content="导出诊断"
+                      ToolTip="导出脱敏后的 IMS 注册诊断报告，供技术支持分析"
+                    />
+                    <ui:Button
                       Appearance="Primary"
                       Padding="10,4"
                       Command="{Binding ExecutePrimaryActionCommand}"
@@ -684,6 +692,15 @@
                   <TextBlock FontSize="11" Text="{Binding AutoScrollStatusText, Mode=OneWay}" />
                 </StackPanel>
               </ui:Button>
+
+              <ui:Button
+                Appearance="Transparent"
+                Padding="6,2"
+                Margin="0,0,2,0"
+                Command="{Binding ExportImsDiagnosticsCommand}"
+                Content="导出"
+                ToolTip="导出 IMS 注册诊断报告（已脱敏）"
+              />
 
               <!-- Copy button -->
               <ui:Button

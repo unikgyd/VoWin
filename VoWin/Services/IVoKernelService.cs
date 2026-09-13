@@ -81,6 +81,7 @@ namespace VoWin.Services
         // VoWiFi
         Task<bool> StartVoWifiAsync(string? slotId = null);
         Task<bool> StopVoWifiAsync(string? slotId = null);
+        Task<string> BuildImsDiagnosticReportAsync(string? slotId = null);
 
         // eSIM / eUICC
         Task<IReadOnlyList<Profile>> GetEuiccProfilesAsync(string? slotId = null);

@@ -182,6 +182,13 @@
             <Border Margin="0,0,0,18" Padding="12,9" Background="{DynamicResource AppWarningSoftBrush}" BorderBrush="{DynamicResource AppWarningBrush}" BorderThickness="1" CornerRadius="8">
               <TextBlock Foreground="{DynamicResource AppTextPrimaryBrush}" TextWrapping="Wrap" Text="注意：开启 VoLTE 音频预热后，VoWin 会长期占用麦克风，以缩短接通后的音频启动时间。关闭后，麦克风只在实际通话时启用。" />
             </Border>
+            <ui:ToggleSwitch Margin="0,0,0,8" IsChecked="{Binding ViewModel.SaveCallRecordings}" Content="保存 VoWiFi 通话录音" />
+            <TextBlock Margin="0,0,0,6" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="录音将保存为 WAV（部分 AMR 通话会同时保存 AMR 原始音频）；每个文件夹最多保留最近 20 通，超过后自动成对清理最早录音。" TextWrapping="Wrap" />
+            <TextBlock Text="录音保存文件夹" Margin="0,0,0,6" />
+            <DockPanel Margin="0,0,0,16">
+              <ui:Button DockPanel.Dock="Right" Content="选择文件夹" Command="{Binding ViewModel.BrowseRecordingDirectoryCommand}" />
+              <TextBox Margin="0,0,12,0" Text="{Binding ViewModel.RecordingDirectory, UpdateSourceTrigger=PropertyChanged}" />
+            </DockPanel>
             <ui:ToggleSwitch Margin="0,0,0,12" IsChecked="{Binding ViewModel.AutoAnswerEnabled}" Content="30 秒无人接听时自动接听" />
             <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
               <TextBlock VerticalAlignment="Center" Text="等待秒数" Margin="0,0,12,0" />

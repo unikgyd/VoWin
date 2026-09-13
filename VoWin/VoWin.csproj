@@ -14,6 +14,12 @@
     <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Release builds must supply this with -p:Version=x.y.z. The fallback
+         keeps local developer builds deterministic. -->
+    <Version Condition="'$(Version)' == ''">0.1.0</Version>
+    <AssemblyVersion Condition="'$(AssemblyVersion)' == ''">$(Version)</AssemblyVersion>
+    <FileVersion Condition="'$(FileVersion)' == ''">$(Version)</FileVersion>
+    <InformationalVersion Condition="'$(InformationalVersion)' == ''">$(Version)</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

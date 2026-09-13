@@ -258,6 +258,7 @@ namespace VoWin.ViewModels.Pages
             _kernelService.Kernel.VoWifiStateChanged += (s, e) => RefreshSummaryProperties();
             _kernelService.Kernel.SignalQualityChanged += (s, e) => RefreshSummaryProperties();
             _kernelService.Kernel.NetworkRegistrationChanged += (s, e) => RefreshSummaryProperties();
+            ThemeBrushes.ThemeResourcesRefreshed += RefreshSummaryProperties;
             _kernelService.Kernel.SimStateChanged += (s, e) =>
             {
                 RefreshSummaryProperties();

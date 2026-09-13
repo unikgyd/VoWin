@@ -3,6 +3,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using System.IO;
 using System.Reflection;
+using System.Diagnostics;
+using System.Threading;
 using System.Windows.Threading;
 using VoWin.Services;
 using VoWin.ViewModels.Pages;
@@ -20,6 +22,8 @@ namespace VoWin
     /// </summary>
     public partial class App
     {
+        private const string SingleInstanceMutexName = @"Local\VoWin.SingleInstance.v1";
+        private const string SingleInstanceActivationEventName = @"Local\VoWin.ActivateExistingInstance.v1";
         // The.NET Generic Host provides dependency injection, configuration, logging, and other services.
         // https://docs.microsoft.com/dotnet/core/extensions/generic-host
         // https://docs.microsoft.com/dotnet/core/extensions/dependency-injection
@@ -76,6 +80,11 @@ namespace VoWin
                 services.AddSingleton<AboutViewModel>();
             }).Build();
         private bool _cellularAudioHelperMode;
+        private Mutex? _singleInstanceMutex;
+        private EventWaitHandle? _singleInstanceActivationEvent;
+        private CancellationTokenSource? _singleInstanceListenerCts;
+        private Task? _singleInstanceListenerTask;
+        private bool _ownsSingleInstanceMutex;
         public static IServiceProvider Services
         {
             get { return _host.Services; }
@@ -89,6 +98,27 @@ namespace VoWin
                 ShutdownMode = ShutdownMode.OnExplicitShutdown;
                 var exitCode = await CellularAudioWorkerHost.RunAsync(e.Args);
                 Shutdown(exitCode);
+                return;
+            }
+
+            if (!AcquireSingleInstance())
+            {
+                Shutdown(0);
+                return;
+            }
+
+            // A pre-single-instance release cannot answer the activation event.
+            // Detect it by process name as a final guard so two releases never
+            // contend for the same modem ports.
+            if (HasAnotherVoWinProcess())
+            {
+                ReleaseSingleInstance();
+                MessageBox.Show(
+                    "检测到另一个 VoWin 正在运行。请从托盘打开或先彻底退出已有实例，避免两个程序同时占用通信模组。",
+                    "VoWin 已在运行",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                Shutdown(0);
                 return;
             }
 
@@ -109,7 +139,9 @@ namespace VoWin
                 ApplicationThemeManager.Changed += (_, _) =>
                     Dispatcher.BeginInvoke(ApplyBrandTheme, DispatcherPriority.Background);
                 ApplyBrandTheme();
+                StartSingleInstanceActivationListener();
                 await _host.StartAsync();
+                _ = CheckForGitHubReleaseUpdateAsync();
             }
             catch (Exception ex)
             {
@@ -244,6 +276,133 @@ namespace VoWin
             res["ToggleButtonBackgroundCheckedPressed"] = accentPressed;
             res["ToggleButtonBorderBrushChecked"] = accent;
             res["ToggleButtonBorderBrushCheckedPressed"] = accentPressed;
+            // Some status elements receive a brush from a view-model or a value
+            // converter rather than directly through DynamicResource. Re-evaluate
+            // those bindings after the palette has been replaced.
+            Helpers.ThemeBrushes.NotifyThemeResourcesRefreshed();
+        }
+
+        private async Task CheckForGitHubReleaseUpdateAsync()
+        {
+            try
+            {
+                // Do not delay the main window or modem initialization for a
+                // network request. GitHub failures are intentionally silent.
+                var installed = Assembly.GetExecutingAssembly().GetName().Version;
+                if (installed == null) return;
+                var update = await new GitHubReleaseUpdateService().CheckAsync(installed, CancellationToken.None);
+                if (update == null) return;
+
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    var result = MessageBox.Show(
+                        $"发现新版本 VoWin v{update.Version.ToString(3)}。\n当前版本：v{installed.ToString(3)}\n\n是否打开 GitHub 下载页面？",
+                        "发现新版本",
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Information);
+                    if (result == MessageBoxResult.Yes)
+                    {
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = update.ReleasePageUrl,
+                            UseShellExecute = true
+                        });
+                    }
+                }, DispatcherPriority.ApplicationIdle);
+            }
+            catch
+            {
+                // Update checking is best-effort and must never affect startup.
+            }
+        }
+
+        private bool AcquireSingleInstance()
+        {
+            try
+            {
+                _singleInstanceActivationEvent = new EventWaitHandle(
+                    initialState: false,
+                    mode: EventResetMode.AutoReset,
+                    name: SingleInstanceActivationEventName);
+                _singleInstanceMutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out var createdNew);
+                _ownsSingleInstanceMutex = createdNew;
+                if (createdNew) return true;
+
+                try { _singleInstanceActivationEvent.Set(); } catch { }
+                _singleInstanceActivationEvent.Dispose();
+                _singleInstanceActivationEvent = null;
+                _singleInstanceMutex.Dispose();
+                _singleInstanceMutex = null;
+                return false;
+            }
+            catch (Exception ex)
+            {
+                LogCrash("SingleInstance.Acquire", ex);
+                // Failing open here could let two processes seize hardware, so
+                // prefer a safe exit if Windows cannot create the named objects.
+                MessageBox.Show("VoWin 无法确认是否已有运行实例，已取消启动以保护通信模组。", "VoWin 启动受保护", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return false;
+            }
+        }
+
+        private static bool HasAnotherVoWinProcess()
+        {
+            try
+            {
+                using var current = Process.GetCurrentProcess();
+                return Process.GetProcessesByName(current.ProcessName)
+                    .Any(process =>
+                    {
+                        try { return process.Id != current.Id; }
+                        finally { process.Dispose(); }
+                    });
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void StartSingleInstanceActivationListener()
+        {
+            var activationEvent = _singleInstanceActivationEvent;
+            if (activationEvent == null) return;
+
+            var cts = new CancellationTokenSource();
+            _singleInstanceListenerCts = cts;
+            _singleInstanceListenerTask = Task.Run(() =>
+            {
+                try
+                {
+                    while (!cts.IsCancellationRequested)
+                    {
+                        if (!activationEvent.WaitOne(500) || cts.IsCancellationRequested) continue;
+                        Dispatcher.BeginInvoke(() =>
+                        {
+                            if (!cts.IsCancellationRequested)
+                                TrayManager.RestoreMainWindow();
+                        }, DispatcherPriority.ApplicationIdle);
+                    }
+                }
+                catch (ObjectDisposedException) { }
+            });
+        }
+
+        private void ReleaseSingleInstance()
+        {
+            var cts = Interlocked.Exchange(ref _singleInstanceListenerCts, null);
+            cts?.Cancel();
+            try { _singleInstanceActivationEvent?.Set(); } catch { }
+            try { _singleInstanceActivationEvent?.Dispose(); } catch { }
+            _singleInstanceActivationEvent = null;
+            if (_ownsSingleInstanceMutex)
+            {
+                try { _singleInstanceMutex?.ReleaseMutex(); } catch { }
+            }
+            _ownsSingleInstanceMutex = false;
+            try { _singleInstanceMutex?.Dispose(); } catch { }
+            _singleInstanceMutex = null;
+            cts?.Dispose();
         }
 
         [Obsolete("Use ApplyBrandTheme instead.")]
@@ -292,6 +451,7 @@ namespace VoWin
         /// </summary>
         private async void OnExit(object sender, ExitEventArgs e)
         {
+            ReleaseSingleInstance();
             if (_cellularAudioHelperMode)
             {
                 try { _host.Dispose(); } catch { }

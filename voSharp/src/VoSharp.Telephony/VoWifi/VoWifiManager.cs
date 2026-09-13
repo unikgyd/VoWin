@@ -697,13 +697,16 @@ public class VoWifiManager : IDisposable
                     _imsIpsec.Activate(agreement, ck, ik);
                     _sipTransport.SetEndpoints(new IPEndPoint(IPAddress.Parse(AssignedIp!), agreement.Selected.PortClient),
                         new IPEndPoint(pcscfAddr, agreement.PcscfServerPort));
-                });
+                },
+                diagnosticLog: message => EventBus?.Publish(EventTopics.SystemLog, "IMS", message));
             _registerSession = session;
             async Task<(byte[] Res, byte[] Ck, byte[] Ik)> Authenticate(byte[] rand, byte[] autn, CancellationToken token)
             {
                 var akaRes = await akaProvider.AuthenticateAsync(AkaChallenge.Create(rand, autn), token).ConfigureAwait(false);
                 return (akaRes.Res!, akaRes.Ck!, akaRes.Ik!);
             }
+            EventBus?.Publish(EventTopics.SystemLog, "IMS",
+                $"REGISTER diagnostics started; P-CSCF={pcscfAddr}:5060; UE={assignedAddress}; transport={assignedAddress.AddressFamily}; IMS-IPsec={_imsIpsec is not null}.");
             var regResult = await session.RegisterAsync(Authenticate, ct).ConfigureAwait(false);
             SmsCapabilityConfirmed = regResult.SmsCapabilityConfirmed;
             ImsInfo = new VoWifiImsSessionInfo(
@@ -750,6 +753,8 @@ public class VoWifiManager : IDisposable
         catch (Exception ex)
         {
             var failure = ex.Message;
+            EventBus?.Publish(EventTopics.SystemError, "IMS",
+                $"IMS registration/startup failed while stage={State}; error={failure}");
             try { await StopVoWifiCoreAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
             LastError = failure;
             SetState(VoWifiState.Failed);
