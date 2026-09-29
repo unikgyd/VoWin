@@ -16,7 +16,7 @@ public sealed class CSharpIkeBackend : IIkeBackend
 {
     private IkeTransport? _transport;
     private EspTunnel? _espTunnel;
-    private IkeLivenessProbe? _livenessProbe;
+    private IkeSessionController? _sessionController;
     private bool _disposed;
 
     public EspTunnel? EspTunnel => _espTunnel;
@@ -24,7 +24,7 @@ public sealed class CSharpIkeBackend : IIkeBackend
 
     /// <summary>Proves the ePDG IKE SA is alive with an encrypted INFORMATIONAL exchange.</summary>
     public Task ProbeLivenessAsync(CancellationToken ct = default)
-        => _livenessProbe?.ProbeAsync(ct)
+        => _sessionController?.ProbeAsync(ct)
            ?? throw new InvalidOperationException("IKE liveness probe is unavailable before the tunnel is established.");
 
     public async Task<IkeBackendResult> StartTunnelAsync(
@@ -121,6 +121,34 @@ public sealed class CSharpIkeBackend : IIkeBackend
                 ForceNatt: forceNatt,
                 LocalAddress: localAddress), ct).ConfigureAwait(false);
 
+            // IDi precedes EAP type negotiation. If the ePDG selects AKA',
+            // start a fresh IKE SA with the mandatory '6' permanent identity;
+            // continuing this SA would bind AUTH to the earlier AKA identity.
+            if (result.RequestedEapType == EapType.AkaPrime)
+            {
+                diagnosticLog?.Invoke("ePDG selected EAP-AKA'; restarting IKE_AUTH with the AKA' permanent identity.");
+                result = await IkeSession.EstablishAsync(new IkeSessionRequest(
+                    EpdgIp: remoteIp,
+                    AkaProvider: akaProvider,
+                    Imsi: sim.Imsi,
+                    HomeMcc: homePlmn.Mcc,
+                    HomeMnc: homePlmn.Mnc,
+                    ExpectedIccid: sim.Iccid,
+                    Apn: apn,
+                    Imei: imei,
+                    FallbackPcscf: fallbackPcscf,
+                    Suite: configuredIkeSuite,
+                    ChildSuite: EspSuite.Preferred,
+                    ProxyUrl: proxyUrl,
+                    Suites: ikeSuites,
+                    ChildSuites: childSuites,
+                    AddressFamilyMode: addressFamily,
+                    DiagnosticLog: diagnosticLog,
+                    ForceNatt: forceNatt,
+                    LocalAddress: localAddress,
+                    EapMethod: EapType.AkaPrime), ct).ConfigureAwait(false);
+            }
+
             // An ePDG that answers a dual-family CFG_REQUEST with a mismatched pair (an IPv6
             // address but an IPv4 P-CSCF) succeeds at IKE_AUTH yet leaves a tunnel that cannot
             // carry IMS signalling, so this rung is not a usable PDN — keep searching, as the
@@ -135,6 +163,7 @@ public sealed class CSharpIkeBackend : IIkeBackend
             familyErrors.Add(result.Success && !string.IsNullOrEmpty(result.AssignedIp)
                 ? $"{addressFamily}: ePDG assigned {result.AssignedIp} but returned P-CSCF {result.PcscfIp} (address families differ)"
                 : $"{addressFamily}: {result.ErrorMessage ?? "no usable assigned IP/P-CSCF"}");
+            result.Controller?.Dispose();
             result.Transport?.Dispose();
 
             // As in the reference engine, only change CP/TS family after the
@@ -161,8 +190,9 @@ public sealed class CSharpIkeBackend : IIkeBackend
         }
 
         _transport = result.Transport;
-        _livenessProbe?.Dispose();
-        _livenessProbe = result.LivenessProbe;
+        _sessionController?.Dispose();
+        _sessionController = result.Controller
+            ?? throw new InvalidOperationException("IKE completed without a persistent session controller.");
         var negotiatedEsp = result.EspSuite
             ?? throw new InvalidOperationException("IKE completed without a negotiated ESP suite.");
         Console.WriteLine(
@@ -207,17 +237,23 @@ public sealed class CSharpIkeBackend : IIkeBackend
         );
     }
 
-    public Task StopTunnelAsync(CancellationToken ct = default)
+    public async Task StopTunnelAsync(CancellationToken ct = default)
     {
-        _livenessProbe?.Dispose();
-        _livenessProbe = null;
+        if (_sessionController != null)
+        {
+            try { await _sessionController.DeleteAsync(ct).ConfigureAwait(false); }
+            finally
+            {
+                _sessionController.Dispose();
+                _sessionController = null;
+            }
+        }
         _espTunnel?.Dispose();
         _espTunnel = null;
 
         _transport?.Dispose();
         _transport = null;
 
-        return Task.CompletedTask;
     }
 
     public void Dispose()

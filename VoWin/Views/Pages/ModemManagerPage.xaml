@@ -144,6 +144,14 @@
         />
         <ui:Button
           Appearance="Secondary"
+          Margin="0,0,8,0"
+          Command="{Binding ReloadSimCommand}"
+          Icon="{ui:SymbolIcon Symbol=Sim24}"
+          Content="重载 SIM"
+          ToolTip="插卡或切卡后重新读取身份；会重载基带并中断蜂窝 IMS"
+        />
+        <ui:Button
+          Appearance="Secondary"
           Command="{Binding DiscoverSlotsCommand}"
           Icon="{ui:SymbolIcon Symbol=ArrowSync24}"
           Content="重新扫描"

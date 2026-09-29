@@ -18,8 +18,9 @@ public class EspTunnel : IDisposable
     private uint _outboundSeq;
     private uint _inboundHighestSeq;
     private ulong _inboundReplayWindow;
-    private readonly object _lock = new();
-    private bool _disposed;
+    private readonly object _sendLock = new();
+    private readonly object _receiveLock = new();
+    private volatile bool _disposed;
 
     public uint OutboundSpi => _outboundSpi;
     public uint InboundSpi => _inboundSpi;
@@ -55,7 +56,7 @@ public class EspTunnel : IDisposable
     public byte[] Seal(byte[] innerPacket, byte nextHeader = 4) // 4 = IPv4 encapsulation
     {
         ArgumentNullException.ThrowIfNull(innerPacket);
-        lock (_lock)
+        lock (_sendLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_outboundSeq == uint.MaxValue)
@@ -139,144 +140,127 @@ public class EspTunnel : IDisposable
     {
         nextHeader = 0;
         ArgumentNullException.ThrowIfNull(espPacket);
-        Monitor.Enter(_lock);
-        try
+        lock (_receiveLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-        const int blockSize = 16;
-        int minLen = 8 + blockSize + blockSize + _icvLength;
-        if (espPacket.Length < minLen)
-        {
-            TraceOpenFailure("truncated", espPacket.Length, 0, 0);
-            return null;
-        }
+            const int blockSize = 16;
+            int minLen = 8 + blockSize + blockSize + _icvLength;
+            if (espPacket.Length < minLen)
+            {
+                TraceOpenFailure("truncated", espPacket.Length, 0, 0);
+                return null;
+            }
 
-        uint spi = BinaryPrimitives.ReadUInt32BigEndian(espPacket.AsSpan(0, 4));
-        uint sequence = BinaryPrimitives.ReadUInt32BigEndian(espPacket.AsSpan(4, 4));
-        if (spi != _inboundSpi || sequence == 0)
-        {
-            TraceOpenFailure(spi != _inboundSpi ? "unexpected-spi" : "zero-sequence", espPacket.Length, spi, sequence);
-            return null;
-        }
+            uint spi = BinaryPrimitives.ReadUInt32BigEndian(espPacket.AsSpan(0, 4));
+            uint sequence = BinaryPrimitives.ReadUInt32BigEndian(espPacket.AsSpan(4, 4));
+            if (spi != _inboundSpi || sequence == 0)
+            {
+                TraceOpenFailure(spi != _inboundSpi ? "unexpected-spi" : "zero-sequence", espPacket.Length, spi, sequence);
+                return null;
+            }
 
-        lock (_lock)
-        {
             if (!IsSequenceAcceptable(sequence))
             {
                 TraceOpenFailure("replay-window", espPacket.Length, spi, sequence);
                 return null;
             }
-        }
 
-        int authLen = espPacket.Length - _icvLength;
-        int cipherLen = authLen - (8 + blockSize);
-        if (cipherLen <= 0 || cipherLen % blockSize != 0)
-        {
-            TraceOpenFailure("invalid-ciphertext-length", espPacket.Length, spi, sequence);
-            return null;
-        }
-
-        var receivedIcv = espPacket.AsSpan(authLen, _icvLength);
-        byte[]? calculatedIcv = null;
-        byte[]? fullHash = null;
-        byte[]? iv = null;
-        byte[]? ciphertext = null;
-        byte[]? decrypted = null;
-
-        try
-        {
-            if (_integrity.Contains("SHA256", StringComparison.OrdinalIgnoreCase))
+            int authLen = espPacket.Length - _icvLength;
+            int cipherLen = authLen - (8 + blockSize);
+            if (cipherLen <= 0 || cipherLen % blockSize != 0)
             {
-                using var hmac = new HMACSHA256(_inboundAuthKey);
-                fullHash = hmac.ComputeHash(espPacket, 0, authLen);
-            }
-            else
-            {
-                using var hmac = new HMACSHA1(_inboundAuthKey);
-                fullHash = hmac.ComputeHash(espPacket, 0, authLen);
-            }
-
-            calculatedIcv = fullHash.AsSpan(0, _icvLength).ToArray();
-            if (!CryptographicOperations.FixedTimeEquals(receivedIcv, calculatedIcv))
-            {
-                TraceOpenFailure("integrity-check", espPacket.Length, spi, sequence);
+                TraceOpenFailure("invalid-ciphertext-length", espPacket.Length, spi, sequence);
                 return null;
             }
 
-            iv = espPacket.AsSpan(8, blockSize).ToArray();
-            ciphertext = espPacket.AsSpan(8 + blockSize, cipherLen).ToArray();
+            var receivedIcv = espPacket.AsSpan(authLen, _icvLength);
+            byte[]? calculatedIcv = null;
+            byte[]? fullHash = null;
+            byte[]? iv = null;
+            byte[]? ciphertext = null;
+            byte[]? decrypted = null;
 
-            using (var aes = Aes.Create())
+            try
             {
-                aes.Key = _inboundEncKey;
-                aes.Mode = CipherMode.CBC;
-                aes.Padding = PaddingMode.None;
-                aes.IV = iv;
-                using var decryptor = aes.CreateDecryptor();
-                decrypted = decryptor.TransformFinalBlock(ciphertext, 0, ciphertext.Length);
-            }
-
-            if (decrypted.Length < 2)
-            {
-                TraceOpenFailure("decrypted-truncated", espPacket.Length, spi, sequence);
-                return null;
-            }
-
-            int padLen = decrypted[^2];
-            int innerLen = decrypted.Length - 2 - padLen;
-            if (padLen > decrypted.Length - 2 || innerLen <= 0)
-            {
-                TraceOpenFailure("invalid-padding-length", espPacket.Length, spi, sequence);
-                return null;
-            }
-
-            for (int i = 0; i < padLen; i++)
-            {
-                if (decrypted[innerLen + i] != (byte)(i + 1))
+                if (_integrity.Contains("SHA256", StringComparison.OrdinalIgnoreCase))
                 {
-                    TraceOpenFailure("invalid-padding-bytes", espPacket.Length, spi, sequence);
+                    using var hmac = new HMACSHA256(_inboundAuthKey);
+                    fullHash = hmac.ComputeHash(espPacket, 0, authLen);
+                }
+                else
+                {
+                    using var hmac = new HMACSHA1(_inboundAuthKey);
+                    fullHash = hmac.ComputeHash(espPacket, 0, authLen);
+                }
+
+                calculatedIcv = fullHash.AsSpan(0, _icvLength).ToArray();
+                if (!CryptographicOperations.FixedTimeEquals(receivedIcv, calculatedIcv))
+                {
+                    TraceOpenFailure("integrity-check", espPacket.Length, spi, sequence);
                     return null;
                 }
-            }
 
-            nextHeader = decrypted[^1];
-            if (nextHeader is not 4 and not 41)
-            {
-                TraceOpenFailure($"unsupported-next-header-{nextHeader}", espPacket.Length, spi, sequence);
-                nextHeader = 0;
-                return null;
-            }
+                iv = espPacket.AsSpan(8, blockSize).ToArray();
+                ciphertext = espPacket.AsSpan(8 + blockSize, cipherLen).ToArray();
 
-            lock (_lock)
-            {
-                if (!IsSequenceAcceptable(sequence))
+                using (var aes = Aes.Create())
                 {
-                    TraceOpenFailure("replay-window-race", espPacket.Length, spi, sequence);
+                    aes.Key = _inboundEncKey;
+                    aes.Mode = CipherMode.CBC;
+                    aes.Padding = PaddingMode.None;
+                    aes.IV = iv;
+                    using var decryptor = aes.CreateDecryptor();
+                    decrypted = decryptor.TransformFinalBlock(ciphertext, 0, ciphertext.Length);
+                }
+
+                if (decrypted.Length < 2)
+                {
+                    TraceOpenFailure("decrypted-truncated", espPacket.Length, spi, sequence);
                     return null;
                 }
+
+                int padLen = decrypted[^2];
+                int innerLen = decrypted.Length - 2 - padLen;
+                if (padLen > decrypted.Length - 2 || innerLen <= 0)
+                {
+                    TraceOpenFailure("invalid-padding-length", espPacket.Length, spi, sequence);
+                    return null;
+                }
+
+                for (int i = 0; i < padLen; i++)
+                {
+                    if (decrypted[innerLen + i] != (byte)(i + 1))
+                    {
+                        TraceOpenFailure("invalid-padding-bytes", espPacket.Length, spi, sequence);
+                        return null;
+                    }
+                }
+
+                nextHeader = decrypted[^1];
+                if (nextHeader is not 4 and not 41)
+                {
+                    TraceOpenFailure($"unsupported-next-header-{nextHeader}", espPacket.Length, spi, sequence);
+                    nextHeader = 0;
+                    return null;
+                }
+
                 CommitSequence(sequence);
+                return decrypted.AsSpan(0, innerLen).ToArray();
             }
-
-            return decrypted.AsSpan(0, innerLen).ToArray();
-        }
-        catch (CryptographicException)
-        {
-            TraceOpenFailure("cipher-operation", espPacket.Length, spi, sequence);
-            return null;
-        }
-        finally
-        {
-            if (calculatedIcv != null) CryptographicOperations.ZeroMemory(calculatedIcv);
-            if (fullHash != null) CryptographicOperations.ZeroMemory(fullHash);
-            if (iv != null) CryptographicOperations.ZeroMemory(iv);
-            if (ciphertext != null) CryptographicOperations.ZeroMemory(ciphertext);
-            if (decrypted != null) CryptographicOperations.ZeroMemory(decrypted);
-        }
-        }
-        finally
-        {
-            Monitor.Exit(_lock);
+            catch (CryptographicException)
+            {
+                TraceOpenFailure("cipher-operation", espPacket.Length, spi, sequence);
+                return null;
+            }
+            finally
+            {
+                if (calculatedIcv != null) CryptographicOperations.ZeroMemory(calculatedIcv);
+                if (fullHash != null) CryptographicOperations.ZeroMemory(fullHash);
+                if (iv != null) CryptographicOperations.ZeroMemory(iv);
+                if (ciphertext != null) CryptographicOperations.ZeroMemory(ciphertext);
+                if (decrypted != null) CryptographicOperations.ZeroMemory(decrypted);
+            }
         }
     }
 
@@ -318,16 +302,19 @@ public class EspTunnel : IDisposable
 
     public void Dispose()
     {
-        lock (_lock)
+        lock (_sendLock)
         {
-            if (_disposed) return;
-            _disposed = true;
-            CryptographicOperations.ZeroMemory(_outboundEncKey);
-            CryptographicOperations.ZeroMemory(_outboundAuthKey);
-            CryptographicOperations.ZeroMemory(_inboundEncKey);
-            CryptographicOperations.ZeroMemory(_inboundAuthKey);
-            _inboundReplayWindow = 0;
-            _inboundHighestSeq = 0;
+            lock (_receiveLock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                CryptographicOperations.ZeroMemory(_outboundEncKey);
+                CryptographicOperations.ZeroMemory(_outboundAuthKey);
+                CryptographicOperations.ZeroMemory(_inboundEncKey);
+                CryptographicOperations.ZeroMemory(_inboundAuthKey);
+                _inboundReplayWindow = 0;
+                _inboundHighestSeq = 0;
+            }
         }
     }
 }

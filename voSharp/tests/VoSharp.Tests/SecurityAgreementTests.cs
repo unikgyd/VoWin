@@ -147,6 +147,20 @@ public class SecurityAgreementTests
     }
 
     [Fact]
+    public void RejectsReservedEspSpiFromPcscf()
+    {
+        const string securityServer =
+            "ipsec-3gpp;q=1.000;alg=hmac-sha-1-96;prot=esp;mod=trans;ealg=aes-cbc;" +
+            "spi-c=0;spi-s=255;port-c=50601;port-s=50600";
+
+        var evaluation = SecurityAgreementBuilder.EvaluateSecurityServer(securityServer, Proposal);
+
+        Assert.Null(evaluation.Agreement);
+        Assert.Contains(evaluation.CandidateDiagnostics,
+            message => message.Contains("reserved ESP SPI", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void RejectsReservedOrDuplicatePorts()
     {
         const string reservedPort =

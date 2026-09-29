@@ -59,6 +59,17 @@ public sealed record AkaAttribute(byte Type, byte[] Raw, int Offset);
 
 public sealed record AkaDerivedKeys(byte[] KEncr, byte[] KAut, byte[] Msk, byte[] Emsk);
 
+public sealed class EapMethodMismatchException : AuthenticationException
+{
+    public byte RequestedType { get; }
+
+    public EapMethodMismatchException(byte requestedType, byte selectedType)
+        : base($"ePDG requested EAP type {requestedType}, but this IKE identity was configured for type {selectedType}.")
+    {
+        RequestedType = requestedType;
+    }
+}
+
 /// <summary>
 /// Dual-mode EAP-AKA client supporting RFC 4187 (type 23) and RFC 5448 (type 50).
 /// Integrates with <see cref="IAkaProvider"/> (e.g. EC25 / PC/SC).
@@ -71,6 +82,7 @@ public sealed class EapAkaClient
     private readonly string _homeMcc;
     private readonly string? _expectedIccid;
     private readonly Action<string>? _diagnosticLog;
+    private readonly byte _selectedEapMethod;
 
     public byte[] Identity { get; }
     public AkaDerivedKeys? Keys { get; private set; }
@@ -85,7 +97,8 @@ public sealed class EapAkaClient
         string homeMcc,
         string homeMnc,
         string? expectedIccid = null,
-        Action<string>? diagnosticLog = null)
+        Action<string>? diagnosticLog = null,
+        byte selectedEapMethod = EapType.Aka)
     {
         _akaProvider = akaProvider ?? throw new ArgumentNullException(nameof(akaProvider));
         _imsi = imsi?.Trim() ?? throw new ArgumentNullException(nameof(imsi));
@@ -93,15 +106,18 @@ public sealed class EapAkaClient
         _homeMnc = homeMnc?.Trim() ?? throw new ArgumentNullException(nameof(homeMnc));
         _expectedIccid = expectedIccid;
         _diagnosticLog = diagnosticLog;
+        if (selectedEapMethod is not (EapType.Aka or EapType.AkaPrime))
+            throw new ArgumentOutOfRangeException(nameof(selectedEapMethod));
+        _selectedEapMethod = selectedEapMethod;
 
-        Identity = BuildPermanentIdentity(_imsi, _homeMcc, _homeMnc);
+        Identity = BuildPermanentIdentity(_imsi, _homeMcc, _homeMnc, selectedEapMethod);
     }
 
     /// <summary>
     /// Builds permanent 3GPP NAI identity:
     /// 0&lt;IMSI&gt;@nai.epc.mnc&lt;MNC3&gt;.mcc&lt;MCC&gt;.3gppnetwork.org
     /// </summary>
-    public static byte[] BuildPermanentIdentity(string imsi, string mcc, string mnc)
+    public static byte[] BuildPermanentIdentity(string imsi, string mcc, string mnc, byte eapMethod = EapType.Aka)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(imsi);
         ArgumentException.ThrowIfNullOrWhiteSpace(mcc);
@@ -112,9 +128,11 @@ public sealed class EapAkaClient
 
         if (mcc.Length != 3 || (mnc.Length != 2 && mnc.Length != 3))
             throw new ArgumentException("MCC must be 3 digits, MNC must be 2 or 3 digits.", nameof(mcc));
+        if (eapMethod is not (EapType.Aka or EapType.AkaPrime))
+            throw new ArgumentOutOfRangeException(nameof(eapMethod));
 
         var mnc3 = mnc.PadLeft(3, '0');
-        var nai = $"0{imsi}@nai.epc.mnc{mnc3}.mcc{mcc}.3gppnetwork.org";
+        var nai = $"{(eapMethod == EapType.AkaPrime ? '6' : '0')}{imsi}@nai.epc.mnc{mnc3}.mcc{mcc}.3gppnetwork.org";
         return Encoding.UTF8.GetBytes(nai);
     }
 
@@ -166,6 +184,8 @@ public sealed class EapAkaClient
 
             case EapType.Aka:
             case EapType.AkaPrime:
+                if (packet.Type != _selectedEapMethod)
+                    throw new EapMethodMismatchException(packet.Type, _selectedEapMethod);
                 var akaResp = await HandleAkaRequestAsync(packet, ct).ConfigureAwait(false);
                 return (akaResp, false);
 
@@ -269,29 +289,23 @@ public sealed class EapAkaClient
         byte[]? kdfInputName = null;
         if (isPrime)
         {
+            if ((autn[6] & 0x80) == 0)
+                throw new AuthenticationException("EAP-AKA' AUTN lacks the AMF separation bit.");
             var kdfAttr = attributes.FirstOrDefault(a => a.Type == AkaAttributeType.Kdf);
-            if (kdfAttr != null && kdfAttr.Raw.Length >= 4)
-            {
-                var kdfVal = BinaryPrimitives.ReadUInt16BigEndian(kdfAttr.Raw.AsSpan(2, 2));
-                if (kdfVal != 1)
-                {
-                    throw new AuthenticationException($"Unsupported EAP-AKA' KDF function {kdfVal}.");
-                }
-            }
+            if (kdfAttr?.Raw.Length != 4 || BinaryPrimitives.ReadUInt16BigEndian(kdfAttr.Raw.AsSpan(2, 2)) != 1)
+                throw new AuthenticationException("EAP-AKA' challenge must select supported AT_KDF value 1.");
 
             var kdfInputAttr = attributes.FirstOrDefault(a => a.Type == AkaAttributeType.KdfInput);
-            if (kdfInputAttr != null && kdfInputAttr.Raw.Length >= 4)
-            {
-                var nameLen = BinaryPrimitives.ReadUInt16BigEndian(kdfInputAttr.Raw.AsSpan(2, 2));
-                if (kdfInputAttr.Raw.Length >= 4 + nameLen)
-                {
-                    kdfInputName = kdfInputAttr.Raw.AsSpan(4, nameLen).ToArray();
-                }
-            }
+            if (kdfInputAttr?.Raw.Length is not >= 5)
+                throw new AuthenticationException("EAP-AKA' challenge is missing AT_KDF_INPUT.");
+            var nameLen = BinaryPrimitives.ReadUInt16BigEndian(kdfInputAttr.Raw.AsSpan(2, 2));
+            if (nameLen == 0 || kdfInputAttr.Raw.Length < 4 + nameLen)
+                throw new AuthenticationException("EAP-AKA' AT_KDF_INPUT has an invalid network name.");
+            kdfInputName = kdfInputAttr.Raw.AsSpan(4, nameLen).ToArray();
         }
 
         var keys = isPrime
-            ? DeriveAkaPrimeKeys(Identity, ik, ck, kdfInputName)
+            ? DeriveAkaPrimeKeys(Identity, ik, ck, autn, kdfInputName!)
             : DeriveAkaKeys(Identity, ik, ck);
 
         // Verify server AT_MAC
@@ -590,33 +604,40 @@ public sealed class EapAkaClient
 
     // ── RFC 5448 Key Derivation (EAP-AKA') ─────────────────────────────────────
 
-    public static AkaDerivedKeys DeriveAkaPrimeKeys(byte[] identity, byte[] ik, byte[] ck, byte[]? networkName = null)
+    public static AkaDerivedKeys DeriveAkaPrimeKeys(byte[] identity, byte[] ik, byte[] ck, byte[] autn, byte[] networkName)
     {
-        // RFC 5448 §3.2 / 3GPP TS 33.402: KDF for CK' and IK'
-        // S = FC || NetworkName || L0 || Identity || L1
-        var netBytes = networkName ?? Encoding.UTF8.GetBytes("WLAN");
-        var ikPrime = new byte[16];
-        var ckPrime = new byte[16];
+        ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(ik);
+        ArgumentNullException.ThrowIfNull(ck);
+        ArgumentNullException.ThrowIfNull(autn);
+        ArgumentNullException.ThrowIfNull(networkName);
+        if (ik.Length != 16 || ck.Length != 16 || autn.Length != 16 || networkName.Length == 0)
+            throw new ArgumentException("EAP-AKA' requires 16-byte IK, CK and AUTN plus a nonempty network name.");
+        if ((autn[6] & 0x80) == 0)
+            throw new AuthenticationException("EAP-AKA' AUTN lacks the AMF separation bit.");
 
-        var ikck = Combine(ik, ck);
-        var s = Combine(new byte[] { 0x20 }, netBytes, new byte[] { (byte)(netBytes.Length >> 8), (byte)(netBytes.Length & 0xFF) }, identity);
-        var kdfOut = HMACSHA256.HashData(ikck, s);
-        Buffer.BlockCopy(kdfOut, 0, ckPrime, 0, 16);
-        Buffer.BlockCopy(kdfOut, 16, ikPrime, 0, 16);
+        // 3GPP TS 33.402 Annex A.2: CK' || IK' = HMAC-SHA-256(CK || IK,
+        // FC || network name || length || SQN xor AK || 0x0006).
+        var s = Combine([0x20], networkName,
+            [(byte)(networkName.Length >> 8), (byte)networkName.Length],
+            autn[..6], [0, 6]);
+        var ckIkPrime = HMACSHA256.HashData(Combine(ck, ik), s);
+        var ckPrime = ckIkPrime[..16];
+        var ikPrime = ckIkPrime[16..];
 
-        var mk = HMACSHA256.HashData(Combine(identity, ikPrime, ckPrime), Encoding.UTF8.GetBytes("EAP-AKA'"));
-        // PRF' to generate 160 bytes: K_encr(16), K_aut(32->16), MSK(64), EMSK(64)
-        var stream = PrfSha256(mk, Combine(Encoding.UTF8.GetBytes("EAP-AKA'"), identity), 160);
+        // RFC 5448 §3.3: PRF'(IK' || CK', "EAP-AKA'" || Identity).
+        var stream = PrfSha256(Combine(ikPrime, ckPrime),
+            Combine(Encoding.ASCII.GetBytes("EAP-AKA'"), identity), 208);
 
         var kEncr = new byte[16];
-        var kAut = new byte[16];
+        var kAut = new byte[32];
         var msk = new byte[64];
         var emsk = new byte[64];
 
         Buffer.BlockCopy(stream, 0, kEncr, 0, 16);
-        Buffer.BlockCopy(stream, 16, kAut, 0, 16);
-        Buffer.BlockCopy(stream, 32, msk, 0, 64);
-        Buffer.BlockCopy(stream, 96, emsk, 0, 64);
+        Buffer.BlockCopy(stream, 16, kAut, 0, 32);
+        Buffer.BlockCopy(stream, 80, msk, 0, 64);
+        Buffer.BlockCopy(stream, 144, emsk, 0, 64);
 
         return new AkaDerivedKeys(kEncr, kAut, msk, emsk);
     }

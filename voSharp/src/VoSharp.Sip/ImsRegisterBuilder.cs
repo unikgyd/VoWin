@@ -21,7 +21,7 @@ public record ImsProfile(
 public static class ImsRegisterBuilder
 {
     // 3GPP TS 24.229: default registration expiry is 3600 s
-    private const int DefaultExpiresSeconds = 3600;
+    public const int DefaultExpiresSeconds = 3600;
 
     /// <summary>
     /// Brackets an IPv6 host so "host:port" stays unambiguous in Via, Contact and From
@@ -65,8 +65,11 @@ public static class ImsRegisterBuilder
         ImsProfile profile,
         string callId,
         uint cseq,
-        string? fromTag = null)
+        string? fromTag = null,
+        int expiresSeconds = DefaultExpiresSeconds)
     {
+        if (expiresSeconds <= 0)
+            throw new ArgumentOutOfRangeException(nameof(expiresSeconds));
         var msg = new SipMessage
         {
             IsRequest = true,
@@ -97,7 +100,7 @@ public static class ImsRegisterBuilder
         msg.SetHeader("To", $"<{publicId}>");
         msg.SetHeader("Call-ID", callId);
         msg.SetHeader("CSeq", $"{cseq} REGISTER");
-        msg.SetHeader("Contact", $"<sip:{user}@{localHost}:{profile.ContactPort ?? profile.LocalPort};transport=udp>;+sip.instance={imeiInstance};+g.3gpp.smsip;audio;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";expires={DefaultExpiresSeconds}");
+        msg.SetHeader("Contact", $"<sip:{user}@{localHost}:{profile.ContactPort ?? profile.LocalPort};transport=udp>;+sip.instance={imeiInstance};+g.3gpp.smsip;audio;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";expires={expiresSeconds}");
         if (!string.IsNullOrWhiteSpace(profile.PAccessNetworkInfo))
             msg.SetHeader("P-Access-Network-Info", profile.PAccessNetworkInfo);
         msg.SetHeader("Accept-Contact", "*;+g.3gpp.smsip, *;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"");
@@ -187,10 +190,11 @@ public static class ImsRegisterBuilder
         DigestChallenge challenge,
         byte[] akaResponse,
         string fromTag,
-        bool integrityProtected = false)
+        bool integrityProtected = false,
+        int expiresSeconds = DefaultExpiresSeconds)
     {
         // BUG-12 FIX: pass the stable fromTag so From header is identical across the dialog
-        var msg = BuildInitialRegister(profile, callId, cseq, fromTag);
+        var msg = BuildInitialRegister(profile, callId, cseq, fromTag, expiresSeconds);
 
         var creds = new DigestCredentials(
             Username: profile.PrivateIdentity,

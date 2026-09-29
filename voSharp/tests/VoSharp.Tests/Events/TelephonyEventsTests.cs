@@ -210,6 +210,7 @@ public class TelephonyEventsTests
         await Task.Delay(100);
         Assert.NotNull(kernel.ActiveCall);
         Assert.Equal("+123456789", kernel.ActiveCall.RemoteNumber);
+        Assert.Null(kernel.ActiveCallSlotId);
 
         // 3. System Error forwarding
         bus.Publish(EventTopics.SystemError, "TestModule", "Something went wrong");

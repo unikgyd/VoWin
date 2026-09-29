@@ -5,7 +5,7 @@
 
 [![.NET](https://img.shields.io/badge/.NET-10.0-512BD4?logo=dotnet)](https://dotnet.microsoft.com/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2B-0078D6?logo=windows)](https://microsoft.com/windows)
-[![Tests](https://img.shields.io/badge/Tests-160%20passed-success)](#51-编译与测试)
+[![Tests](https://img.shields.io/badge/Tests-315%20passed-success)](#51-编译与测试)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
@@ -101,6 +101,10 @@
 - **NAT 穿越与保活**：支持 UDP 500 到 4500 自动漂移、Non-ESP Marker 识别、NAT 探测哈希与 20 秒 Keepalive 保活。
 
 ### 3.2 IMS / SIP / 语音呼叫与音频
+- **WireGuard 私网 SIP Gateway**：内置 Digest registrar 与 B2BUA，将 VoWiFi IMS 或 AT + Quectel USB Audio 基带通话桥接为 PCMA/PCMU SIP/RTP；支持多终端注册、来电分叉抢接、外拨和 DTMF，且默认拒绝公网/通配地址监听。配置与边界见 [SIP_GATEWAY.md](docs/SIP_GATEWAY.md)。
+- **双路径媒体策略**：VoWiFi 可直接桥接 Windows 侧 IMS RTP；无 IMS 注册时回退到 `ATD`/`ATA` 与 USB Audio PCM。基带音频由独立 helper 经命名管道直连 SIP RTP，不经过电脑麦克风/扬声器。
+- **严格限制 ADB 边界**：标准 Quectel UAC 模组不探测、不调用 ADB；只有 QDC507 固件实际启用缺失的 D4 路由时才使用 ADB 兼容层，PCM 始终通过 Windows USB Audio 传输。
+- **蜂窝 Host IMS 前置探针与实验性 SIP 通话**：`host-ims probe` 只读检查 IMS APN、context 激活、运行时 P-CSCF、Quectel USB 网络模式，以及 IMS 地址是否归属于 Windows 蜂窝网卡；WPF 的“系统状态”页也会显示同一结果。`host-ims register|status|stop` 及页面按钮可在 `HostRoutable` 时绑定所选 IMS 地址，读取 ISIM 的 IMPI/DOMAIN/IMPU 并在 ISIM 上执行 AKA/REGISTER；注册后的普通拨号、来电和私网 SIP 网关可复用 Host SIP/RTP。它不激活 bearer，尚无蜂窝 `ipsec-3gpp` 数据面，真实运营商通话未验收。无 SIM 时探针只能预检硬件/驱动，不能验证 IMS 注册。设计见 [HOST_IMS.md](docs/HOST_IMS.md)。
 - **3GPP TS 24.229 SIP 注册**：
   - 401 Unauthorized 挑战自动响应；
   - **Digest AKAv1-MD5 认证**：自动调用硬件 USIM 计算 RES 并生成响应摘要；
@@ -189,7 +193,7 @@ voSharp/
 # 1. 还原并编译整个解决方案
 dotnet build voSharp.slnx
 
-# 2. 运行所有单元测试；当前基线为 160 通过、0 失败
+# 2. 运行所有单元测试；当前基线为 315 通过、0 失败
 dotnet test voSharp.slnx
 ```
 

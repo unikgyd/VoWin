@@ -28,6 +28,7 @@ public sealed class IkeTransport : IDisposable
     private bool _isFloated;
     private Task? _keepaliveTask;
     private Task? _packetPumpTask;
+    private Func<byte[], Task>? _incomingIkeRequestHandler;
     private bool _disposed;
 
     public bool IsFloated => _isFloated;
@@ -35,6 +36,14 @@ public sealed class IkeTransport : IDisposable
     public IPEndPoint? LocalEndpoint => _socket?.LocalEndPoint as IPEndPoint;
     public ChannelReader<byte[]> EspPackets => _espChannel.Reader;
     public Socks5Client? Socks5Proxy => _socks5Client;
+
+    /// <summary>
+    /// Installs the active IKE SA request handler. After the ESP packet pump owns
+    /// the socket, peer-initiated IKE requests are delivered here instead of
+    /// being silently discarded.
+    /// </summary>
+    internal void SetIncomingIkeRequestHandler(Func<byte[], Task>? handler)
+        => Volatile.Write(ref _incomingIkeRequestHandler, handler);
 
     public IkeTransport(
         IPAddress remoteIp,
@@ -417,8 +426,32 @@ public sealed class IkeTransport : IDisposable
     private bool TryDeliverIkeResponse(ReadOnlySpan<byte> ikePacket)
     {
         if (ikePacket.Length < IkeDefaults.HeaderLength) return false;
+        if ((ikePacket[17] >> 4) != 2 ||
+            ikePacket[18] is < (byte)IkeExchangeType.IkeSaInit or > (byte)IkeExchangeType.Informational ||
+            BinaryPrimitives.ReadUInt32BigEndian(ikePacket.Slice(24, 4)) != ikePacket.Length)
+            return false;
         var flags = (IkeFlags)ikePacket[19];
-        if (!flags.HasFlag(IkeFlags.Response)) return false;
+        if (!flags.HasFlag(IkeFlags.Response))
+        {
+            var handler = Volatile.Read(ref _incomingIkeRequestHandler);
+            if (handler == null) return false;
+
+            var packet = ikePacket.ToArray();
+            try
+            {
+                var handling = handler(packet);
+                if (!handling.IsCompletedSuccessfully)
+                {
+                    _ = handling.ContinueWith(
+                        task => Log($"IKE peer request failed: {task.Exception?.GetBaseException().Message}"),
+                        CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
+            }
+            catch (Exception ex) { Log($"IKE peer request dispatch failed: {ex.Message}"); }
+            return true;
+        }
 
         var key = (
             BinaryPrimitives.ReadUInt32BigEndian(ikePacket.Slice(20, 4)),
@@ -429,6 +462,27 @@ public sealed class IkeTransport : IDisposable
             return true;
         }
         return false;
+    }
+
+    /// <summary>Sends an IKE packet without registering a local request/response transaction.</summary>
+    internal async Task SendIkeAsync(byte[] ikePacket, CancellationToken ct = default)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(ikePacket);
+        if (ikePacket.Length < IkeDefaults.HeaderLength)
+            throw new ArgumentException("Packet is too short for an IKE header.", nameof(ikePacket));
+        if (_socket == null)
+            throw new InvalidOperationException("Socket is not initialized.");
+
+        var wirePacket = _isFloated ? new byte[4 + ikePacket.Length] : ikePacket;
+        if (_isFloated)
+            Buffer.BlockCopy(ikePacket, 0, wirePacket, 4, ikePacket.Length);
+        var sendBuf = _socks5Client != null
+            ? Socks5Client.EncapsulateUdpDatagram(wirePacket, _remoteEndpoint)
+            : wirePacket;
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
+        await _socket.SendAsync(sendBuf, SocketFlags.None, linkedCts.Token).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -456,6 +510,7 @@ public sealed class IkeTransport : IDisposable
         _disposed = true;
 
         _cts.Cancel();
+        Volatile.Write(ref _incomingIkeRequestHandler, null);
         foreach (var pending in _pendingIkeResponses.Values)
             pending.TrySetCanceled();
         _pendingIkeResponses.Clear();

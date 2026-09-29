@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
@@ -13,6 +15,7 @@ using Microsoft.Win32;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using VoSharp.Kernel.Pool;
+using VoSharp.Modem;
 using VoSharp.Modem.At;
 using VoSharp.Sim;
 using VoSharp.StateMachine;
@@ -41,7 +44,18 @@ namespace VoWin.ViewModels.Pages
         private readonly SemaphoreSlim _homeRouteGate = new(1, 1);
         private int _refreshNotificationScheduled;
         private int _simSwitchLoadVersion;
+        private int _hostImsProbeVersion;
         private bool _isLoadingSimSwitches;
+        private readonly ConcurrentDictionary<string, long> _simSwitchIntentVersions = new(StringComparer.OrdinalIgnoreCase);
+
+        private sealed record SimSwitchIntent(
+            ModemSlot Slot,
+            string Iccid,
+            bool FlightMode,
+            bool VoWifi,
+            bool CellularData,
+            bool DataRoaming,
+            long Version);
 
         // UI Design Token Colors (Frozen for performance & thread safety)
         public static Brush TokenPrimary => ThemeBrushes.Accent;
@@ -107,6 +121,91 @@ namespace VoWin.ViewModels.Pages
 
         [ObservableProperty]
         private bool _isBusy;
+
+        [ObservableProperty]
+        private bool _isHostImsProbeRunning;
+
+        public ObservableCollection<HostImsEndpointCandidate> HostImsCandidateOptions { get; } = [];
+
+        [ObservableProperty]
+        private HostImsEndpointCandidate? _selectedHostImsEndpoint;
+
+        [ObservableProperty]
+        private bool _isHostImsRegistrationBusy;
+
+        [ObservableProperty]
+        private string _hostImsRegistrationStatusText = "尚未注册";
+
+        [ObservableProperty]
+        private string _hostImsRegistrationDetail = "需先插卡并探测到 Windows 持有的 IMS 数据面。";
+
+        [ObservableProperty]
+        private bool _hasHostImsRegistrationSession;
+
+        public bool CanStartHostImsRegistration =>
+            !IsHostImsProbeRunning && !IsHostImsRegistrationBusy &&
+            SelectedHostImsEndpoint is not null && SelectedSlot?.Sim is not null &&
+            SelectedSlot.IsPcscReader == false;
+
+        public bool CanStopHostImsRegistration =>
+            !IsHostImsRegistrationBusy && HasHostImsRegistrationSession;
+
+        partial void OnSelectedHostImsEndpointChanged(HostImsEndpointCandidate? value) =>
+            OnPropertyChanged(nameof(CanStartHostImsRegistration));
+
+        partial void OnIsHostImsProbeRunningChanged(bool value) =>
+            OnPropertyChanged(nameof(CanStartHostImsRegistration));
+
+        partial void OnIsHostImsRegistrationBusyChanged(bool value)
+        {
+            OnPropertyChanged(nameof(CanStartHostImsRegistration));
+            OnPropertyChanged(nameof(CanStopHostImsRegistration));
+        }
+
+        partial void OnHasHostImsRegistrationSessionChanged(bool value) =>
+            OnPropertyChanged(nameof(CanStopHostImsRegistration));
+
+        [ObservableProperty]
+        private string _hostImsStatusTitle = "尚未探测蜂窝 IMS";
+
+        [ObservableProperty]
+        private string _hostImsStatusDetail = "此探针只读取 IMS APN、PDN、P-CSCF 与 Windows 网卡映射，不会修改模组配置。";
+
+        [ObservableProperty]
+        private string _hostImsReadinessText = "待探测";
+
+        [ObservableProperty]
+        private string _hostImsUsbMode = "--";
+
+        [ObservableProperty]
+        private string _hostImsModemSetting = "--";
+
+        [ObservableProperty]
+        private string _hostImsContextText = "--";
+
+        [ObservableProperty]
+        private string _hostImsPdnAddress = "--";
+
+        [ObservableProperty]
+        private string _hostImsPcscf = "--";
+
+        [ObservableProperty]
+        private string _hostImsWindowsInterface = "--";
+
+        [ObservableProperty]
+        private string _hostImsWindowsCellularAdapters = "--";
+
+        [ObservableProperty]
+        private string _hostImsEndpointCandidates = "--";
+
+        [ObservableProperty]
+        private Brush _hostImsStatusBrush = TokenMuted;
+
+        [ObservableProperty]
+        private Brush _hostImsStatusBackground = TokenMutedBg;
+
+        [ObservableProperty]
+        private SymbolRegular _hostImsStatusSymbol = SymbolRegular.Info24;
 
         [ObservableProperty]
         private bool _isDeviceDetailsExpanded;
@@ -659,10 +758,10 @@ namespace VoWin.ViewModels.Pages
 
             Slots.CollectionChanged += (s, e) =>
             {
-                if (SelectedSlot == null && Slots.Count > 0)
-                {
-                    SelectedSlot = Slots.FirstOrDefault();
-                }
+                if (SelectedSlot == null || !Slots.Contains(SelectedSlot))
+                    SelectedSlot = SelectedSlot == null
+                        ? Slots.FirstOrDefault()
+                        : Slots.FirstOrDefault(slot => slot.Id == SelectedSlot.Id) ?? Slots.FirstOrDefault();
             };
 
             // Hook state changes to refresh properties
@@ -679,6 +778,7 @@ namespace VoWin.ViewModels.Pages
                     if (SelectedSlot == null ||
                         (!string.IsNullOrWhiteSpace(e.SlotId) && !string.Equals(e.SlotId, SelectedSlot.Id, StringComparison.OrdinalIgnoreCase)))
                         return;
+                    ResetHostImsProbe();
 
                     // Every SIM transition invalidates any pending work for
                     // the previous card, including a delayed READY handler.
@@ -745,18 +845,84 @@ namespace VoWin.ViewModels.Pages
                 OnPropertyChanged(nameof(SipProbeLossDetailText));
                 OnPropertyChanged(nameof(SipPacketLoss));
                 OnPropertyChanged(nameof(LastProbeStatusText));
+                RefreshHostImsRegistrationStatus();
             };
             _heartbeatTimer.Start();
         }
 
         partial void OnSelectedSlotChanged(ModemSlot? value)
         {
+            ResetHostImsProbe();
             NotifyAll();
             OnPropertyChanged(nameof(HasCurrentSim));
             if (value != null)
             {
                 _ = LoadSimSwitchesAsync(value);
                 _ = LoadVoWifiRouteAsync(value);
+            }
+        }
+
+        private void ResetHostImsProbe()
+        {
+            Interlocked.Increment(ref _hostImsProbeVersion);
+            IsHostImsProbeRunning = false;
+            HostImsStatusTitle = "尚未探测蜂窝 IMS";
+            HostImsStatusDetail = SelectedSlot?.IsPcscReader == true
+                ? "PC/SC 读卡器没有蜂窝数据面；请选择 AT 蜂窝模组。"
+                : "此探针只读取 IMS APN、PDN、P-CSCF 与 Windows 网卡映射，不会修改模组配置。";
+            HostImsReadinessText = "待探测";
+            HostImsUsbMode = "--";
+            HostImsModemSetting = "--";
+            HostImsContextText = "--";
+            HostImsPdnAddress = "--";
+            HostImsPcscf = "--";
+            HostImsWindowsInterface = "--";
+            HostImsWindowsCellularAdapters = "--";
+            HostImsEndpointCandidates = "--";
+            HostImsCandidateOptions.Clear();
+            SelectedHostImsEndpoint = null;
+            HostImsStatusBrush = TokenMuted;
+            HostImsStatusBackground = TokenMutedBg;
+            HostImsStatusSymbol = SymbolRegular.Info24;
+            RefreshHostImsRegistrationStatus();
+        }
+
+        private void RefreshHostImsRegistrationStatus()
+        {
+            if (SelectedSlot is not { IsPcscReader: false } slot)
+            {
+                HostImsRegistrationStatusText = "尚未注册";
+                HostImsRegistrationDetail = "请选择 AT 蜂窝模组。";
+                HasHostImsRegistrationSession = false;
+                return;
+            }
+
+            try
+            {
+                var status = _kernelService.GetHostImsRegistrationStatus(slot.Id);
+                HasHostImsRegistrationSession = status.Endpoint is not null;
+                HostImsRegistrationStatusText = status.State switch
+                {
+                    "registered" => "SIP REGISTER 已接受",
+                    "failed" => "注册刷新失败",
+                    "inactive" => "会话已失效",
+                    "stopped" when status.RemoteDeregistered == true => "远端已确认注销",
+                    _ => "尚未注册"
+                };
+                HostImsRegistrationDetail = status.LastError ??
+                    (status.IsRegistered
+                        ? $"{status.Endpoint}；卡通道 {status.CardPath ?? "未标记"}；到期 {status.ExpiresAtUtc?.ToLocalTime():yyyy-MM-dd HH:mm:ss}。这不代表呼叫数据面已就绪。"
+                        : status.RemoteDeregistered == true
+                            ? "运营商已确认注销此 SIP 绑定，本机会话已停止。"
+                        : status.RemoteDeregistered == false
+                            ? "本机会话已停止；远端注销未获确认，绑定可能保留到有效期结束。"
+                        : "仅在 Windows 已持有 IMS bearer、卡有可读 ISIM 身份或满足严格 USIM 回退条件时可尝试实验性注册。");
+            }
+            catch
+            {
+                HostImsRegistrationStatusText = "状态不可用";
+                HostImsRegistrationDetail = "所选卡槽的注册状态暂不可读取。";
+                HasHostImsRegistrationSession = false;
             }
         }
 
@@ -1016,11 +1182,6 @@ namespace VoWin.ViewModels.Pages
         private void QueueApplySimSwitches()
         {
             if (_isLoadingSimSwitches) return;
-            _ = PersistAndApplySimSwitchesAsync();
-        }
-
-        private async Task PersistAndApplySimSwitchesAsync()
-        {
             var slot = SelectedSlot;
             var iccid = slot?.Sim?.Iccid;
             if (slot == null || string.IsNullOrWhiteSpace(iccid))
@@ -1028,11 +1189,39 @@ namespace VoWin.ViewModels.Pages
                 StatusMessage = "请先选择已识别 SIM 卡的通信设备。";
                 return;
             }
+            var version = _simSwitchIntentVersions.AddOrUpdate(slot.Id, 1, static (_, current) => current + 1);
+            _ = PersistAndApplySimSwitchesAsync(new SimSwitchIntent(
+                slot, iccid, FlightModeSwitchEnabled, VoWifiSwitchEnabled,
+                CellularDataSwitchEnabled, DataRoamingSwitchEnabled, version));
+        }
+
+        private async Task PersistAndApplySimSwitchesAsync(SimSwitchIntent intent)
+        {
+            var slot = intent.Slot;
+            var iccid = intent.Iccid;
+            var warnings = new List<string>();
 
             await _simSwitchGate.WaitAsync();
             try
             {
-                if (!ReferenceEquals(slot, SelectedSlot)) return;
+                if (_simSwitchIntentVersions.GetValueOrDefault(slot.Id) != intent.Version ||
+                    !string.Equals(slot.Sim?.Iccid, iccid, StringComparison.Ordinal)) return;
+
+                if (slot.IsPcscReader)
+                    intent = intent with { FlightMode = false, CellularData = false, DataRoaming = false };
+
+                // User intent is durable before any AT/network action. A later
+                // CGATT, roaming or metrics failure must not resurrect the old
+                // flight-mode/VoWiFi value on the next module restart.
+                var existing = await _kernelService.Preferences.GetSimPreferenceAsync(iccid);
+                await _kernelService.SaveSimPreferencesAsync(
+                    iccid,
+                    intent.FlightMode,
+                    intent.VoWifi,
+                    intent.CellularData,
+                    intent.DataRoaming,
+                    existing?.DedicatedProxyUrl,
+                    existing?.CardNickname);
 
                 // A PC/SC reader has no baseband. Its SIM can still start
                 // VoWiFi and use IMS calls/SMS, but it cannot apply CFUN,
@@ -1041,76 +1230,65 @@ namespace VoWin.ViewModels.Pages
                 if (slot.IsPcscReader)
                 {
                     _isLoadingSimSwitches = true;
-                    FlightModeSwitchEnabled = false;
-                    CellularDataSwitchEnabled = false;
-                    DataRoamingSwitchEnabled = false;
+                    if (ReferenceEquals(slot, SelectedSlot))
+                    {
+                        FlightModeSwitchEnabled = false;
+                        CellularDataSwitchEnabled = false;
+                        DataRoamingSwitchEnabled = false;
+                    }
                     _isLoadingSimSwitches = false;
                 }
 
-                if (!slot.IsPcscReader && slot.IsFlightMode != FlightModeSwitchEnabled)
+                if (!slot.IsPcscReader && slot.IsFlightMode != intent.FlightMode)
                 {
-                    StatusMessage = FlightModeSwitchEnabled ? "正在开启飞行模式并确认模组状态..." : "正在关闭飞行模式并确认模组状态...";
-                    var flightApplied = await _kernelService.SetFlightModeAsync(FlightModeSwitchEnabled, slot.Id);
-                    if (!flightApplied || slot.IsFlightMode != FlightModeSwitchEnabled)
+                    StatusMessage = intent.FlightMode ? "正在开启飞行模式并确认模组状态..." : "正在关闭飞行模式并确认模组状态...";
+                    var flightApplied = await _kernelService.SetFlightModeAsync(intent.FlightMode, slot.Id);
+                    if (!flightApplied || slot.IsFlightMode != intent.FlightMode)
                     {
                         // Keep the UI and future per-SIM restoration policy in
                         // sync with the actual modem state.  Setting this flag
                         // suppresses a second apply operation from the binding.
                         _isLoadingSimSwitches = true;
-                        FlightModeSwitchEnabled = slot.IsFlightMode;
+                        if (ReferenceEquals(slot, SelectedSlot)) FlightModeSwitchEnabled = slot.IsFlightMode;
                         _isLoadingSimSwitches = false;
-                        StatusMessage = "飞行模式切换未获模组确认，开关已恢复为实际状态。";
-                        return;
+                        await _kernelService.SaveSimPreferencesAsync(
+                            iccid, slot.IsFlightMode, intent.VoWifi, intent.CellularData, intent.DataRoaming,
+                            existing?.DedicatedProxyUrl, existing?.CardNickname);
+                        intent = intent with { FlightMode = slot.IsFlightMode };
+                        warnings.Add("飞行模式未获模组确认，已采用实际状态");
                     }
                 }
 
-                if (!slot.IsPcscReader && !FlightModeSwitchEnabled)
+                if (!slot.IsPcscReader && !slot.IsFlightMode)
                 {
-                    var roamingApplied = await slot.SetDataRoamingEnabledAsync(DataRoamingSwitchEnabled);
-                    var cellularDataApplied = await slot.SetCellularDataEnabledAsync(CellularDataSwitchEnabled);
+                    var roamingApplied = await slot.SetDataRoamingEnabledAsync(intent.DataRoaming);
+                    var cellularDataApplied = await slot.SetCellularDataEnabledAsync(intent.CellularData);
                     if (!roamingApplied || !cellularDataApplied)
-                    {
-                        StatusMessage = "飞行模式已切换，但部分蜂窝数据/漫游设置未获模组确认。";
-                        return;
-                    }
+                        warnings.Add("部分蜂窝数据/漫游设置未获模组确认");
                     await slot.RefreshMetricsAsync();
                 }
 
-                if (VoWifiSwitchEnabled)
+                if (intent.VoWifi)
                 {
                     if (slot.VoWifi.State == VoWifiState.Disconnected)
                     {
                         if (!await _kernelService.StartVoWifiAsync(slot.Id))
-                        {
-                            StatusMessage = "开关已应用，但 VoWiFi 未能启动；请导出本次诊断日志。";
-                            return;
-                        }
+                            warnings.Add("VoWiFi 未能启动，请查看诊断日志");
                     }
                 }
-                else if (slot.VoWifi.State != VoWifiState.Disconnected)
+                else
                 {
                     if (!await _kernelService.StopVoWifiAsync(slot.Id))
-                    {
-                        StatusMessage = "开关已应用，但 VoWiFi 未能正常停止。";
-                        return;
-                    }
+                        warnings.Add("VoWiFi 未能正常停止");
                 }
 
-                // Save only after the hardware actions above are confirmed.
-                // A toggle always writes the complete four-switch policy while
-                // keeping unrelated SIM metadata such as nickname and proxy.
-                var existing = await _kernelService.Preferences.GetSimPreferenceAsync(iccid);
-                await _kernelService.SaveSimPreferencesAsync(
-                    iccid,
-                    FlightModeSwitchEnabled,
-                    VoWifiSwitchEnabled,
-                    CellularDataSwitchEnabled,
-                    DataRoamingSwitchEnabled,
-                    existing?.DedicatedProxyUrl,
-                    existing?.CardNickname);
-
-                StatusMessage = "已保存并应用此 SIM 卡的开关。";
-                NotifyAll();
+                if (_simSwitchIntentVersions.GetValueOrDefault(slot.Id) == intent.Version)
+                {
+                    StatusMessage = warnings.Count == 0
+                        ? "已保存并应用此 SIM 卡的开关。"
+                        : $"开关意图已保存；{string.Join("；", warnings)}。";
+                    NotifyAll();
+                }
             }
             catch (Exception ex)
             {
@@ -1289,7 +1467,7 @@ namespace VoWin.ViewModels.Pages
         {
             if (IsBusy) return;
             IsBusy = true;
-            StatusMessage = "正在刷新全部射频与 SIM 卡遥测...";
+            StatusMessage = "正在刷新信号与网络注册信息...";
             try
             {
                 await _kernelService.RefreshMetricsAsync();
@@ -1354,6 +1532,202 @@ namespace VoWin.ViewModels.Pages
             {
                 IsProbing = false;
             }
+        }
+
+        [RelayCommand]
+        private async Task ProbeHostImsAsync()
+        {
+            if (IsHostImsProbeRunning) return;
+
+            var version = Interlocked.Increment(ref _hostImsProbeVersion);
+            IsHostImsProbeRunning = true;
+            HostImsCandidateOptions.Clear();
+            SelectedHostImsEndpoint = null;
+            HostImsStatusTitle = "正在读取 IMS 数据面…";
+            HostImsStatusDetail = "查询模组 PDP Context，并与 Windows 当前网卡地址进行匹配。";
+            HostImsReadinessText = "探测中";
+            HostImsStatusBrush = TokenPrimary;
+            HostImsStatusBackground = TokenPrimaryBg;
+            HostImsStatusSymbol = SymbolRegular.ArrowSyncCircle24;
+            StatusMessage = "正在只读探测蜂窝 Host IMS 前置条件…";
+
+            try
+            {
+                var slot = SelectedSlot ?? throw new InvalidOperationException("请先选择一个蜂窝模组。");
+                var result = await _kernelService.ProbeHostImsAsync(slot.Id);
+                if (version != Volatile.Read(ref _hostImsProbeVersion) || !ReferenceEquals(slot, SelectedSlot)) return;
+                ApplyHostImsProbeResult(result);
+                StatusMessage = $"Host IMS 探测完成：{HostImsStatusTitle}";
+            }
+            catch (Exception ex)
+            {
+                if (version != Volatile.Read(ref _hostImsProbeVersion)) return;
+                HostImsStatusTitle = "Host IMS 探测失败";
+                HostImsStatusDetail = ex.Message;
+                HostImsReadinessText = "读取失败";
+                HostImsStatusBrush = TokenDanger;
+                HostImsStatusBackground = TokenDangerBg;
+                HostImsStatusSymbol = SymbolRegular.DismissCircle24;
+                StatusMessage = $"Host IMS 探测失败：{ex.Message}";
+            }
+            finally
+            {
+                if (version == Volatile.Read(ref _hostImsProbeVersion))
+                    IsHostImsProbeRunning = false;
+            }
+        }
+
+        [RelayCommand]
+        private async Task StartHostImsRegistrationAsync()
+        {
+            if (IsHostImsRegistrationBusy) return;
+            var slot = SelectedSlot;
+            var endpoint = SelectedHostImsEndpoint;
+            if (slot is null || endpoint is null || !CanStartHostImsRegistration)
+            {
+                StatusMessage = "先插卡并探测到 Windows 持有的 IMS 地址，然后选择一个端点。";
+                return;
+            }
+
+            IsHostImsRegistrationBusy = true;
+            HostImsRegistrationStatusText = "正在实验性注册…";
+            HostImsRegistrationDetail = "将重新探测 IMS bearer；ISIM 优先走 QMI UIM，读取不可用时回退 AT；无 ISIM 时严格验证 USIM，并在挑战前选择 QMI 或 AT AKA。";
+            try
+            {
+                var status = await _kernelService.StartHostImsRegistrationAsync(slot.Id, endpoint);
+                if (ReferenceEquals(slot, SelectedSlot)) RefreshHostImsRegistrationStatus();
+                StatusMessage = status.IsRegistered
+                    ? "Host IMS SIP 已注册；可实验性拨号，蜂窝 IPsec 与运营商实网语音仍未验收。"
+                    : $"Host IMS 注册状态：{status.State}";
+            }
+            catch (Exception ex)
+            {
+                if (ReferenceEquals(slot, SelectedSlot))
+                {
+                    HostImsRegistrationStatusText = "实验性注册失败";
+                    HostImsRegistrationDetail = ex.Message;
+                }
+                StatusMessage = $"Host IMS 注册失败：{ex.Message}";
+            }
+            finally
+            {
+                IsHostImsRegistrationBusy = false;
+                if (ReferenceEquals(slot, SelectedSlot)) RefreshHostImsRegistrationStatus();
+            }
+        }
+
+        [RelayCommand]
+        private async Task StopHostImsRegistrationAsync()
+        {
+            if (IsHostImsRegistrationBusy || SelectedSlot is not { } slot) return;
+            IsHostImsRegistrationBusy = true;
+            try
+            {
+                await _kernelService.StopHostImsRegistrationAsync(slot.Id);
+                var stopped = _kernelService.GetHostImsRegistrationStatus(slot.Id);
+                StatusMessage = stopped.RemoteDeregistered == true
+                    ? "已停止 Host IMS SIP 会话，运营商确认注销。"
+                    : "已停止本机 Host IMS SIP 会话；远端注册可能持续到有效期结束。";
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = $"停止 Host IMS 注册失败：{ex.Message}";
+            }
+            finally
+            {
+                IsHostImsRegistrationBusy = false;
+                if (ReferenceEquals(slot, SelectedSlot)) RefreshHostImsRegistrationStatus();
+            }
+        }
+
+        private void ApplyHostImsProbeResult(HostImsProbeResult result)
+        {
+            (HostImsStatusTitle, HostImsStatusDetail, HostImsReadinessText,
+                HostImsStatusBrush, HostImsStatusBackground, HostImsStatusSymbol) = result.Readiness switch
+            {
+                HostImsReadiness.SimUnavailable => (
+                    "模组已连接，当前没有可用 SIM",
+                    $"{(result.AtControlAvailable switch { true => "AT 通道已响应", false => "AT 预检命令未成功", _ => "AT 通道未检测" })}；USB 数据模式{(result.UsbNetworkMode == null ? "未报告" : $"为 {result.UsbNetworkMode}")}。插入实体 SIM 或启用 eSIM Profile 后，再次探测 IMS PDN、P-CSCF 与 Windows 网卡映射。",
+                    "NO SIM",
+                    TokenPrimary, TokenPrimaryBg, SymbolRegular.Sim24),
+                HostImsReadiness.ProbeFailed => (
+                    "IMS 数据面探测未完成",
+                    result.Summary,
+                    "PROBE FAILED",
+                    TokenWarning, TokenWarningBg, SymbolRegular.Warning24),
+                HostImsReadiness.HostRoutable when result.CanAttemptWindowsIms => (
+                    "发现 Windows IMS 数据面候选",
+                    "活动网卡上发现 IMS 地址，且 Windows 到 P-CSCF 的出站接口和源地址匹配；仍需验证实际网络可达与 SIP REGISTER，当前结果不是通话就绪证明。",
+                    "HOST CANDIDATE",
+                    TokenSuccess, TokenSuccessBg, SymbolRegular.CheckmarkCircle24),
+                HostImsReadiness.HostRoutable => (
+                    "IMS 地址已映射，但 P-CSCF 路由未验证",
+                    "Windows 网卡拥有 IMS 地址，但到 P-CSCF 的路由或源地址不匹配；已禁用实验性注册，请检查 IMS 专用数据面。",
+                    "ROUTE MISMATCH",
+                    TokenWarning, TokenWarningBg, SymbolRegular.Warning24),
+                HostImsReadiness.ModemInternalOnly => (
+                    "IMS 仍封在模组内部",
+                    "模组已有活动 IMS PDN，但 Windows 不拥有该地址或 P-CSCF 路由。需要 MBIM/QMI 多 PDN 或独立 PPP 数据面；RNDIS NAT 不能替代。",
+                    "MODEM INTERNAL",
+                    TokenWarning, TokenWarningBg, SymbolRegular.Warning24),
+                HostImsReadiness.ConfiguredButInactive => (
+                    "IMS Profile 已配置但未激活",
+                    "发现 IMS APN，但模组没有报告活动的 IMS 本机地址。需要由合适的 MBIM/QMI bearer 建立 IMS context。",
+                    "INACTIVE",
+                    TokenWarning, TokenWarningBg, SymbolRegular.Warning24),
+                _ => (
+                    "未发现 IMS PDP Context",
+                    "模组没有报告 IMS APN。请先确认运营商 MBN/Carrier Profile 与模组固件能力；本探针不会自动写入 APN。",
+                    "NOT CONFIGURED",
+                    TokenMuted, TokenMutedBg, SymbolRegular.Info24)
+            };
+
+            if (result.ProbeSource != "AT")
+                HostImsStatusDetail += $" 数据来源：{result.ProbeSource}。";
+            if (!string.IsNullOrWhiteSpace(result.ControlStackStatus))
+                HostImsStatusDetail += $" 控制栈：{result.ControlStackStatus}。";
+
+            HostImsUsbMode = result.UsbNetworkMode ?? "未报告";
+            HostImsModemSetting = result.ModemImsEnabled switch
+            {
+                true => "模组 IMS 已启用",
+                false => "模组 IMS 已禁用",
+                null => "MBN/自动或未报告"
+            };
+
+            HostImsContextText = result.Contexts.Count == 0
+                ? "--"
+                : string.Join(" · ", result.Contexts.Select(context =>
+                    $"{context.Label} / {context.Apn} / {context.PdpType} / {(context.IsActive ? "Active" : "Inactive")}"));
+            HostImsPdnAddress = JoinDistinctOrDash(result.Contexts.SelectMany(context => context.LocalAddresses).Select(address => address.ToString()));
+            HostImsPcscf = JoinDistinctOrDash(result.Contexts.SelectMany(context => context.PcscfServers).Select(address => address.ToString()));
+            HostImsWindowsInterface = JoinDistinctOrDash(result.Contexts.SelectMany(context => context.HostInterfaces));
+            HostImsWindowsCellularAdapters = result.WindowsCellularAdapters.Count == 0
+                ? "未发现候选网卡"
+                : string.Join(" · ", result.WindowsCellularAdapters.Select(adapter =>
+                    $"{adapter.Name} ({(adapter.IsConnected ? "已连接" : "未连接")})"));
+            HostImsEndpointCandidates = result.EndpointCandidates.Count == 0
+                ? "无；需同一活动 IMS Context 中有 Windows 本机地址和同族 P-CSCF"
+                : string.Join(" · ", result.EndpointCandidates.Select(candidate =>
+                    $"{candidate.Display} / " +
+                    (result.RouteChecks?.FirstOrDefault(check => check.Endpoint == candidate) is { } route
+                        ? (route.IsVerified ? "路由已验证" : route.Summary)
+                        : "路由未检查")));
+            HostImsCandidateOptions.Clear();
+            var usableCandidates = result.EndpointCandidates.Where(result.IsRouteVerified).ToArray();
+            foreach (var candidate in usableCandidates)
+                HostImsCandidateOptions.Add(candidate);
+            SelectedHostImsEndpoint = usableCandidates.Length == 1 ? usableCandidates[0] : null;
+            OnPropertyChanged(nameof(CanStartHostImsRegistration));
+        }
+
+        private static string JoinDistinctOrDash(IEnumerable<string> values)
+        {
+            var items = values
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return items.Length == 0 ? "--" : string.Join(" · ", items);
         }
 
         [RelayCommand]

@@ -1,6 +1,7 @@
 using System.IO.Ports;
 using System.Text;
 using System.Text.RegularExpressions;
+using VoSharp.Common.Aka;
 using VoSharp.Common.Events;
 using VoSharp.Common.Utils;
 using VoSharp.Modem.At;
@@ -10,6 +11,8 @@ namespace VoSharp.Modem;
 public class ModemDriver : IAsyncDisposable
 {
     private readonly AtSession _session;
+    private readonly IQmiModemReader? _qmi;
+    private volatile bool _qmiDisabled;
     private readonly AsyncEventBus? _eventBus;
     private volatile bool _isRadioStateKnown;
     private volatile bool _isRadioDisabled;
@@ -22,9 +25,21 @@ public class ModemDriver : IAsyncDisposable
     public event EventHandler<FlightModeChangedEventArgs>? FlightModeChanged;
     public event EventHandler<ModemUrcEventArgs>? UrcReceived;
 
-    public ModemDriver(string portName, int baudRate = 115200, AsyncEventBus? eventBus = null)
+    public ModemDriver(string portName, int baudRate = 115200, AsyncEventBus? eventBus = null,
+        IQmiModemReader? qmi = null)
     {
         _session = new AtSession(portName, baudRate, eventBus);
+        if (qmi is not null) _qmi = qmi;
+        else
+        {
+            try { _qmi = QmiModemReader.FromEnvironment(portName); }
+            catch (ArgumentException ex)
+            {
+                // A bad optional QMI endpoint must not prevent the AT fallback
+                // channel from opening. Surface the configuration error safely.
+                LastQmiFallbackReason = $"QMI endpoint configuration: {ex.Message}";
+            }
+        }
         _session.UrcPublicationFilter = ShouldPublishUrc;
         _eventBus = eventBus;
         _session.UrcReceived += (s, urc) =>
@@ -36,7 +51,78 @@ public class ModemDriver : IAsyncDisposable
     public bool IsOpen => _session.IsOpen;
     public string PortName => _session.PortName;
     public AtSession Session => _session;
+    public bool HasQmiEndpoint => _qmi is not null;
+    public bool IsQmiActive => _qmi is not null && !_qmiDisabled;
+    public string? LastQmiFallbackReason { get; private set; }
     public string? FirmwareRevision { get; private set; }
+
+    /// <summary>Reads provisioned IMS identities from ADF.ISIM without changing card files.</summary>
+    public Task<IsimIdentityProbeResult> ProbeIsimIdentityAsync(CancellationToken ct = default) =>
+        new IsimIdentityReader(_session).ReadAsync(ct);
+
+    /// <summary>
+    /// Tries the QMI UIM logical-channel path before choosing an AT ISIM session.
+    /// A failure here is safe to fall back because no IMS AKA vector was sent.
+    /// </summary>
+    public async Task<IsimIdentityProbeResult?> TryProbeQmiIsimIdentityAsync(CancellationToken ct = default)
+    {
+        if (_qmiDisabled || _qmi is not IQmiIsimReader isim) return null;
+        try
+        {
+            var result = await isim.ReadIsimIdentityAsync(ct).ConfigureAwait(false);
+            if (result.Readiness == IsimIdentityReadiness.Available)
+            {
+                LastQmiFallbackReason = null;
+                return result;
+            }
+            LastQmiFallbackReason = $"QMI UIM ISIM: {result.Readiness}; checking AT.";
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            LastQmiFallbackReason = $"QMI UIM ISIM {ex.GetType().Name}; checking AT.";
+        }
+        return null;
+    }
+
+    /// <summary>Does not retry a transmitted AKA vector through AT on QMI failure.</summary>
+    public Task<AkaResult> AuthenticateQmiIsimAkaAsync(AkaChallenge challenge, CancellationToken ct = default)
+    {
+        if (_qmiDisabled || _qmi is not IQmiIsimReader isim)
+            throw new InvalidOperationException("QMI ISIM is not available for this modem slot.");
+        return isim.AuthenticateIsimAsync(challenge, ct);
+    }
+
+    /// <summary>Checks QMI USIM capability before a network AKA challenge is consumed.</summary>
+    public async Task<bool> TryCanAuthenticateQmiUsimAsync(CancellationToken ct = default)
+    {
+        if (_qmiDisabled || _qmi is not IQmiUsimReader usim) return false;
+        try
+        {
+            var available = await usim.CanAuthenticateUsimAsync(ct).ConfigureAwait(false);
+            if (available) LastQmiFallbackReason = null;
+            else LastQmiFallbackReason = "QMI UIM has no ready selected USIM channel; using AT.";
+            return available;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            LastQmiFallbackReason = $"QMI UIM USIM {ex.GetType().Name}; using AT.";
+            return false;
+        }
+    }
+
+    /// <summary>Never replays a sent QMI AKA challenge through AT on failure.</summary>
+    public Task<AkaResult> AuthenticateQmiUsimAkaAsync(AkaChallenge challenge, CancellationToken ct = default)
+    {
+        if (_qmiDisabled || _qmi is not IQmiUsimReader usim)
+            throw new InvalidOperationException("QMI USIM is not available for this modem slot.");
+        return usim.AuthenticateUsimAsync(challenge, ct);
+    }
+
+    /// <summary>Runs IMS AKA against ADF.ISIM when the card provisions an ISIM application.</summary>
+    public Task<AkaResult> AuthenticateIsimAkaAsync(AkaChallenge challenge, CancellationToken ct = default) =>
+        new IsimIdentityReader(_session).AuthenticateAsync(challenge, ct);
 
     /// <summary>Sets the physical DTR signal while retaining the AT reader.</summary>
     public void SetDataTerminalReady(bool asserted) => _session.SetDataTerminalReady(asserted);
@@ -60,12 +146,72 @@ public class ModemDriver : IAsyncDisposable
         {
             // Disable AT echo
             await _session.ExecuteCommandAsync("ATE0", 1000, ct).ConfigureAwait(false);
+            if (_qmi is not null && !_qmiDisabled)
+                await VerifyQmiMatchesAtModemAsync(ct).ConfigureAwait(false);
             return true;
         }
         return false;
     }
 
-    public async Task<string> GetImeiAsync(CancellationToken ct = default)
+    internal async Task<T> PreferQmiAsync<T>(
+        Func<CancellationToken, Task<T>>? qmiRead,
+        Func<CancellationToken, Task<T>> atRead,
+        Func<T, bool> isUsable,
+        CancellationToken ct)
+    {
+        if (!_qmiDisabled && qmiRead is not null)
+        {
+            try
+            {
+                var value = await qmiRead(ct).ConfigureAwait(false);
+                if (isUsable(value))
+                {
+                    LastQmiFallbackReason = null;
+                    return value;
+                }
+                LastQmiFallbackReason = "QMI returned no usable value; using AT.";
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                LastQmiFallbackReason = $"QMI {ex.GetType().Name}; using AT.";
+            }
+        }
+        return await atRead(ct).ConfigureAwait(false);
+    }
+
+    public Task<string> GetImeiAsync(CancellationToken ct = default) =>
+        PreferQmiAsync(_qmi is null ? null : _qmi.GetImeiAsync, GetImeiFromAtAsync,
+            value => IsDecimalIdentifier(value, 14, 18), ct);
+
+    private static bool IsDecimalIdentifier(string? value, int minLength, int maxLength) =>
+        value is not null && value.Length >= minLength && value.Length <= maxLength &&
+        value.All(char.IsAsciiDigit);
+
+    internal static bool SameModemImei(string? qmiImei, string? atImei) =>
+        IsDecimalIdentifier(qmiImei, 15, 15) &&
+        IsDecimalIdentifier(atImei, 15, 15) &&
+        string.Equals(qmiImei, atImei, StringComparison.Ordinal);
+
+    private async Task VerifyQmiMatchesAtModemAsync(CancellationToken ct)
+    {
+        try
+        {
+            var qmiImei = await _qmi!.GetImeiAsync(ct).ConfigureAwait(false);
+            var atImei = await GetImeiFromAtAsync(ct).ConfigureAwait(false);
+            if (SameModemImei(qmiImei, atImei)) return;
+            _qmiDisabled = true;
+            LastQmiFallbackReason = "QMI and AT modem identities do not match; using AT for this slot.";
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _qmiDisabled = true;
+            LastQmiFallbackReason = $"QMI identity check failed ({ex.GetType().Name}); using AT for this slot.";
+        }
+    }
+
+    private async Task<string> GetImeiFromAtAsync(CancellationToken ct)
     {
         var resp = await _session.ExecuteCommandAsync("AT+GSN", 2000, ct).ConfigureAwait(false);
         if (!resp.Success)
@@ -101,7 +247,259 @@ public class ModemDriver : IAsyncDisposable
         return FirmwareRevision ?? string.Empty;
     }
 
-    public async Task<string> GetImsiAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Probes whether the modem exposes an active IMS PDN all the way to a
+    /// Windows network interface. All commands are read-only; this method never
+    /// creates, activates, edits or deletes a PDP context.
+    /// </summary>
+    public async Task<HostImsProbeResult> ProbeHostImsPdnAsync(CancellationToken ct = default)
+    {
+        var simInserted = await GetSimInsertedAsync(ct).ConfigureAwait(false);
+        HostImsProbeResult? qmiProbe = null;
+        var qmiReader = _qmi;
+        IReadOnlyList<QmiImsProfile> qmiProfiles = [];
+        var qmiProfilesChecked = false;
+
+        if (simInserted == false && qmiReader is IQmiImsProfileReader profileReader && !_qmiDisabled)
+        {
+            try
+            {
+                qmiProfiles = await profileReader.GetConfiguredImsProfilesAsync(ct).ConfigureAwait(false);
+                qmiProfilesChecked = true;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                LastQmiFallbackReason = $"QMI WDS profile preflight {ex.GetType().Name}; using AT when available.";
+            }
+        }
+
+        if (simInserted != false && qmiReader is not null && !_qmiDisabled)
+        {
+            try
+            {
+                var qmiIms = await qmiReader.GetActiveImsPdnAsync(ct).ConfigureAwait(false);
+                if (qmiIms is not null)
+                {
+                    qmiProbe = BuildQmiHostImsProbe(simInserted, qmiIms, DescribeControlStack());
+                    if (qmiProbe.CanAttemptWindowsIms) return qmiProbe;
+                    LastQmiFallbackReason = "QMI WDS IMS context has no verified Windows route; checking AT contexts.";
+                }
+                else LastQmiFallbackReason = "QMI WDS did not expose a complete active IMS context; using AT.";
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                LastQmiFallbackReason = $"QMI WDS {ex.GetType().Name}; using AT.";
+            }
+        }
+
+        if (!_session.IsOpen && qmiProbe is not null) return qmiProbe;
+
+        if (simInserted == false && !_session.IsOpen && qmiReader is not null && !_qmiDisabled)
+        {
+            var profiles = qmiProfiles.Select(profile => new HostImsPdnContext(
+                -1000 - profile.ProfileIndex, profile.PdpType, profile.Apn, false,
+                [], [], [], [], [])).ToArray();
+            return new HostImsProbeResult(
+                HostImsReadiness.SimUnavailable,
+                null,
+                null,
+                profiles,
+                $"QMI confirmed that no selected SIM is present; WDS {(qmiProfilesChecked ? $"found {profiles.Length} configured IMS profiles" : "profile query was unavailable")}. AT/USB mode was not checked because the AT port is closed.")
+            {
+                SimInserted = false,
+                ProbeSource = profiles.Length > 0 ? "QMI UIM + WDS profile" : "QMI UIM",
+                ControlStackStatus = DescribeControlStack(),
+                WindowsCellularAdapters = HostImsPdnParser.GetWindowsCellularAdapters()
+            };
+        }
+
+        var configuredResponse = await _session.ExecuteCommandAsync("AT+CGDCONT?", 4000, ct).ConfigureAwait(false);
+        var imsResponse = await _session.ExecuteCommandAsync("AT+QCFG=\"ims\"", 3000, ct).ConfigureAwait(false);
+        var usbResponse = await _session.ExecuteCommandAsync("AT+QCFG=\"usbnet\"", 3000, ct).ConfigureAwait(false);
+        var configured = HostImsPdnParser.ParseConfigured(configuredResponse.Lines)
+            .Where(context => HostImsPdnParser.IsImsApn(context.Apn))
+            .ToArray();
+        var imsSetting = HostImsPdnParser.ParseQuectelImsEnabled(imsResponse.Lines);
+        var usbMode = HostImsPdnParser.ParseQuectelUsbNetworkMode(usbResponse.Lines);
+        if (simInserted == false)
+        {
+            // Dynamic PDP queries cannot establish IMS readiness without a SIM and
+            // may wait for their full AT timeout. Keep the useful configuration and
+            // USB-mode preflight, but do not infer an active data context.
+            var preflightContexts = qmiProfiles.Count > 0
+                ? qmiProfiles.Select(profile => new HostImsPdnContext(
+                    -1000 - profile.ProfileIndex, profile.PdpType, profile.Apn, false,
+                    [], [], [], [], [])).ToArray()
+                : configured.Select(profile => new HostImsPdnContext(
+                    profile.ContextId, profile.PdpType, profile.Apn, false,
+                    [], [], [], [], [])).ToArray();
+            var atAvailable = configuredResponse.Success || imsResponse.Success || usbResponse.Success;
+            return new HostImsProbeResult(
+                HostImsReadiness.SimUnavailable,
+                imsSetting,
+                usbMode,
+                preflightContexts,
+                $"No SIM is inserted or selected. AT preflight {(atAvailable ? "responded" : "did not respond successfully")}; USB network mode is {(usbMode == null ? "unreported" : "reported")}. IMS PDN/P-CSCF cannot be evaluated yet.")
+            {
+                SimInserted = false,
+                AtControlAvailable = atAvailable,
+                ProbeSource = qmiProfiles.Count > 0 ? "QMI WDS profile + AT" : "AT",
+                ControlStackStatus = DescribeControlStack(),
+                WindowsCellularAdapters = HostImsPdnParser.GetWindowsCellularAdapters()
+            };
+        }
+
+        var activeResponse = await _session.ExecuteCommandAsync("AT+CGACT?", 4000, ct).ConfigureAwait(false);
+        var runtimeResponse = await _session.ExecuteCommandAsync("AT+CGCONTRDP", 5000, ct).ConfigureAwait(false);
+        var runtime = HostImsPdnParser.ParseRuntime(runtimeResponse.Lines)
+            .Where(context => HostImsPdnParser.IsImsApn(context.Apn) || configured.Any(item => item.ContextId == context.ContextId))
+            .ToArray();
+        var activation = HostImsPdnParser.ParseActivation(activeResponse.Lines);
+        var failedQueries = new List<string>();
+        if (!configuredResponse.Success) failedQueries.Add("AT+CGDCONT?");
+        if (!activeResponse.Success && runtime.Length == 0) failedQueries.Add("AT+CGACT?");
+        if (!runtimeResponse.Success && HostImsPdnParser.IsRuntimeQueryFailureCritical(configured, activation))
+            failedQueries.Add("AT+CGCONTRDP");
+        var hostAddresses = HostImsPdnParser.GetHostAddresses();
+        var ids = configured.Select(item => item.ContextId).Concat(runtime.Select(item => item.ContextId)).Distinct().Order().ToArray();
+        var contexts = ids.Select(cid =>
+        {
+            var profile = configured.FirstOrDefault(item => item.ContextId == cid);
+            var live = runtime.FirstOrDefault(item => item.ContextId == cid);
+            var localAddresses = live?.LocalAddresses ?? [];
+            var interfaces = localAddresses
+                .Where(hostAddresses.ContainsKey)
+                .SelectMany(address => hostAddresses[address])
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return new HostImsPdnContext(
+                cid,
+                profile?.PdpType ?? "unknown",
+                live?.Apn ?? profile?.Apn ?? "ims",
+                HostImsPdnParser.IsContextActive(cid, activation, live != null),
+                localAddresses,
+                live?.Gateways ?? [],
+                live?.DnsServers ?? [],
+                live?.PcscfServers ?? [],
+                interfaces)
+            {
+                HostOwnedAddresses = localAddresses.Where(hostAddresses.ContainsKey).ToArray()
+            };
+        }).ToArray();
+
+        var readiness = HostImsPdnParser.Classify(simInserted, failedQueries.Count > 0, contexts);
+        var routeChecks = HostImsRouteVerifier.Check(HostImsPdnParser.GetEndpointCandidates(contexts));
+        var summary = readiness switch
+        {
+            HostImsReadiness.ProbeFailed => $"IMS context queries failed ({string.Join(", ", failedQueries)}); configuration cannot be determined.",
+            HostImsReadiness.HostRoutable when routeChecks.Any(check => check.IsVerified) =>
+                "IMS address and P-CSCF are visible on Windows; at least one candidate has a matching Windows source and interface route.",
+            HostImsReadiness.HostRoutable =>
+                "IMS address and P-CSCF are visible on Windows, but no candidate has a verified P-CSCF route; registration is disabled.",
+            HostImsReadiness.ModemInternalOnly => "The modem has an active IMS PDN, but Windows does not own its address/P-CSCF route. QMI/MBIM multi-PDN or PPP exposure is required.",
+            HostImsReadiness.ConfiguredButInactive => "An IMS APN profile exists, but no active IMS PDN runtime address was reported.",
+            _ => "No IMS PDP context was reported by the modem."
+        };
+        var atProbe = new HostImsProbeResult(
+            readiness,
+            imsSetting,
+            usbMode,
+            contexts,
+            summary)
+        {
+            SimInserted = simInserted,
+            ControlStackStatus = DescribeControlStack(),
+            WindowsCellularAdapters = HostImsPdnParser.GetWindowsCellularAdapters(),
+            RouteChecks = routeChecks
+        };
+        if (qmiProbe is null || atProbe.CanAttemptWindowsIms ||
+            atProbe.Readiness == HostImsReadiness.HostRoutable)
+            return atProbe;
+        // WDS proved an active IMS context even when AT cannot see that
+        // context. Do not erase this evidence with an empty AT CID list.
+        return qmiProbe with
+        {
+            Summary = $"{qmiProbe.Summary} AT fallback: {atProbe.Summary}",
+            ControlStackStatus = DescribeControlStack()
+        };
+    }
+
+    private string DescribeControlStack() => _qmi is null
+        ? "AT（未配置 QMI 端点）"
+        : _qmiDisabled
+            ? $"AT（QMI 已停用：{LastQmiFallbackReason ?? "身份核验失败"}）"
+            : LastQmiFallbackReason is null
+                ? "QMI 优先，AT 回退"
+                : $"QMI/AT 回退：{LastQmiFallbackReason}";
+
+    internal static HostImsProbeResult BuildQmiHostImsProbe(bool? simInserted,
+        QmiImsPdn qmiIms, string controlStackStatus)
+    {
+        if (!HostImsPdnParser.IsImsApn(qmiIms.Apn) ||
+            qmiIms.LocalAddress.Equals(System.Net.IPAddress.Any) ||
+            qmiIms.LocalAddress.Equals(System.Net.IPAddress.IPv6Any) ||
+            qmiIms.PcscfServers.Count == 0 ||
+            qmiIms.PcscfServers.Any(address =>
+                address.AddressFamily != qmiIms.LocalAddress.AddressFamily ||
+                address.Equals(System.Net.IPAddress.Any) ||
+                address.Equals(System.Net.IPAddress.IPv6Any)))
+            throw new FormatException("QMI WDS did not return a complete IMS APN/address/P-CSCF context.");
+        var hostAddresses = HostImsPdnParser.GetHostAddresses();
+        var interfaces = hostAddresses.TryGetValue(qmiIms.LocalAddress, out var matches)
+            ? matches : [];
+        var context = new HostImsPdnContext(
+            qmiIms.ProfileIndex is { } index ? -1000 - index : -1,
+            "IP", qmiIms.Apn, true,
+            [qmiIms.LocalAddress], [], [], qmiIms.PcscfServers, interfaces)
+        {
+            HostOwnedAddresses = interfaces.Length > 0 ? [qmiIms.LocalAddress] : []
+        };
+        var contexts = new[] { context };
+        var readiness = HostImsPdnParser.Classify(simInserted, false, contexts);
+        var routeChecks = HostImsRouteVerifier.Check(HostImsPdnParser.GetEndpointCandidates(contexts));
+        var summary = readiness == HostImsReadiness.ModemInternalOnly
+            ? "QMI WDS reports an active IMS APN and P-CSCF, but Windows does not own its address."
+            : routeChecks.Any(check => check.IsVerified)
+                ? "QMI WDS reports an active IMS APN; its address and P-CSCF route are owned by a Windows cellular interface."
+                : "QMI WDS reports an active IMS APN, but the Windows P-CSCF route is not verified.";
+        return new HostImsProbeResult(readiness, null, null, contexts, summary)
+        {
+            SimInserted = simInserted,
+            ProbeSource = "QMI WDS",
+            ControlStackStatus = controlStackStatus,
+            WindowsCellularAdapters = HostImsPdnParser.GetWindowsCellularAdapters(),
+            RouteChecks = routeChecks
+        };
+    }
+
+    /// <summary>Reads physical/selected SIM presence without changing the baseband.</summary>
+    public Task<bool?> GetSimInsertedAsync(CancellationToken ct = default) =>
+        PreferQmiAsync(_qmi is null ? null : _qmi.GetSimInsertedAsync, GetSimInsertedFromAtAsync,
+            value => value.HasValue, ct);
+
+    private async Task<bool?> GetSimInsertedFromAtAsync(CancellationToken ct)
+    {
+        var simResponse = await _session.ExecuteCommandAsync("AT+QSIMSTAT?", 3000, ct).ConfigureAwait(false);
+        var simInserted = HostImsPdnParser.ParseQuectelSimInserted(simResponse.Lines);
+        if (simInserted == null)
+        {
+            var pinResponse = await _session.ExecuteCommandAsync("AT+CPIN?", 3000, ct).ConfigureAwait(false);
+            simInserted = pinResponse.Success && pinResponse.Lines.Any(line => line.Contains("+CPIN:", StringComparison.OrdinalIgnoreCase))
+                ? true
+                : pinResponse.ErrorCode?.Trim().EndsWith("CME ERROR: 10", StringComparison.OrdinalIgnoreCase) == true
+                    ? false
+                    : null;
+        }
+        return simInserted;
+    }
+
+    public Task<string> GetImsiAsync(CancellationToken ct = default) =>
+        PreferQmiAsync(_qmi is null ? null : _qmi.GetImsiAsync, GetImsiFromAtAsync,
+            value => IsDecimalIdentifier(value, 14, 16), ct);
+
+    private async Task<string> GetImsiFromAtAsync(CancellationToken ct)
     {
         var resp = await _session.ExecuteCommandAsync("AT+CIMI", 2000, ct).ConfigureAwait(false);
         if (resp.Success)
@@ -119,7 +517,11 @@ public class ModemDriver : IAsyncDisposable
         return string.Empty;
     }
 
-    public async Task<string> GetIccidAsync(CancellationToken ct = default)
+    public Task<string> GetIccidAsync(CancellationToken ct = default) =>
+        PreferQmiAsync(_qmi is null ? null : _qmi.GetIccidAsync, GetIccidFromAtAsync,
+            value => IsDecimalIdentifier(value, 18, 22), ct);
+
+    private async Task<string> GetIccidFromAtAsync(CancellationToken ct)
     {
         var resp = await _session.ExecuteCommandAsync("AT+QCCID", 2000, ct).ConfigureAwait(false);
         if (!resp.Success)
@@ -545,6 +947,19 @@ public class ModemDriver : IAsyncDisposable
     public async Task<SignalQuality> GetSignalAsync(CancellationToken ct = default)
     {
         if (_isRadioStateKnown && !_isRadioDisabled)
+            _radioStatusReportingEnabled = true;
+        var signal = await PreferQmiAsync<SignalQuality?>(
+            _qmi is null ? null : _qmi.GetSignalAsync,
+            async token => await GetSignalFromAtAsync(token).ConfigureAwait(false),
+            value => value is { RssiRaw: not 99 }, ct).ConfigureAwait(false)
+            ?? new SignalQuality(99, 0, 0, "Unknown");
+        try { SignalChanged?.Invoke(this, new SignalChangedEventArgs(signal)); } catch { }
+        return signal;
+    }
+
+    private async Task<SignalQuality> GetSignalFromAtAsync(CancellationToken ct)
+    {
+        if (_isRadioStateKnown && !_isRadioDisabled)
         {
             _radioStatusReportingEnabled = true;
         }
@@ -558,7 +973,6 @@ public class ModemDriver : IAsyncDisposable
                 if (raw == 99 || raw < 0)
                 {
                     var noSig = new SignalQuality(99, 0, 0, "LTE/NR");
-                    try { SignalChanged?.Invoke(this, new SignalChangedEventArgs(noSig)); } catch { }
                     return noSig;
                 }
 
@@ -573,16 +987,34 @@ public class ModemDriver : IAsyncDisposable
                     _ => 0      // <= -113 dBm (无信号)
                 };
                 var sq = new SignalQuality(raw, dbm, bars, "LTE/NR");
-                try { SignalChanged?.Invoke(this, new SignalChangedEventArgs(sq)); } catch { }
                 return sq;
             }
         }
         var defSq = new SignalQuality(99, 0, 0, "Unknown");
-        try { SignalChanged?.Invoke(this, new SignalChangedEventArgs(defSq)); } catch { }
         return defSq;
     }
 
     public async Task<NetworkRegistration> GetRegistrationAsync(CancellationToken ct = default)
+    {
+        if (_isRadioStateKnown && !_isRadioDisabled)
+            _radioStatusReportingEnabled = true;
+        var registration = await PreferQmiAsync<NetworkRegistration?>(
+            _qmi is null ? null : _qmi.GetRegistrationAsync,
+            async token => await GetRegistrationFromAtAsync(token).ConfigureAwait(false),
+            value => value is not null && value.Status != NetworkRegStatus.Unknown,
+            ct).ConfigureAwait(false)
+            ?? new NetworkRegistration(NetworkRegStatus.Unknown, null, null, null);
+        try
+        {
+            RegistrationChanged?.Invoke(this,
+                new NetworkRegistrationChangedEventArgs(registration,
+                    NetworkRegStatus.Unknown, registration.Status));
+        }
+        catch { }
+        return registration;
+    }
+
+    private async Task<NetworkRegistration> GetRegistrationFromAtAsync(CancellationToken ct)
     {
         if (_isRadioStateKnown && !_isRadioDisabled)
         {
@@ -611,7 +1043,6 @@ public class ModemDriver : IAsyncDisposable
         }
 
         var reg = new NetworkRegistration(regStatus, opName, "LTE", null);
-        try { RegistrationChanged?.Invoke(this, new NetworkRegistrationChangedEventArgs(reg, NetworkRegStatus.Unknown, regStatus)); } catch { }
         return reg;
     }
 
@@ -625,11 +1056,14 @@ public class ModemDriver : IAsyncDisposable
 
     public async Task<bool> HangupVoiceAsync(CancellationToken ct = default)
     {
-        _eventBus?.Publish(EventTopics.CallEnded, "Modem", "HANGUP");
-        _eventBus?.Publish(EventTopics.CallState, "Modem", "ENDED");
         var resp = await _session.ExecuteCommandAsync("ATH", 3000, ct).ConfigureAwait(false);
         if (!resp.Success)
             resp = await _session.ExecuteCommandAsync("AT+CHUP", 3000, ct).ConfigureAwait(false);
+        if (resp.Success)
+        {
+            _eventBus?.Publish(EventTopics.CallEnded, "Modem", "HANGUP");
+            _eventBus?.Publish(EventTopics.CallState, "Modem", "ENDED");
+        }
         return resp.Success;
     }
 
@@ -956,7 +1390,11 @@ public class ModemDriver : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         try { ConnectionChanged?.Invoke(this, new ModemConnectionChangedEventArgs(PortName, false)); } catch { }
-        await _session.DisposeAsync().ConfigureAwait(false);
+        try { await _session.DisposeAsync().ConfigureAwait(false); }
+        finally
+        {
+            if (_qmi is not null) await _qmi.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }
 

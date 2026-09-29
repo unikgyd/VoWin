@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Windows;
 using VoWin.Services;
 using VoWin.ViewModels.Windows;
@@ -60,7 +61,7 @@ namespace VoWin.Views.Windows
 
             KernelService.Kernel.CallEnded += (s, e) =>
             {
-                Dispatcher.BeginInvoke(InCallFloatingWindow.Dismiss);
+                Dispatcher.BeginInvoke(CheckInCallFloatingWindow);
             };
         }
 
@@ -77,7 +78,10 @@ namespace VoWin.Views.Windows
                 var num = !string.IsNullOrWhiteSpace(KernelService.CurrentCallNumber)
                     ? KernelService.CurrentCallNumber
                     : "当前通话";
-                var slot = KernelService.ActiveSlot?.Name ?? "SIM 1";
+                var presentedSlotId = KernelService.Kernel.ActiveCallSlotId;
+                var slot = KernelService.Slots.FirstOrDefault(candidate =>
+                    string.Equals(candidate.Id, presentedSlotId, StringComparison.OrdinalIgnoreCase))?.Name
+                    ?? KernelService.ActiveSlot?.Name ?? "SIM 1";
 
                 InCallFloatingWindow.ShowActiveCall(
                     number: num,

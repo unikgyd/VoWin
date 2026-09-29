@@ -1,4 +1,9 @@
 <Solution>
+  <Folder Name="/qmi/">
+    <Project Path="qmi/qmiSharp/qmiSharp.csproj" />
+    <Project Path="qmi/qmiSharp.Cli/qmiSharp.Cli.csproj" />
+    <Project Path="qmi/qmiSharp.Tests/qmiSharp.Tests.csproj" />
+  </Folder>
   <Folder Name="/voSharp/">
     <Project Path="voSharp/src/VoSharp.Common/VoSharp.Common.csproj" />
     <Project Path="voSharp/src/VoSharp.Crypto/VoSharp.Crypto.csproj" />

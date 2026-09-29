@@ -34,11 +34,13 @@ public class IncomingCallTests
         Assert.False(incoming[^1].IsVoWifi);
         Assert.Equal("cellular-1", incoming[^1].SlotId);
         Assert.Contains(states, e => e.NewState == CallState.Incoming && !e.IsOutgoing);
+        Assert.All(states, e => Assert.Equal("cellular-1", e.SlotId));
         Assert.NotNull(kernel.ActiveCall);
 
         slot.HandleCellularCallUrc("NO CARRIER");
         Assert.Contains(states, e => e.NewState == CallState.Ended);
         Assert.Single(ended);
+        Assert.Equal("cellular-1", ended[0].SlotId);
         Assert.Null(kernel.ActiveCall);
     }
 
@@ -63,6 +65,59 @@ public class IncomingCallTests
         Assert.Equal("cellular-buffered", incoming[^1].SlotId);
         Assert.False(incoming[^1].IsVoWifi);
         Assert.NotNull(kernel.ActiveCall);
+    }
+
+    [Fact]
+    public async Task EndingOneSlotDoesNotClearAnotherSlotsTrackedCall()
+    {
+        await using var kernel = new VoKernel();
+        var first = new ModemSlot("cellular-a", "COM_TEST_A", eventBus: kernel.EventBus);
+        var second = new ModemSlot("cellular-b", "COM_TEST_B", eventBus: kernel.EventBus);
+        Assert.True(kernel.Pool.TryAddSlot(first));
+        Assert.True(kernel.Pool.TryAddSlot(second));
+        var incoming = new List<IncomingCallEventArgs>();
+        kernel.IncomingCall += (_, e) => incoming.Add(e);
+
+        first.HandleCellularCallUrc("+CLIP: \"11111111\",145");
+        second.HandleCellularCallUrc("+CLIP: \"22222222\",145");
+        Assert.Equal(2, incoming.Count);
+        Assert.Equal("cellular-a", incoming[0].SlotId);
+        Assert.Equal("cellular-b", incoming[1].SlotId);
+
+        first.HandleCellularCallUrc("NO CARRIER");
+        Assert.NotNull(kernel.ActiveCall);
+        Assert.Equal(incoming[1].CallId, kernel.ActiveCall.CallId);
+        Assert.Equal("cellular-b", kernel.ActiveCallSlotId);
+        Assert.Equal("22222222", kernel.ActiveCall.RemoteNumber);
+
+        await kernel.Pool.RemoveSlotAsync("cellular-a");
+        Assert.Equal(incoming[1].CallId, kernel.ActiveCall?.CallId);
+
+        second.HandleCellularCallUrc("NO CARRIER");
+        Assert.Null(kernel.ActiveCall);
+    }
+
+    [Fact]
+    public async Task ImsEventsForwardTheOwningSlotId()
+    {
+        await using var kernel = new VoKernel();
+        var slot = new ModemSlot("ims-slot", "COM_TEST", eventBus: kernel.EventBus);
+        Assert.True(kernel.Pool.TryAddSlot(slot));
+        var incoming = new List<IncomingCallEventArgs>();
+        var states = new List<CallStateChangedEventArgs>();
+        var ended = new List<CallEndedEventArgs>();
+        kernel.IncomingCall += (_, e) => incoming.Add(e);
+        kernel.CallStateChanged += (_, e) => states.Add(e);
+        kernel.CallEnded += (_, e) => ended.Add(e);
+
+        await slot.Calls.HandleIncomingInviteAsync(CreateMockInvite(), slot.VoWifi, _ => Task.CompletedTask);
+        Assert.Equal("ims-slot", Assert.Single(incoming).SlotId);
+        Assert.Equal("ims-slot", kernel.ActiveCallSlotId);
+        Assert.All(states, e => Assert.Equal("ims-slot", e.SlotId));
+
+        await slot.Calls.RejectAsync();
+        Assert.Equal("ims-slot", Assert.Single(ended).SlotId);
+        Assert.Null(kernel.ActiveCall);
     }
 
     private static SipMessage CreateMockInvite(string callerNumber = "+8613800000000", string localIp = "6.155.204.12")

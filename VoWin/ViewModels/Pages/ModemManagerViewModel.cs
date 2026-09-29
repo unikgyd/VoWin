@@ -215,8 +215,10 @@ namespace VoWin.ViewModels.Pages
                 StatusMessage = enabled
                     ? $"正在将卡槽 [{slot.Name}] 切换为飞行模式..."
                     : $"正在将卡槽 [{slot.Name}] 退出飞行模式...";
-                await slot.SetFlightModeAsync(enabled);
+                var applied = await _kernelService.SetFlightModeAsync(enabled, slot.Id);
                 token.ThrowIfCancellationRequested();
+                if (!applied || slot.IsFlightMode != enabled)
+                    throw new InvalidOperationException("模组未确认新的飞行模式状态。");
                 StatusMessage = enabled
                     ? $"[{slot.Name}] 已进入飞行模式。"
                     : $"[{slot.Name}] 已退出飞行模式并刷新网络。";
@@ -373,8 +375,10 @@ namespace VoWin.ViewModels.Pages
             StatusMessage = $"正在重启模组 [{SelectedSlot.Name}]...";
             try
             {
-                await _kernelService.ExecuteAtCommandAsync("AT+CFUN=1,1", SelectedSlot.Id);
-                StatusMessage = $"模组 [{SelectedSlot.Name}] 重启指令已发送。";
+                var rebooted = await _kernelService.RebootModemAsync(SelectedSlot.Id);
+                StatusMessage = rebooted
+                    ? $"模组 [{SelectedSlot.Name}] 重启指令已发送；旧 VoWiFi 恢复任务已停止。"
+                    : $"模组 [{SelectedSlot.Name}] 未确认重启指令。";
             }
             catch (Exception ex)
             {
@@ -690,7 +694,7 @@ namespace VoWin.ViewModels.Pages
         {
             if (SelectedSlot == null) return;
             StatusMessage = $"正在将 [{SelectedSlot.Name}] 退出飞行模式...";
-            await SelectedSlot.SetFlightModeAsync(false);
+            await _kernelService.SetFlightModeAsync(false, SelectedSlot.Id);
             ModuleFlightMode = false;
             StatusMessage = $"[{SelectedSlot.Name}] 已退出飞行模式并唤醒 SIM 芯片。";
         }
@@ -803,6 +807,37 @@ namespace VoWin.ViewModels.Pages
             catch (Exception ex)
             {
                 StatusMessage = $"刷新指标错误: {ex.Message}";
+            }
+            finally
+            {
+                IsBusy = false;
+            }
+        }
+
+        [RelayCommand]
+        private async Task ReloadSimAsync()
+        {
+            var slot = SelectedSlot;
+            if (slot is null || slot.IsPcscReader || IsBusy) return;
+            var confirmation = System.Windows.MessageBox.Show(
+                $"重新读取 [{slot.Name}] 的 SIM？\n\n此操作会重载蜂窝基带，断开当前蜂窝数据、Host IMS 注册及通话。插卡或切卡后才需要执行。",
+                "确认重载 SIM",
+                System.Windows.MessageBoxButton.YesNo,
+                System.Windows.MessageBoxImage.Warning);
+            if (confirmation != System.Windows.MessageBoxResult.Yes) return;
+
+            IsBusy = true;
+            StatusMessage = $"正在重新读取 [{slot.Name}] 的 SIM...";
+            try
+            {
+                var identity = await _kernelService.RefreshSimAsync(slot.Id);
+                StatusMessage = identity is null
+                    ? $"[{slot.Name}] 未能确认 SIM；请检查插卡状态和诊断日志。"
+                    : $"[{slot.Name}] 的 SIM 已重新读取。";
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = $"重载 SIM 失败: {ex.Message}";
             }
             finally
             {
@@ -966,20 +1001,29 @@ namespace VoWin.ViewModels.Pages
         private async Task SwitchEuiccProfileAsync(Profile? profile)
         {
             var target = profile ?? SelectedProfile;
-            if (target == null) return;
+            var slot = SelectedSlot;
+            if (target == null || slot == null || IsBusy) return;
 
             StatusMessage = $"正在启用 Profile: {target.ProfileName ?? target.ICCID}...";
+            IsBusy = true;
             try
             {
-                bool ok = await _kernelService.SwitchEuiccProfileAsync(target.ICCID, SelectedSlot?.Id, target.EuiccAid);
+                // Capture the owning slot. The service owns the task, so page
+                // navigation cannot redirect or abandon an in-flight switch.
+                bool ok = await _kernelService.SwitchEuiccProfileAsync(target.ICCID, slot.Id, target.EuiccAid);
                 StatusMessage = ok
                     ? "Profile 切换成功，新卡 ICCID / IMSI / 号码已重新读取并校验。"
                     : "Profile 切换失败；VoWiFi 已保持停止。";
-                await LoadEuiccDataAsync();
+                if (ok)
+                    _ = LoadEuiccDataForSlotAsync(slot, userInitiated: false);
             }
             catch (Exception ex)
             {
                 StatusMessage = $"切换 Profile 失败: {ex.Message}";
+            }
+            finally
+            {
+                IsBusy = false;
             }
         }
 

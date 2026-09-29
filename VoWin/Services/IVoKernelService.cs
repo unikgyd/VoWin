@@ -2,6 +2,8 @@ using System.Collections.ObjectModel;
 using VoSharp.Euicc.Models;
 using VoSharp.Kernel;
 using VoSharp.Kernel.Pool;
+using VoSharp.Kernel.SipGateway;
+using VoSharp.Modem;
 using VoSharp.Modem.At;
 using VoSharp.Sim;
 using VoSharp.StateMachine;
@@ -44,12 +46,16 @@ namespace VoWin.Services
         string? CurrentCallNumber { get; }
         bool HasIncomingCall { get; }
         string? IncomingCallerNumber { get; }
+        bool IsPresentedCallEvent(string callId);
         event Action<string>? CallMediaStatusChanged;
         event Action<SmsMessageModel>? IncomingSmsReceived;
         event Action<string, string?>? IncomingCallReceived;
         event Action? EgressRoutesChanged;
         Task<CallExperienceSettings> GetCallExperienceSettingsAsync();
         Task SaveCallExperienceSettingsAsync(CallExperienceSettings settings);
+        SipGatewayStatus? GetSipGatewayStatus();
+        Task StartSipGatewayAsync(SipGatewayOptions options, CancellationToken cancellationToken = default);
+        Task StopSipGatewayAsync();
 
         // Operations
         Task InitializeAsync();
@@ -58,11 +64,17 @@ namespace VoWin.Services
         Task<bool> RemoveSlotAsync(string slotId);
         bool SelectSlot(string slotId);
         Task RefreshMetricsAsync(string? slotId = null);
+        Task<SimIdentity?> RefreshSimAsync(string? slotId = null);
         Task<string> ExecuteAtCommandAsync(string command, string? slotId = null);
         Task<string> SendUssdAsync(string code, string? slotId = null);
         Task<bool> SetFlightModeAsync(bool enable, string? slotId = null);
         Task<bool> RebootModemAsync(string? slotId = null);
         Task<(bool Success, long RttMs, string Status)> ProbeVoWifiLivenessAsync(string? slotId = null);
+        Task<HostImsProbeResult> ProbeHostImsAsync(string? slotId = null, CancellationToken cancellationToken = default);
+        HostImsRegistrationStatus GetHostImsRegistrationStatus(string? slotId = null);
+        Task<HostImsRegistrationStatus> StartHostImsRegistrationAsync(
+            string? slotId = null, HostImsEndpointCandidate? endpoint = null, CancellationToken cancellationToken = default);
+        Task StopHostImsRegistrationAsync(string? slotId = null);
 
         // Calls
         Task<CallInfo> DialAsync(string number, string? slotId = null, bool forceCellular = false);

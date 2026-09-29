@@ -110,6 +110,7 @@ public sealed class AkaResult
         if (_ck != null) CryptographicOperations.ZeroMemory(_ck);
         if (_ik != null) CryptographicOperations.ZeroMemory(_ik);
         if (_res != null) CryptographicOperations.ZeroMemory(_res);
+        if (_auts != null) CryptographicOperations.ZeroMemory(_auts);
     }
 
     public override string ToString() => Success

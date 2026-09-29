@@ -83,13 +83,13 @@ public sealed class SecurityAssociation
     public required byte[] AuthKey { get; init; }
 
     /// <summary>Lifetime in seconds. Windows requires a non-zero value; Linux XFRM has no equivalent.</summary>
-    public int LifetimeSeconds { get; init; } = 3600;
+    public uint LifetimeSeconds { get; init; } = 3600;
 
     /// <summary>Lifetime in kilobytes. 0 means unlimited.</summary>
-    public int LifetimeKilobytes { get; init; }
+    public uint LifetimeKilobytes { get; init; }
 
     /// <summary>Lifetime in packets. 0 means unlimited.</summary>
-    public int LifetimePackets { get; init; }
+    public uint LifetimePackets { get; init; }
 }
 
 /// <summary>A complete request to bring up one CHILD_SA (or one sec-agree SA pair).</summary>
@@ -164,7 +164,7 @@ public sealed record ChildSaSnapshot(
     uint Spi,
     IpsecCipherAlgorithm Cipher,
     IpsecAuthAlgorithm Auth,
-    int LifetimeSeconds,
+    uint LifetimeSeconds,
     IPAddress LocalAddress,
     IPAddress RemoteAddress
 );

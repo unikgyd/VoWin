@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+
+    <!-- NuGet Package Metadata -->
+    <PackageId>qmiSharp</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>xiagao</Authors>
+    <Company>xiagao</Company>
+    <Product>qmiSharp</Product>
+    <Title>qmiSharp - Qualcomm QMI Protocol Stack for .NET on Windows</Title>
+    <Description>Qualcomm QMI protocol primitives and selected service APIs for .NET on Windows, with generated libqmi metadata, QMUX/QRTR framing, explicit raw transports, and Windows modem diagnostics.</Description>
+    <PackageTags>qmi;qualcomm;lte;5g;modem;quectel;cellular;libqmi;iot;telecom</PackageTags>
+    <RepositoryType>git</RepositoryType>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="qmiSharp.Tests" />
+    <PackageReference Include="System.IO.Ports" Version="10.0.12" />
+  </ItemGroup>
+
+</Project>

@@ -10,12 +10,11 @@ public class AtSession : IAtSession, IAsyncDisposable
     private readonly AsyncEventBus? _eventBus;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
+    private readonly object _portLifecycleGate = new();
+    private readonly AtResponseRouter _router = new();
     private Task? _readTask;
-    private TaskCompletionSource<AtResponse>? _pendingCommand;
-    private string? _pendingCommandText;
+    private CancellationTokenSource? _readLoopCts;
     private TaskCompletionSource<bool>? _pendingPrompt;
-    private readonly List<string> _currentResponseLines = new();
-    private string? _pendingMultilineUrcHeader;
 
     public AtSession(string portName, int baudRate = 115200, AsyncEventBus? eventBus = null)
     {
@@ -28,6 +27,7 @@ public class AtSession : IAtSession, IAsyncDisposable
             RtsEnable = true
         };
         _eventBus = eventBus;
+        _router.UrcReceived += EmitUrc;
     }
 
     public bool IsOpen => _port.IsOpen;
@@ -54,10 +54,21 @@ public class AtSession : IAtSession, IAsyncDisposable
 
     public void Open()
     {
-        if (!_port.IsOpen)
+        lock (_portLifecycleGate)
         {
+            if (_port.IsOpen) return;
+            var previous = _readTask;
+            if (previous is { IsCompleted: false } &&
+                Task.WhenAny(previous, Task.Delay(TimeSpan.FromSeconds(1))).GetAwaiter().GetResult() != previous)
+                throw new IOException("The previous AT reader has not stopped; refusing to open a second reader.");
             _port.Open();
-            _readTask = Task.Run(ReadLoopAsync);
+            var readerCts = new CancellationTokenSource();
+            _readLoopCts = readerCts;
+            _readTask = Task.Run(async () =>
+            {
+                try { await ReadLoopAsync(readerCts.Token).ConfigureAwait(false); }
+                finally { readerCts.Dispose(); }
+            });
         }
     }
 
@@ -65,15 +76,24 @@ public class AtSession : IAtSession, IAsyncDisposable
     /// Releases the serial handle without disposing the session.  It can be
     /// opened again later to resume URC and command processing.
     /// </summary>
-    public bool Close()
+    public bool Close() => CloseCore(out _);
+
+    private bool CloseCore(out Task? reader)
     {
-        try
+        lock (_portLifecycleGate)
         {
-            if (_port.IsOpen)
-                _port.Close();
-            return !_port.IsOpen;
+            var readerCts = _readLoopCts;
+            _readLoopCts = null;
+            try { readerCts?.Cancel(); } catch (ObjectDisposedException) { }
+            var closed = true;
+            try { if (_port.IsOpen) _port.Close(); }
+            catch { closed = false; }
+            _pendingPrompt?.TrySetCanceled();
+            _pendingPrompt = null;
+            _router.ResetOnClose();
+            reader = _readTask;
+            return closed && !_port.IsOpen;
         }
-        catch { return false; }
     }
 
     /// <summary>
@@ -82,8 +102,7 @@ public class AtSession : IAtSession, IAsyncDisposable
     /// </summary>
     public async Task<bool> CloseAsync(CancellationToken ct = default)
     {
-        var closed = Close();
-        var readTask = _readTask;
+        var closed = CloseCore(out var readTask);
         if (readTask != null)
         {
             try
@@ -92,7 +111,7 @@ public class AtSession : IAtSession, IAsyncDisposable
             }
             catch (OperationCanceledException) { }
         }
-        return closed && !_port.IsOpen;
+        return closed && (readTask == null || readTask.IsCompleted) && !_port.IsOpen;
     }
 
     public async Task<AtResponse> ExecuteCommandAsync(string command, int timeoutMs = 2000, CancellationToken ct = default)
@@ -104,38 +123,46 @@ public class AtSession : IAtSession, IAsyncDisposable
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token, _cts.Token);
 
         bool lockTaken = false;
+        bool writeAttempted = false;
+        TaskCompletionSource<AtResponse>? pending = null;
         try
         {
             lockTaken = await _lock.WaitAsync(timeoutMs, linkedCts.Token).ConfigureAwait(false);
             if (!lockTaken)
                 return new AtResponse(false, Array.Empty<string>(), "TIMEOUT");
 
-            _currentResponseLines.Clear();
-            var tcs = new TaskCompletionSource<AtResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _pendingCommand = tcs;
-            _pendingCommandText = command;
+            if (!await _router.AwaitPreviousTerminalAsync(linkedCts.Token).ConfigureAwait(false))
+                return new AtResponse(false, Array.Empty<string>(), "AT_DESYNCHRONIZED");
+            if (!IsOpen)
+                return new AtResponse(false, Array.Empty<string>(), "Port is not open");
 
+            pending = new TaskCompletionSource<AtResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _router.BeginCommand(command, pending);
+
+            writeAttempted = true;
             _port.Write(command + "\r\n");
 
-            using var reg = linkedCts.Token.Register(() =>
-            {
-                tcs.TrySetResult(new AtResponse(false, _currentResponseLines.ToArray(), "TIMEOUT", string.Join("\n", _currentResponseLines)));
-            });
+            using var reg = linkedCts.Token.Register(() => _router.Timeout(pending));
 
-            return await tcs.Task.ConfigureAwait(false);
+            return await pending.Task.ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            return new AtResponse(false, _currentResponseLines.ToArray(), "TIMEOUT", string.Join("\n", _currentResponseLines));
+            if (writeAttempted && pending != null) _router.Timeout(pending);
+            return pending != null
+                ? _router.SnapshotResponse(false, "TIMEOUT")
+                : new AtResponse(false, Array.Empty<string>(), "TIMEOUT");
         }
         catch (Exception ex)
         {
-            return new AtResponse(false, _currentResponseLines.ToArray(), ex.Message, string.Join("\n", _currentResponseLines));
+            if (writeAttempted && IsOpen) _router.MarkLateResponseDrain();
+            return pending != null
+                ? _router.SnapshotResponse(false, ex.Message)
+                : new AtResponse(false, Array.Empty<string>(), ex.Message);
         }
         finally
         {
-            _pendingCommand = null;
-            _pendingCommandText = null;
+            _router.EndCommand(pending);
             if (lockTaken)
             {
                 try { _lock.Release(); } catch { }
@@ -157,16 +184,25 @@ public class AtSession : IAtSession, IAsyncDisposable
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, totalTimeoutCts.Token, _cts.Token);
 
         bool lockTaken = false;
+        bool writeAttempted = false;
+        TaskCompletionSource<AtResponse>? pending = null;
         try
         {
             lockTaken = await _lock.WaitAsync(promptTimeoutMs + completionTimeoutMs, linkedCts.Token).ConfigureAwait(false);
             if (!lockTaken)
                 return new AtResponse(false, Array.Empty<string>(), "TIMEOUT");
 
-            _currentResponseLines.Clear();
+            if (!await _router.AwaitPreviousTerminalAsync(linkedCts.Token).ConfigureAwait(false))
+                return new AtResponse(false, Array.Empty<string>(), "AT_DESYNCHRONIZED");
+            if (!IsOpen)
+                return new AtResponse(false, Array.Empty<string>(), "Port is not open");
+
             var promptTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             _pendingPrompt = promptTcs;
+            pending = new TaskCompletionSource<AtResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _router.BeginCommand(initialCommand, pending);
 
+            writeAttempted = true;
             _port.Write(initialCommand + "\r\n");
 
             // Wait for '>' prompt
@@ -176,46 +212,51 @@ public class AtSession : IAtSession, IAsyncDisposable
 
             try
             {
+                var first = await Task.WhenAny(promptTcs.Task, pending.Task).ConfigureAwait(false);
+                if (first == pending.Task || pending.Task.IsCompleted)
+                    return await pending.Task.ConfigureAwait(false);
                 await promptTcs.Task.ConfigureAwait(false);
             }
             catch
             {
+                _router.Timeout(pending);
+                var response = await pending.Task.ConfigureAwait(false);
+                if (response.ErrorCode != "TIMEOUT") return response;
                 try { _port.Write("\x1B\r\n"); } catch { }
-                return new AtResponse(false, _currentResponseLines.ToArray(), "PROMPT_TIMEOUT", string.Join("\n", _currentResponseLines));
+                return _router.SnapshotResponse(false, "PROMPT_TIMEOUT");
             }
             finally
             {
                 _pendingPrompt = null;
             }
 
-            var cmdTcs = new TaskCompletionSource<AtResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _pendingCommand = cmdTcs;
-            _pendingCommandText = initialCommand;
-
             _port.Write(payload + "\x1A");
 
-            using var cmdReg = linkedCts.Token.Register(() =>
-            {
-                cmdTcs.TrySetResult(new AtResponse(false, _currentResponseLines.ToArray(), "TIMEOUT", string.Join("\n", _currentResponseLines)));
-            });
+            using var cmdReg = linkedCts.Token.Register(() => _router.Timeout(pending));
 
-            return await cmdTcs.Task.ConfigureAwait(false);
+            return await pending.Task.ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            try { _port.Write("\x1B\r\n"); } catch { }
-            return new AtResponse(false, _currentResponseLines.ToArray(), "TIMEOUT", string.Join("\n", _currentResponseLines));
+            if (pending != null) _router.Timeout(pending);
+            else if (writeAttempted && IsOpen) _router.MarkLateResponseDrain();
+            if (writeAttempted && IsOpen) try { _port.Write("\x1B\r\n"); } catch { }
+            return pending != null
+                ? _router.SnapshotResponse(false, "TIMEOUT")
+                : new AtResponse(false, Array.Empty<string>(), "TIMEOUT");
         }
         catch (Exception ex)
         {
-            try { _port.Write("\x1B\r\n"); } catch { }
-            return new AtResponse(false, _currentResponseLines.ToArray(), ex.Message, string.Join("\n", _currentResponseLines));
+            if (writeAttempted && IsOpen) _router.MarkLateResponseDrain();
+            if (writeAttempted && IsOpen) try { _port.Write("\x1B\r\n"); } catch { }
+            return pending != null
+                ? _router.SnapshotResponse(false, ex.Message)
+                : new AtResponse(false, Array.Empty<string>(), ex.Message);
         }
         finally
         {
             _pendingPrompt = null;
-            _pendingCommand = null;
-            _pendingCommandText = null;
+            _router.EndCommand(pending);
             if (lockTaken)
             {
                 try { _lock.Release(); } catch { }
@@ -223,12 +264,12 @@ public class AtSession : IAtSession, IAsyncDisposable
         }
     }
 
-    private async Task ReadLoopAsync()
+    private async Task ReadLoopAsync(CancellationToken readerCt)
     {
         var buffer = new byte[2048];
         var lineBuilder = new StringBuilder();
 
-        while (!_cts.IsCancellationRequested && _port.IsOpen)
+        while (!_cts.IsCancellationRequested && !readerCt.IsCancellationRequested && _port.IsOpen)
         {
             try
             {
@@ -236,6 +277,7 @@ public class AtSession : IAtSession, IAsyncDisposable
                 if (toRead > 0)
                 {
                     int bytesRead = _port.Read(buffer, 0, Math.Min(buffer.Length, toRead));
+                    if (readerCt.IsCancellationRequested) break;
                     if (bytesRead > 0)
                     {
                         var text = Encoding.ASCII.GetString(buffer, 0, bytesRead);
@@ -254,7 +296,7 @@ public class AtSession : IAtSession, IAsyncDisposable
                                 lineBuilder.Clear();
                                 if (!string.IsNullOrEmpty(line))
                                 {
-                                    HandleLine(line);
+                                    _router.HandleLine(line);
                                 }
                             }
                             else
@@ -270,69 +312,23 @@ public class AtSession : IAtSession, IAsyncDisposable
                 }
                 else
                 {
-                    await Task.Delay(10, _cts.Token).ConfigureAwait(false);
+                    await Task.Delay(10, readerCt).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) { break; }
             catch (TimeoutException) { }
             catch (Exception ex)
             {
-                if (!_cts.IsCancellationRequested && _port.IsOpen)
+                if (!_cts.IsCancellationRequested && !readerCt.IsCancellationRequested && _port.IsOpen)
                 {
                     _eventBus?.Publish(EventTopics.SystemError, "AtSession", $"ReadLoop error: {ex.Message}");
-                    try { await Task.Delay(50, _cts.Token).ConfigureAwait(false); } catch { break; }
+                    try { await Task.Delay(50, readerCt).ConfigureAwait(false); } catch { break; }
                 }
                 else
                 {
                     break;
                 }
             }
-        }
-    }
-
-    private void HandleLine(string line)
-    {
-        // +CMT and +CDS carry their PDU/text body on the next line. Keep both
-        // lines together so the SMS layer can decode the notification without
-        // losing the body while another AT command is in flight.
-        if (_pendingMultilineUrcHeader != null)
-        {
-            var completeUrc = $"{_pendingMultilineUrcHeader}\n{line}";
-            _pendingMultilineUrcHeader = null;
-            EmitUrc(completeUrc);
-            return;
-        }
-
-        if (line.StartsWith("+CMT:", StringComparison.OrdinalIgnoreCase) ||
-            line.StartsWith("+CDS:", StringComparison.OrdinalIgnoreCase))
-        {
-            _pendingMultilineUrcHeader = line;
-            return;
-        }
-
-        var isUrc = UrcParser.IsUrc(line);
-        var pending = _pendingCommand;
-        var belongsToPendingCommand = pending != null &&
-            (!isUrc || UrcParser.IsExpectedCommandResponse(_pendingCommandText, line));
-        if (belongsToPendingCommand)
-        {
-            _currentResponseLines.Add(line);
-
-            if (line.Equals("OK", StringComparison.OrdinalIgnoreCase))
-            {
-                pending!.TrySetResult(new AtResponse(true, _currentResponseLines.ToArray(), null, string.Join("\n", _currentResponseLines)));
-            }
-            else if (line.Equals("ERROR", StringComparison.OrdinalIgnoreCase) ||
-                     line.StartsWith("+CME ERROR:", StringComparison.OrdinalIgnoreCase) ||
-                     line.StartsWith("+CMS ERROR:", StringComparison.OrdinalIgnoreCase))
-            {
-                pending!.TrySetResult(new AtResponse(false, _currentResponseLines.ToArray(), line, string.Join("\n", _currentResponseLines)));
-            }
-        }
-
-        if (isUrc)
-        {
-            EmitUrc(line);
         }
     }
 
@@ -348,20 +344,12 @@ public class AtSession : IAtSession, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();
-        try
-        {
-            if (_port.IsOpen)
-            {
-                _port.Close();
-            }
-        }
-        catch { }
-
-        if (_readTask != null)
+        CloseCore(out var reader);
+        if (reader != null)
         {
             try
             {
-                await Task.WhenAny(_readTask, Task.Delay(100)).ConfigureAwait(false);
+                await Task.WhenAny(reader, Task.Delay(100)).ConfigureAwait(false);
             }
             catch { }
         }

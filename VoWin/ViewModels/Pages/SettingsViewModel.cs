@@ -3,6 +3,8 @@ using Wpf.Ui.Appearance;
 using VoWin.Models;
 using VoWin.Services;
 using System.IO;
+using System.Net;
+using VoSharp.Kernel.SipGateway;
 namespace VoWin.ViewModels.Pages
 {
     public partial class SettingsViewModel : ObservableObject, INavigationAware
@@ -35,6 +37,14 @@ namespace VoWin.ViewModels.Pages
         [ObservableProperty] private string _autoAnswerMessagePath = string.Empty;
         [ObservableProperty] private string _recordingDirectory = string.Empty;
         [ObservableProperty] private string _callSettingsStatus = string.Empty;
+        [ObservableProperty] private string _sipGatewayBindAddress = string.Empty;
+        [ObservableProperty] private int _sipGatewayPort = 5060;
+        [ObservableProperty] private string _sipGatewayExtension = "1001";
+        [ObservableProperty] private string _sipGatewayPassword = string.Empty;
+        [ObservableProperty] private bool _isSipGatewayRunning;
+        [ObservableProperty] private string _sipGatewayStatus = "未启动";
+
+        public string SipGatewayActionText => IsSipGatewayRunning ? "停止 SIP 网关" : "启动 SIP 网关";
 
         public async Task OnNavigatedToAsync()
         {
@@ -51,6 +61,7 @@ namespace VoWin.ViewModels.Pages
                 RecordingDirectory = settings.RecordingDirectory ?? GetDefaultRecordingDirectory();
                 _callSettingsLoaded = true;
             }
+            RefreshSipGatewayStatus();
         }
 
         public Task OnNavigatedFromAsync() => Task.CompletedTask;
@@ -154,6 +165,59 @@ namespace VoWin.ViewModels.Pages
             });
             CallSettingsStatus = "通话与来电设置已保存。";
         }
+
+        [RelayCommand]
+        private async Task ToggleSipGatewayAsync()
+        {
+            if (IsSipGatewayRunning)
+            {
+                await _kernel.StopSipGatewayAsync();
+                RefreshSipGatewayStatus();
+                return;
+            }
+            if (!IPAddress.TryParse(SipGatewayBindAddress.Trim(), out var bindAddress))
+            {
+                SipGatewayStatus = "请输入 WireGuard 网卡的 IP，例如 10.66.66.1。";
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(SipGatewayExtension) || string.IsNullOrEmpty(SipGatewayPassword))
+            {
+                SipGatewayStatus = "分机号和密码不能为空。";
+                return;
+            }
+            try
+            {
+                await _kernel.StartSipGatewayAsync(new SipGatewayOptions
+                {
+                    BindAddress = bindAddress,
+                    SipPort = SipGatewayPort,
+                    Realm = "vowin.local",
+                    Accounts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        [SipGatewayExtension.Trim()] = SipGatewayPassword
+                    }
+                });
+                RefreshSipGatewayStatus();
+            }
+            catch (Exception ex)
+            {
+                SipGatewayStatus = $"启动失败：{ex.Message}";
+            }
+        }
+
+        private void RefreshSipGatewayStatus()
+        {
+            var status = _kernel.GetSipGatewayStatus();
+            IsSipGatewayRunning = status?.IsRunning == true;
+            SipGatewayStatus = IsSipGatewayRunning
+                ? $"监听 {status!.LocalEndPoint} · 已注册 {status.Registrations.Count} 台终端 · 活跃 {status.ActiveDialogs} 通"
+                : "未启动（仅允许绑定 WireGuard、回环或其他私网地址）";
+        }
+
+        [RelayCommand]
+        private void RefreshSipGateway() => RefreshSipGatewayStatus();
+
+        partial void OnIsSipGatewayRunningChanged(bool value) => OnPropertyChanged(nameof(SipGatewayActionText));
 
         private static string GetDefaultRecordingDirectory() => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VoWin", "Recordings");

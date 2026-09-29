@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Net;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
 using VoSharp.Common.Aka;
@@ -34,7 +35,8 @@ public sealed record IkeSessionRequest(
     IkeAddressFamilyMode AddressFamilyMode = IkeAddressFamilyMode.Ipv6,
     Action<string>? DiagnosticLog = null,
     bool ForceNatt = false,
-    IPAddress? LocalAddress = null
+    IPAddress? LocalAddress = null,
+    byte EapMethod = EapType.Aka
 );
 
 public sealed record IkeSessionResult(
@@ -55,7 +57,9 @@ public sealed record IkeSessionResult(
     string? ErrorMessage,
     IkeLivenessProbe? LivenessProbe = null,
     bool EapSucceeded = false,
-    IkeAddressFamilyMode AddressFamilyMode = IkeAddressFamilyMode.Ipv6
+    IkeAddressFamilyMode AddressFamilyMode = IkeAddressFamilyMode.Ipv6,
+    IkeSessionController? Controller = null,
+    byte? RequestedEapType = null
 );
 
 /// <summary>
@@ -175,6 +179,7 @@ public static class IkeSession
             Trace($"IKE stage=IKE_SA_INIT send; endpoint-family={request.EpdgIp.AddressFamily}; port={request.EpdgPort}; dh={ikeSuite.DhGroupId}; proposals={ikeSuites.Count()}; proxy={socksClient is not null}; packet-bytes={initReqBytes.Length}.");
             var initRespBytes = await transport.RoundTripAsync(initReqBytes, ct).ConfigureAwait(false);
             var initResp = IkeWire.ParseMessage(initRespBytes);
+            ValidateHandshakeResponse(initResp, initiatorSpi, 0, IkeExchangeType.IkeSaInit, 0, allowZeroResponderSpi: true);
 
             // RFC 7296 section 2.6: a responder under load can remain
             // stateless and answer IKE_SA_INIT with N(COOKIE), SPIr=0. Retry
@@ -196,6 +201,7 @@ public static class IkeSession
                 Trace($"IKE stage=IKE_SA_INIT retry-cookie; attempt={cookieAttempt + 1}; packet-bytes={initReqBytes.Length}.");
                 initRespBytes = await transport.RoundTripAsync(initReqBytes, ct).ConfigureAwait(false);
                 initResp = IkeWire.ParseMessage(initRespBytes);
+                ValidateHandshakeResponse(initResp, initiatorSpi, 0, IkeExchangeType.IkeSaInit, 0, allowZeroResponderSpi: true);
             }
 
             if (initResp.ResponderSpi == 0)
@@ -207,10 +213,11 @@ public static class IkeSession
             var chosenSaPayload = initResp.Payloads.FirstOrDefault(p => p.Type == IkePayloadType.SecurityAssociation)
                 ?? throw new IkeFormatException("IKE_SA_INIT response missing SA payload.");
             var chosenProposals = IkeWire.DecodeProposals(chosenSaPayload.Body);
-            if (chosenProposals.Count == 0)
-                throw new IkeFormatException("IKE_SA_INIT response contains no proposals.");
+            if (chosenProposals.Count != 1)
+                throw new IkeFormatException("IKE_SA_INIT response must select exactly one proposal.");
 
             var negotiatedSuite = IkeSuite.FromProposal(chosenProposals[0]);
+            ValidateChosenSuite(chosenProposals[0].ProposalNumber, negotiatedSuite, ikeSuites);
 
             var peerKePayload = initResp.Payloads.FirstOrDefault(p => p.Type == IkePayloadType.KeyExchange)
                 ?? throw new IkeFormatException("IKE_SA_INIT response missing KE payload.");
@@ -247,7 +254,8 @@ public static class IkeSession
                 request.HomeMcc,
                 request.HomeMnc,
                 request.ExpectedIccid,
-                message => Trace($"EAP-AKA {message}"));
+                message => Trace($"EAP-AKA {message}"),
+                request.EapMethod);
 
             var childInboundSpis = new Dictionary<byte, uint>();
             var childProposals = childSuites.Select((candidate, index) =>
@@ -301,7 +309,8 @@ public static class IkeSession
             Trace($"IKE stage=IKE_AUTH send initial EAP request; address-family={request.AddressFamilyMode}; apn={request.Apn}; child-proposals={childSuites.Count()}; packet-bytes={firstAuthEncrypted.Length}.");
             var firstAuthRespBytes = await transport.RoundTripAsync(firstAuthEncrypted, ct).ConfigureAwait(false);
 
-            var (_, currentInnerPayloads) = IkeCrypto.DecryptPayloads(firstAuthRespBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
+            var (firstAuthHeader, currentInnerPayloads) = IkeCrypto.DecryptPayloads(firstAuthRespBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
+            ValidateHandshakeResponse(firstAuthHeader, initiatorSpi, responderSpi, IkeExchangeType.IkeAuth, authMsgId);
             var peerIdrPayload = currentInnerPayloads.FirstOrDefault(p => p.Type == IkePayloadType.IdentificationResponder);
 
             // ── 3. EAP-AKA Rounds Loop ──────────────────────────────────────
@@ -366,7 +375,8 @@ public static class IkeSession
                 Trace($"IKE stage=IKE_AUTH send EAP response; round={round + 1}; response-bytes={eapResponse.Length}; device-identity={deviceRequest is not null && !string.IsNullOrWhiteSpace(request.Imei)}.");
                 var respBytes = await transport.RoundTripAsync(encNext, ct).ConfigureAwait(false);
 
-                var (_, inner) = IkeCrypto.DecryptPayloads(respBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
+                var (roundHeader, inner) = IkeCrypto.DecryptPayloads(respBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
+                ValidateHandshakeResponse(roundHeader, initiatorSpi, responderSpi, IkeExchangeType.IkeAuth, authMsgId);
                 currentInnerPayloads = inner;
                 peerIdrPayload ??= currentInnerPayloads.FirstOrDefault(p => p.Type == IkePayloadType.IdentificationResponder);
 
@@ -408,44 +418,33 @@ public static class IkeSession
             Trace($"IKE stage=final-AUTH send; packet-bytes={finalEnc.Length}.");
             var finalRespBytes = await transport.RoundTripAsync(finalEnc, ct).ConfigureAwait(false);
 
-            var (_, finalPayloads) = IkeCrypto.DecryptPayloads(finalRespBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
+            var (finalHeader, finalPayloads) = IkeCrypto.DecryptPayloads(finalRespBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
+            ValidateHandshakeResponse(finalHeader, initiatorSpi, responderSpi, IkeExchangeType.IkeAuth, authMsgId);
             peerIdrPayload ??= finalPayloads.FirstOrDefault(p => p.Type == IkePayloadType.IdentificationResponder);
 
             // ── 5. Verify Responder AUTH (RFC 7296 §2.15 / 3GPP TS 33.402) ────
             var respAuthPayload = finalPayloads.FirstOrDefault(p => p.Type == IkePayloadType.Authentication);
-            if (respAuthPayload != null && respAuthPayload.Body.Length >= 4)
-            {
-                byte authMethod = respAuthPayload.Body[0];
-                var actualAuth = respAuthPayload.Body.AsSpan(4);
-                Console.WriteLine($"[IKE] Responder AUTH Method={authMethod}, BodyLen={respAuthPayload.Body.Length}, PeerIdr={peerIdrPayload != null}");
-                if (authMethod == AuthMethodSharedKeyMic)
-                {
-                    var respIdBody = peerIdrPayload?.Body ?? idrPayload.Body;
-                    var respIdHash = IkeCrypto.Prf(negotiatedSuite, ikeKeys.SkPr, respIdBody);
-                    var respSignedOctets = Combine(initRespBytes, initiatorNonce, respIdHash);
-                    var expectedRespAuth = IkeCrypto.Prf(negotiatedSuite, keyPad, respSignedOctets);
-
-                    Console.WriteLine($"[IKE] Responder AUTH Actual={Convert.ToHexString(actualAuth)}, Expected={Convert.ToHexString(expectedRespAuth)}");
-                    if (!CryptographicOperations.FixedTimeEquals(expectedRespAuth, actualAuth))
-                    {
-                        Console.WriteLine($"[IKE WARN] Responder AUTH MIC mismatch (actual={Convert.ToHexString(actualAuth)}, expected={Convert.ToHexString(expectedRespAuth)})");
-                        // If ePDG calculation differs or is relaxed, log warning
-                    }
-                }
-            }
+            if (peerIdrPayload?.Body is not { Length: > 4 })
+                throw new AuthenticationException("Responder did not provide an identity for final AUTH verification.");
+            var respIdBody = peerIdrPayload.Body;
+            var respIdHash = IkeCrypto.Prf(negotiatedSuite, ikeKeys.SkPr, respIdBody);
+            var respSignedOctets = Combine(initRespBytes, initiatorNonce, respIdHash);
+            var expectedRespAuth = IkeCrypto.Prf(negotiatedSuite, keyPad, respSignedOctets);
+            VerifyFinalResponderAuth(respAuthPayload, expectedRespAuth);
 
             // ── 6. Parse CHILD_SA, CP, and Key Material ──────────────────────
             stage = "CHILD_SA/configuration";
             var finalSaPayload = finalPayloads.FirstOrDefault(p => p.Type == IkePayloadType.SecurityAssociation)
                 ?? throw new IkeFormatException("Final IKE_AUTH response missing SA payload.");
             var finalProposals = IkeWire.DecodeProposals(finalSaPayload.Body);
-            if (finalProposals.Count == 0 || finalProposals[0].Spi.Length != 4)
+            if (finalProposals.Count != 1 || finalProposals[0].Spi.Length != 4)
                 throw new IkeFormatException("Final IKE_AUTH response has invalid ESP proposals.");
 
             var childOutboundSpi = BinaryPrimitives.ReadUInt32BigEndian(finalProposals[0].Spi);
             var negotiatedChildSuite = EspSuite.FromProposal(finalProposals[0]);
             if (!childInboundSpis.TryGetValue(finalProposals[0].ProposalNumber, out var childInboundSpi))
                 throw new IkeFormatException($"ePDG selected unknown ESP proposal {finalProposals[0].ProposalNumber}.");
+            ValidateChosenSuite(finalProposals[0].ProposalNumber, negotiatedChildSuite, childSuites);
 
             var (outEnc, outAuth, inEnc, inAuth) = IkeCrypto.DeriveChildSaKeys(
                 negotiatedSuite, negotiatedChildSuite, ikeKeys.SkD, initiatorNonce, responderNonce);
@@ -467,6 +466,11 @@ public static class IkeSession
                 : "unknown";
             Trace($"IKE stage=CHILD_SA complete; esp-encryption={negotiatedChildSuite.EncryptionId}-{negotiatedChildSuite.EncryptionBits}; esp-integrity={negotiatedChildSuite.IntegrityId}; assigned-family={assignedFamily}; dns-count={dnsList.Count}; pcscf-family={pcscfFamily}.");
 
+            var controller = new IkeSessionController(
+                transport, negotiatedSuite, initiatorSpi, responderSpi, authMsgId,
+                childInboundSpi, ikeKeys.SkEi, ikeKeys.SkAi, ikeKeys.SkEr, ikeKeys.SkAr,
+                request.DiagnosticLog);
+
             return new IkeSessionResult(
                 Success: true,
                 AssignedIp: assignedIp,
@@ -483,11 +487,10 @@ public static class IkeSession
                 Transport: transport,
                 IsNatDetected: isNatDetected,
                 ErrorMessage: null,
-                LivenessProbe: new IkeLivenessProbe(
-                    transport, negotiatedSuite, initiatorSpi, responderSpi, authMsgId,
-                    ikeKeys.SkEi, ikeKeys.SkAi, ikeKeys.SkEr, ikeKeys.SkAr),
+                LivenessProbe: new IkeLivenessProbe(controller),
                 EapSucceeded: true,
-                AddressFamilyMode: request.AddressFamilyMode
+                AddressFamilyMode: request.AddressFamilyMode,
+                Controller: controller
             );
         }
         catch (Exception ex)
@@ -511,12 +514,57 @@ public static class IkeSession
                 IsNatDetected: false,
                 ErrorMessage: ex.Message,
                 EapSucceeded: eapSucceeded,
-                AddressFamilyMode: request.AddressFamilyMode
+                AddressFamilyMode: request.AddressFamilyMode,
+                RequestedEapType: (ex as EapMethodMismatchException)?.RequestedType
             );
         }
 
         static string currentPayloadNames(IEnumerable<IkePayload> payloads) =>
             string.Join(',', payloads.Select(payload => payload.Type.ToString()));
+    }
+
+    internal static void VerifyFinalResponderAuth(IkePayload? authPayload, ReadOnlySpan<byte> expectedMic)
+    {
+        if (authPayload?.Body is not { Length: >= 5 } body ||
+            body[0] != AuthMethodSharedKeyMic ||
+            body[1] != 0 || body[2] != 0 || body[3] != 0 ||
+            body.Length != expectedMic.Length + 4 ||
+            !CryptographicOperations.FixedTimeEquals(body.AsSpan(4), expectedMic))
+        {
+            throw new AuthenticationException("Responder final AUTH is missing or invalid.");
+        }
+    }
+
+    internal static void ValidateHandshakeResponse(
+        IkeWire.IkeMessage header,
+        ulong initiatorSpi,
+        ulong responderSpi,
+        IkeExchangeType exchange,
+        uint messageId,
+        bool allowZeroResponderSpi = false)
+    {
+        if ((header.Version >> 4) != 2 ||
+            header.InitiatorSpi != initiatorSpi ||
+            (!allowZeroResponderSpi && header.ResponderSpi != responderSpi) ||
+            header.Exchange != exchange ||
+            header.MessageId != messageId ||
+            !header.Flags.HasFlag(IkeFlags.Response) ||
+            header.Flags.HasFlag(IkeFlags.Initiator))
+        {
+            throw new IkeFormatException("IKE response did not match the active exchange.");
+        }
+    }
+
+    internal static void ValidateChosenSuite(byte proposalNumber, IkeSuite chosen, IReadOnlyList<IkeSuite> offered)
+    {
+        if (proposalNumber == 0 || proposalNumber > offered.Count || chosen != offered[proposalNumber - 1])
+            throw new IkeFormatException("Responder selected an IKE suite that was not offered.");
+    }
+
+    internal static void ValidateChosenSuite(byte proposalNumber, EspSuite chosen, IReadOnlyList<EspSuite> offered)
+    {
+        if (proposalNumber == 0 || proposalNumber > offered.Count || chosen != offered[proposalNumber - 1])
+            throw new IkeFormatException("Responder selected an ESP suite that was not offered.");
     }
 
     internal static bool DetectNat(

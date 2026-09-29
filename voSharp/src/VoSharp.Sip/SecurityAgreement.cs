@@ -8,10 +8,10 @@ namespace VoSharp.Sip;
 /// One ipsec-3gpp security mechanism offered to (or selected by) the P-CSCF.
 /// 3GPP TS 33.203 §7.2 / RFC 3329.
 /// </summary>
-/// <param name="SpiClient">SPI of the SA the UE uses when sending (UE client port → P-CSCF server port).</param>
-/// <param name="SpiServer">SPI of the SA the P-CSCF uses when sending to the UE server port.</param>
-/// <param name="PortClient">UE-side source port used when the UE dials out.</param>
-/// <param name="PortServer">UE-side destination port the P-CSCF dials back into; must be listening.</param>
+/// <param name="SpiClient">SPI of the inbound SA terminating at this endpoint's protected client port.</param>
+/// <param name="SpiServer">SPI of the inbound SA terminating at this endpoint's protected server port.</param>
+/// <param name="PortClient">This endpoint's protected client port.</param>
+/// <param name="PortServer">This endpoint's protected server port; must be listening.</param>
 public sealed record SecurityProposal(
     string IntegrityAlgorithm,
     string EncryptionAlgorithm,
@@ -45,10 +45,10 @@ public sealed record SecurityAgreementEvaluation(
 /// Security agreement (sec-agree) for IMS registration.
 /// </summary>
 /// <remarks>
-/// Port naming is the usual source of confusion: <c>port-c</c>/<c>spi-c</c> describe the SA the
-/// <b>UE</b> uses as a client (outbound, from <c>port-c</c>), while <c>port-s</c>/<c>spi-s</c>
-/// describe the SA on the port the <b>P-CSCF</b> connects back to. Both are UE-side values in
-/// Security-Client; the P-CSCF answers with its own pair.
+/// Port naming is the usual source of confusion: <c>spi-c</c>/<c>spi-s</c> always identify
+/// inbound SAs at the endpoint advertising them. Security-Client describes the UE's two
+/// inbound SAs; Security-Server describes the P-CSCF's two inbound SAs. UE outbound traffic
+/// from <c>port-c</c> to the P-CSCF <c>port-s</c> therefore uses the P-CSCF's <c>spi-s</c>.
 /// </remarks>
 public static class SecurityAgreementBuilder
 {
@@ -208,6 +208,12 @@ public static class SecurityAgreementBuilder
                 !TryGetInt(parameters, "port-s", out var pcscfServerPort))
             {
                 diagnostics.Add($"{label}: rejected (missing or invalid SPI/port field).");
+                continue;
+            }
+
+            if (pcscfClientSpi < 256 || pcscfServerSpi < 256)
+            {
+                diagnostics.Add($"{label}: rejected (reserved ESP SPI value).");
                 continue;
             }
 

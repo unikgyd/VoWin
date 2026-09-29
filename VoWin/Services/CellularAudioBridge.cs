@@ -2,6 +2,9 @@ using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Pipes;
+using System.Threading.Channels;
+using VoSharp.Telephony.Calls;
 
 namespace VoWin.Services;
 
@@ -20,6 +23,10 @@ internal sealed class CellularAudioWorker : IDisposable
     private AudioFileReader? _messageReader;
     private int _hostMicrophonePeak;
     private int _modemDownlinkPeak;
+    private CancellationTokenSource? _externalCts;
+    private Channel<byte[]>? _downlinkFrames;
+    private Task? _uplinkPump;
+    private Task? _downlinkPump;
 
     public bool IsRunning { get; private set; }
     public string DeviceSummary { get; private set; } = string.Empty;
@@ -80,9 +87,104 @@ internal sealed class CellularAudioWorker : IDisposable
         IsRunning = true;
     }
 
+    /// <summary>
+    /// Opens only the modem UAC endpoints. Uplink PCM is read from the parent
+    /// SIP gateway and captured modem PCM is returned over the second pipe.
+    /// No Windows microphone or speaker is opened in this mode.
+    /// </summary>
+    public void StartExternal(Stream uplinkSource, Stream downlinkDestination, string? messagePath = null)
+    {
+        ArgumentNullException.ThrowIfNull(uplinkSource);
+        ArgumentNullException.ThrowIfNull(downlinkDestination);
+        Stop();
+
+        var modemInput = FindInputDevice(isModem: true);
+        var modemOutput = FindOutputDevice(isModem: true);
+        if (modemInput < 0 || modemOutput < 0)
+            throw new InvalidOperationException("Windows did not expose the modem AC Interface input/output endpoints.");
+
+        DeviceSummary = $"external SIP PCM, modem input={WaveIn.GetCapabilities(modemInput).ProductName}, " +
+                        $"modem output={WaveOut.GetCapabilities(modemOutput).ProductName}";
+        Interlocked.Exchange(ref _hostMicrophonePeak, 0);
+        Interlocked.Exchange(ref _modemDownlinkPeak, 0);
+
+        var format = new WaveFormat(8000, 16, 1);
+        _modemUplink = CreateBuffer(format);
+        _modemPlayback = new WaveOut { DeviceNumber = modemOutput, Volume = 1.0f };
+        var uplinkMix = new MixingSampleProvider(new[] { _modemUplink.ToSampleProvider() }) { ReadFully = true };
+        if (!string.IsNullOrWhiteSpace(messagePath) && File.Exists(messagePath))
+        {
+            _messageReader = new AudioFileReader(messagePath);
+            ISampleProvider message = _messageReader;
+            if (message.WaveFormat.Channels == 2) message = new StereoToMonoSampleProvider(message);
+            if (message.WaveFormat.SampleRate != 8000) message = new WdlResamplingSampleProvider(message, 8000);
+            uplinkMix.AddMixerInput(message);
+        }
+        _modemPlayback.Init(uplinkMix.ToWaveProvider16());
+
+        _downlinkFrames = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(32)
+        {
+            SingleReader = true,
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+        _modemCapture = CreateCapture(modemInput, format, (_, args) =>
+        {
+            UpdatePeak(ref _modemDownlinkPeak, args.Buffer, args.BytesRecorded);
+            var copy = new byte[args.BytesRecorded];
+            Buffer.BlockCopy(args.Buffer, 0, copy, 0, args.BytesRecorded);
+            _downlinkFrames?.Writer.TryWrite(copy);
+        });
+
+        _externalCts = new CancellationTokenSource();
+        var token = _externalCts.Token;
+        _uplinkPump = Task.Run(() => PumpExternalUplinkAsync(uplinkSource, token), token);
+        _downlinkPump = Task.Run(() => PumpExternalDownlinkAsync(downlinkDestination, token), token);
+        _modemPlayback.Play();
+        _modemCapture.StartRecording();
+        IsRunning = true;
+    }
+
+    private async Task PumpExternalUplinkAsync(Stream source, CancellationToken ct)
+    {
+        var buffer = new byte[320];
+        while (!ct.IsCancellationRequested)
+        {
+            var count = await ReadPcmFrameAsync(source, buffer, ct).ConfigureAwait(false);
+            if (count < buffer.Length) break;
+            UpdatePeak(ref _hostMicrophonePeak, buffer, count);
+            _modemUplink?.AddSamples(buffer, 0, count);
+        }
+    }
+
+    private static async Task<int> ReadPcmFrameAsync(Stream source, byte[] buffer, CancellationToken ct)
+    {
+        var total = 0;
+        while (total < buffer.Length)
+        {
+            var count = await source.ReadAsync(buffer.AsMemory(total), ct).ConfigureAwait(false);
+            if (count == 0) break;
+            total += count;
+        }
+        return total;
+    }
+
+    private async Task PumpExternalDownlinkAsync(Stream destination, CancellationToken ct)
+    {
+        if (_downlinkFrames == null) return;
+        await foreach (var frame in _downlinkFrames.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+        {
+            await destination.WriteAsync(frame, ct).ConfigureAwait(false);
+            await destination.FlushAsync(ct).ConfigureAwait(false);
+        }
+    }
+
     public void Stop()
     {
         IsRunning = false;
+        var externalCts = Interlocked.Exchange(ref _externalCts, null);
+        try { externalCts?.Cancel(); } catch { }
+        _downlinkFrames?.Writer.TryComplete();
         StopCapture(ref _hostMicrophone);
         StopCapture(ref _modemCapture);
         StopPlayback(ref _modemPlayback);
@@ -91,6 +193,11 @@ internal sealed class CellularAudioWorker : IDisposable
         _hostDownlink = null;
         _messageReader?.Dispose();
         _messageReader = null;
+        try { Task.WaitAll([_uplinkPump ?? Task.CompletedTask, _downlinkPump ?? Task.CompletedTask], 1000); } catch { }
+        _uplinkPump = null;
+        _downlinkPump = null;
+        _downlinkFrames = null;
+        externalCts?.Dispose();
     }
 
     public (int HostMicrophonePeak, int ModemDownlinkPeak) ReadAndResetPeaks() =>
@@ -182,7 +289,7 @@ internal sealed class CellularAudioWorker : IDisposable
 /// republishes UAC. A long-lived WPF process otherwise keeps the pre-route
 /// WinMM device mapping and receives a successful but permanent zero stream.
 /// </summary>
-internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable
+internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable, ICallPcmMedia
 {
     private Process? _process;
     private EventWaitHandle? _stopEvent;
@@ -190,11 +297,21 @@ internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private int _hostMicrophonePeak;
     private int _modemDownlinkPeak;
+    private NamedPipeServerStream? _uplinkPipe;
+    private NamedPipeServerStream? _downlinkPipe;
+    private CancellationTokenSource? _pcmCts;
+    private Channel<byte[]>? _uplinkFrames;
+    private Task? _uplinkPump;
+    private Task? _downlinkPump;
 
     public bool IsRunning => _process is { HasExited: false } && _ready?.Task.IsCompletedSuccessfully == true;
     public string DeviceSummary { get; private set; } = string.Empty;
+    public event Action<short[]>? RemotePcmReceived;
 
-    public async Task StartAsync(string? messagePath = null, CancellationToken cancellationToken = default)
+    public async Task StartAsync(
+        string? messagePath = null,
+        CancellationToken cancellationToken = default,
+        bool externalPcm = false)
     {
         await _lifecycleGate.WaitAsync(cancellationToken);
         try
@@ -218,19 +335,41 @@ internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable
             startInfo.ArgumentList.Add("--cellular-audio-helper");
             startInfo.ArgumentList.Add("--stop-event");
             startInfo.ArgumentList.Add(eventName);
-        startInfo.ArgumentList.Add("--parent-pid");
-        startInfo.ArgumentList.Add(Environment.ProcessId.ToString());
-        if (!string.IsNullOrWhiteSpace(messagePath) && File.Exists(messagePath))
-        {
-            startInfo.ArgumentList.Add("--message-file");
-            startInfo.ArgumentList.Add(messagePath);
-        }
+            startInfo.ArgumentList.Add("--parent-pid");
+            startInfo.ArgumentList.Add(Environment.ProcessId.ToString());
+            Task? pipeConnect = null;
+            if (externalPcm)
+            {
+                var pipeBase = $"VoWinCellularPcm_{Guid.NewGuid():N}";
+                _uplinkPipe = new NamedPipeServerStream(pipeBase + "_up", PipeDirection.Out, 1,
+                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                _downlinkPipe = new NamedPipeServerStream(pipeBase + "_down", PipeDirection.In, 1,
+                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                startInfo.ArgumentList.Add("--external-pcm");
+                startInfo.ArgumentList.Add("--uplink-pipe");
+                startInfo.ArgumentList.Add(pipeBase + "_up");
+                startInfo.ArgumentList.Add("--downlink-pipe");
+                startInfo.ArgumentList.Add(pipeBase + "_down");
+                pipeConnect = Task.WhenAll(
+                    _uplinkPipe.WaitForConnectionAsync(cancellationToken),
+                    _downlinkPipe.WaitForConnectionAsync(cancellationToken));
+            }
+            if (!string.IsNullOrWhiteSpace(messagePath) && File.Exists(messagePath))
+            {
+                startInfo.ArgumentList.Add("--message-file");
+                startInfo.ArgumentList.Add(messagePath);
+            }
 
             var process = _process = Process.Start(startInfo) ?? throw new InvalidOperationException("Cannot start VoWin cellular audio helper.");
             _ = PumpOutputAsync(process, ready);
             try
             {
                 DeviceSummary = await ready.Task.WaitAsync(TimeSpan.FromSeconds(12), cancellationToken);
+                if (pipeConnect != null)
+                {
+                    await pipeConnect.WaitAsync(TimeSpan.FromSeconds(12), cancellationToken).ConfigureAwait(false);
+                    StartPcmPumps();
+                }
             }
             catch
             {
@@ -253,6 +392,13 @@ internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable
 
     private async Task StopCoreAsync()
     {
+        var pcmCts = Interlocked.Exchange(ref _pcmCts, null);
+        try { pcmCts?.Cancel(); } catch { }
+        _uplinkFrames?.Writer.TryComplete();
+        try { _uplinkPipe?.Dispose(); } catch { }
+        try { _downlinkPipe?.Dispose(); } catch { }
+        _uplinkPipe = null;
+        _downlinkPipe = null;
         var process = Interlocked.Exchange(ref _process, null);
         var stopEvent = Interlocked.Exchange(ref _stopEvent, null);
         try { stopEvent?.Set(); } catch { }
@@ -270,6 +416,11 @@ internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable
         }
         stopEvent?.Dispose();
         _ready = null;
+        try { await Task.WhenAll(_uplinkPump ?? Task.CompletedTask, _downlinkPump ?? Task.CompletedTask).WaitAsync(TimeSpan.FromSeconds(1)); } catch { }
+        _uplinkPump = null;
+        _downlinkPump = null;
+        _uplinkFrames = null;
+        pcmCts?.Dispose();
         Interlocked.Exchange(ref _hostMicrophonePeak, 0);
         Interlocked.Exchange(ref _modemDownlinkPeak, 0);
     }
@@ -277,6 +428,59 @@ internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable
     public (int HostMicrophonePeak, int ModemDownlinkPeak) ReadAndResetPeaks() =>
         (Interlocked.Exchange(ref _hostMicrophonePeak, 0),
          Interlocked.Exchange(ref _modemDownlinkPeak, 0));
+
+    public void SendExternalPcm(short[] samples)
+    {
+        ArgumentNullException.ThrowIfNull(samples);
+        if (_uplinkFrames == null || samples.Length == 0) return;
+        var bytes = new byte[samples.Length * sizeof(short)];
+        Buffer.BlockCopy(samples, 0, bytes, 0, bytes.Length);
+        _uplinkFrames.Writer.TryWrite(bytes);
+    }
+
+    private void StartPcmPumps()
+    {
+        _pcmCts = new CancellationTokenSource();
+        _uplinkFrames = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(32)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+        var token = _pcmCts.Token;
+        _uplinkPump = Task.Run(async () =>
+        {
+            await foreach (var frame in _uplinkFrames.Reader.ReadAllAsync(token).ConfigureAwait(false))
+            {
+                await _uplinkPipe!.WriteAsync(frame, token).ConfigureAwait(false);
+                await _uplinkPipe.FlushAsync(token).ConfigureAwait(false);
+            }
+        }, token);
+        _downlinkPump = Task.Run(async () =>
+        {
+            var bytes = new byte[320];
+            while (!token.IsCancellationRequested)
+            {
+                var count = await ReadPcmFrameAsync(_downlinkPipe!, bytes, token).ConfigureAwait(false);
+                if (count < bytes.Length) break;
+                var samples = new short[bytes.Length / 2];
+                Buffer.BlockCopy(bytes, 0, samples, 0, bytes.Length);
+                try { RemotePcmReceived?.Invoke(samples); } catch { }
+            }
+        }, token);
+    }
+
+    private static async Task<int> ReadPcmFrameAsync(Stream source, byte[] buffer, CancellationToken ct)
+    {
+        var total = 0;
+        while (total < buffer.Length)
+        {
+            var count = await source.ReadAsync(buffer.AsMemory(total), ct).ConfigureAwait(false);
+            if (count == 0) break;
+            total += count;
+        }
+        return total;
+    }
 
     private async Task PumpOutputAsync(Process process, TaskCompletionSource<string> ready)
     {
@@ -338,7 +542,21 @@ internal static class CellularAudioWorkerHost
             using var parent = Process.GetProcessById(parentId);
             var messagePath = ReadOptionalArgument(args, "--message-file");
             using var worker = new CellularAudioWorker();
-            worker.Start(messagePath);
+            NamedPipeClientStream? uplinkPipe = null;
+            NamedPipeClientStream? downlinkPipe = null;
+            if (args.Contains("--external-pcm", StringComparer.Ordinal))
+            {
+                uplinkPipe = new NamedPipeClientStream(".", ReadArgument(args, "--uplink-pipe"), PipeDirection.In, PipeOptions.Asynchronous);
+                downlinkPipe = new NamedPipeClientStream(".", ReadArgument(args, "--downlink-pipe"), PipeDirection.Out, PipeOptions.Asynchronous);
+                await Task.WhenAll(
+                    uplinkPipe.ConnectAsync(10000),
+                    downlinkPipe.ConnectAsync(10000)).ConfigureAwait(false);
+                worker.StartExternal(uplinkPipe, downlinkPipe, messagePath);
+            }
+            else
+            {
+                worker.Start(messagePath);
+            }
             Console.WriteLine("READY|" + worker.DeviceSummary);
             Console.Out.Flush();
 
@@ -349,6 +567,8 @@ internal static class CellularAudioWorkerHost
                 Console.Out.Flush();
                 await Task.Yield();
             }
+            uplinkPipe?.Dispose();
+            downlinkPipe?.Dispose();
             return 0;
         }
         catch (Exception ex)

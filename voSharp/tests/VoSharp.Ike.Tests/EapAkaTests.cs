@@ -38,6 +38,44 @@ public class EapAkaTests
 
         var nai3Digit = EapAkaClient.BuildPermanentIdentity("460011234567890", "460", "011");
         Assert.Equal("0460011234567890@nai.epc.mnc011.mcc460.3gppnetwork.org", Encoding.UTF8.GetString(nai3Digit));
+        var prime = EapAkaClient.BuildPermanentIdentity("460001234567890", "460", "00", EapType.AkaPrime);
+        Assert.StartsWith("6460001234567890@", Encoding.UTF8.GetString(prime));
+    }
+
+    [Fact]
+    public void DeriveAkaPrimeKeys_MatchesRfc5448AppendixCCase1()
+    {
+        var keys = EapAkaClient.DeriveAkaPrimeKeys(
+            Encoding.ASCII.GetBytes("0555444333222111"),
+            Convert.FromHexString("9744871ad32bf9bbd1dd5ce54e3e2e5a"),
+            Convert.FromHexString("5349fbe098649f948f5d2e973a81c00f"),
+            Convert.FromHexString("bb52e91c747ac3ab2a5c23d15ee351d5"),
+            Encoding.ASCII.GetBytes("WLAN"));
+
+        Assert.Equal("766FA0A6C317174B812D52FBCD11A179", Convert.ToHexString(keys.KEncr));
+        Assert.Equal("0842EA722FF6835BFA2032499FC3EC23C2F0E388B4F07543FFC677F1696D71EA", Convert.ToHexString(keys.KAut));
+        Assert.Equal("67C42D9AA56C1B79E295E3459FC3D187D42BE0BF818D3070E362C5E967A4D544E8ECFE19358AB3039AFF03B7C930588C055BABEE58A02650B067EC4E9347C75A", Convert.ToHexString(keys.Msk));
+        Assert.Equal("F861703CD775590E16C7679EA3874ADA866311DE290764D760CF76DF647EA01C313F69924BDD7650CA9BAC141EA075C4EF9E8029C0E290CDBAD5638B63BC23FB", Convert.ToHexString(keys.Emsk));
+    }
+
+    [Fact]
+    public async Task AkaPrimeSelection_RequiresFreshIdentity()
+    {
+        var provider = new MockAkaProvider();
+        var akaClient = new EapAkaClient(provider, "460001234567890", "460", "00");
+        var primeRequest = EapAkaClient.MarshalEapPacket(new EapPacket(
+            EapCode.Request, 1, EapType.AkaPrime, [AkaSubtype.Identity, 0, 0]));
+        var mismatch = await Assert.ThrowsAsync<EapMethodMismatchException>(() => akaClient.HandleAsync(primeRequest));
+        Assert.Equal(EapType.AkaPrime, mismatch.RequestedType);
+
+        var primeClient = new EapAkaClient(provider, "460001234567890", "460", "00",
+            selectedEapMethod: EapType.AkaPrime);
+        Assert.Equal((byte)'6', primeClient.Identity[0]);
+        var identityRequest = EapAkaClient.MarshalEapPacket(new EapPacket(
+            EapCode.Request, 1, EapType.Identity, []));
+        var (response, complete) = await primeClient.HandleAsync(identityRequest);
+        Assert.False(complete);
+        Assert.Equal(primeClient.Identity, EapAkaClient.ParseEapPacket(response!).Data);
     }
 
     [Fact]

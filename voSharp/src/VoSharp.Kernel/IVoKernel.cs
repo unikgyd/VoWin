@@ -4,6 +4,7 @@ using VoSharp.Euicc;
 using VoSharp.Euicc.Models;
 using VoSharp.Kernel.Events;
 using VoSharp.Kernel.Pool;
+using VoSharp.Kernel.SipGateway;
 using VoSharp.Modem;
 using VoSharp.Modem.At;
 using VoSharp.Sim;
@@ -32,8 +33,11 @@ public interface IVoKernel : IAsyncDisposable
     ImsCallManager Calls { get; }
     SmsService? SmsService { get; }
     EuiccManager? EuiccManager { get; set; }
+    SipGateway.SipGateway? LocalSipGateway { get; }
+    ICellularSipMediaProvider? CellularSipMediaProvider { get; set; }
 
     CallSession? ActiveCall { get; }
+    string? ActiveCallSlotId { get; }
     bool RoamingAllowed { get; }
     IReadOnlyList<SmsMessage> Inbox { get; }
     IReadOnlyList<SmsMessage> Outbox { get; }
@@ -51,6 +55,12 @@ public interface IVoKernel : IAsyncDisposable
     Task<CallInfo?> AnswerAsync(string? slotId = null, CancellationToken ct = default);
     Task<CallInfo?> RejectAsync(string? slotId = null, CancellationToken ct = default);
     Task<bool> SendDtmfAsync(char digit, string? slotId = null, CancellationToken ct = default);
+    Task StartSipGatewayAsync(SipGatewayOptions options, CancellationToken ct = default);
+    Task StopSipGatewayAsync();
+    HostImsRegistrationStatus GetHostImsRegistrationStatus(string? slotId = null);
+    Task<HostImsRegistrationStatus> StartHostImsRegistrationAsync(
+        string? slotId = null, HostImsEndpointCandidate? endpoint = null, CancellationToken ct = default);
+    Task StopHostImsRegistrationAsync(string? slotId = null);
 
     // ── Direct SMS Operations ────────────────────────────────────────────────
     Task<SmsSubmitResult> SendSmsAsync(

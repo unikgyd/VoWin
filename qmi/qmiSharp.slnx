@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="qmiSharp/qmiSharp.csproj" />
+  <Project Path="qmiSharp.Cli/qmiSharp.Cli.csproj" />
+  <Project Path="qmiSharp.Tests/qmiSharp.Tests.csproj" />
+</Solution>

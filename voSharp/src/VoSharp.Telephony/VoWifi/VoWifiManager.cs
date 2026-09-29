@@ -139,6 +139,7 @@ public class VoWifiManager : IDisposable
     // separate from the current-call reference so a concurrent SIP state change
     // cannot make an already negotiated RTP port disappear from the dispatcher.
     private readonly ConcurrentDictionary<int, Calls.RtpSession> _rtpSessions = new();
+    private readonly ConcurrentDictionary<int, Calls.RtpSession> _rtcpSessions = new();
     private readonly object _rtpSessionLock = new();
     private Calls.RtpSession? _activeRtpSession;
     public Calls.RtpSession? ActiveRtpSession
@@ -152,12 +153,17 @@ public class VoWifiManager : IDisposable
         lock (_rtpSessionLock)
         {
             if (_activeRtpSession is { } previous && !ReferenceEquals(previous, session))
+            {
                 _rtpSessions.TryRemove(previous.LocalPort, out _);
+                _rtcpSessions.TryRemove(previous.LocalRtcpPort, out _);
+            }
 
             _rtpSessions[session.LocalPort] = session;
+            _rtcpSessions[session.LocalRtcpPort] = session;
             _activeRtpSession = session;
         }
-        EventBus?.Publish(EventTopics.SystemLog, "VoWiFi", $"Registered RTP endpoint on UDP {session.LocalPort}.");
+        EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+            $"Registered RTP/RTCP endpoints on UDP {session.LocalPort}/{session.LocalRtcpPort}.");
     }
 
     public void UnregisterRtpSession(Calls.RtpSession session)
@@ -167,6 +173,8 @@ public class VoWifiManager : IDisposable
         {
             if (_rtpSessions.TryGetValue(session.LocalPort, out var registered) && ReferenceEquals(registered, session))
                 _rtpSessions.TryRemove(session.LocalPort, out _);
+            if (_rtcpSessions.TryGetValue(session.LocalRtcpPort, out var registeredRtcp) && ReferenceEquals(registeredRtcp, session))
+                _rtcpSessions.TryRemove(session.LocalRtcpPort, out _);
             if (ReferenceEquals(_activeRtpSession, session))
                 _activeRtpSession = null;
         }
@@ -177,6 +185,7 @@ public class VoWifiManager : IDisposable
         lock (_rtpSessionLock)
         {
             _rtpSessions.Clear();
+            _rtcpSessions.Clear();
             _activeRtpSession = null;
         }
     }
@@ -209,6 +218,12 @@ public class VoWifiManager : IDisposable
     // UI state behind.
     private static readonly TimeSpan ProactiveRenewalAge = TimeSpan.FromHours(3.5);
     public bool EnableImsIpsec { get; set; } = true;
+    /// <summary>
+    /// Supplies the AOSP-Iwlan discovery inputs that are available outside Android
+    /// (registered/equivalent PLMN, roaming MCC, carrier/static and location data).
+    /// The explicit StartVoWifiAsync custom ePDG still has the highest priority.
+    /// </summary>
+    public EpdgDiscoveryOptions EpdgDiscovery { get; set; } = new();
     public bool SmsCapabilityConfirmed { get; private set; }
     private Ikev2Transport? _transport;
     private CancellationTokenSource? _ctsEspDispatch;
@@ -406,7 +421,20 @@ public class VoWifiManager : IDisposable
             var homePlmnCandidates = EpdgResolver.BuildHomePlmnCandidates(sim);
             EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
                 $"Stage 1/4 ePDG discovery started; home-PLMN candidates=[{string.Join(',', homePlmnCandidates.Select(candidate => $"{candidate.Mcc}-{candidate.Mnc}"))}]; custom-ePDG={!string.IsNullOrWhiteSpace(customEpdg)}.");
-            EpdgInfo = await EpdgResolver.ResolveAsync(sim, customEpdg, ct)
+            var addressPreference = options.LocalAddress?.AddressFamily switch
+            {
+                System.Net.Sockets.AddressFamily.InterNetwork => EpdgAddressPreference.Ipv4Preferred,
+                System.Net.Sockets.AddressFamily.InterNetworkV6 => EpdgAddressPreference.Ipv6Preferred,
+                _ => EpdgAddressPreference.System
+            };
+            var discovery = EpdgDiscovery with
+            {
+                CustomEpdg = customEpdg ?? EpdgDiscovery.CustomEpdg,
+                AddressPreference = options.LocalAddress == null
+                    ? EpdgDiscovery.AddressPreference
+                    : addressPreference
+            };
+            EpdgInfo = await EpdgResolver.ResolveAsync(sim, discovery, ct)
                                          .ConfigureAwait(false);
             // TS 24.011 RP-DATA must use the SMSC provisioned by this SIM.  Do
             // not substitute a number from another carrier when the modem has
@@ -544,6 +572,9 @@ public class VoWifiManager : IDisposable
                     stopEndpointFailover = true;
                     break;
                 }
+
+                if (ikeResult is not { Success: true, AssignedIp: not null, PcscfIp: not null } && !stopEndpointFailover)
+                    EpdgResolver.ReportConnectionFailure(targetIp);
 
                 if (ikeResult is { Success: true, AssignedIp: not null, PcscfIp: not null } || stopEndpointFailover)
                     break;
@@ -698,6 +729,8 @@ public class VoWifiManager : IDisposable
                             }
                             else if (_rtpSessions.TryGetValue(packet.LocalEndPoint.Port, out var rtpSession))
                                 rtpSession.ProcessRtpPacket(packet.Payload);
+                            else if (_rtcpSessions.TryGetValue(packet.LocalEndPoint.Port, out var rtcpSession))
+                                rtcpSession.ProcessRtcpPacket(packet.Payload);
                             else
                             {
                                 var ports = _rtpSessions.IsEmpty ? "none" : string.Join(",", _rtpSessions.Keys.Order());
@@ -1062,17 +1095,23 @@ public class VoWifiManager : IDisposable
         });
     }
 
-    private static TimeSpan GetRecoveryDelay(int failedAttempts) => failedAttempts switch
+    private static TimeSpan GetRecoveryDelay(int failedAttempts)
     {
-        0 => TimeSpan.FromSeconds(2),
-        1 => TimeSpan.FromSeconds(5),
-        2 => TimeSpan.FromSeconds(10),
-        3 => TimeSpan.FromSeconds(20),
-        4 => TimeSpan.FromSeconds(30),
-        5 => TimeSpan.FromMinutes(1),
-        6 => TimeSpan.FromMinutes(2),
-        _ => TimeSpan.FromMinutes(5)
-    };
+        var baseline = failedAttempts switch
+        {
+            0 => TimeSpan.FromSeconds(2),
+            1 => TimeSpan.FromSeconds(5),
+            2 => TimeSpan.FromSeconds(10),
+            3 => TimeSpan.FromSeconds(20),
+            4 => TimeSpan.FromSeconds(30),
+            5 => TimeSpan.FromMinutes(1),
+            6 => TimeSpan.FromMinutes(2),
+            _ => TimeSpan.FromMinutes(5)
+        };
+        // De-synchronise clients recovering after a common Wi-Fi/ePDG outage.
+        var jitterPercent = RandomNumberGenerator.GetInt32(-20, 21);
+        return TimeSpan.FromMilliseconds(baseline.TotalMilliseconds * (100 + jitterPercent) / 100);
+    }
 
     private static bool IsNonRetryableEpdgRejection(string? reason) => reason != null &&
         (reason.Contains("NON_3GPP_ACCESS_TO_EPC_NOT_ALLOWED", StringComparison.Ordinal) ||
@@ -1139,10 +1178,20 @@ public class VoWifiManager : IDisposable
             catch (OperationCanceledException) { }
         }
         healthCts?.Dispose();
+        if (_registerSession != null)
+        {
+            await _registerSession.StopRefreshingAsync().ConfigureAwait(false);
+            try { await _registerSession.DeregisterAsync(ct).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                EventBus?.Publish(EventTopics.SystemError, "IMS", $"Graceful SIP de-registration failed: {ex.Message}");
+            }
+
+            EpdgResolver.ReportConnectionSuccess();
+        }
+        _registerSession = null;
         _sessionCts?.Cancel();
         ClearRtpSessions();
-        if (_registerSession != null) await _registerSession.StopRefreshingAsync().ConfigureAwait(false);
-        _registerSession = null;
         SmsCapabilityConfirmed = false;
         _incomingSmsTransactions.Clear();
 
@@ -1163,16 +1212,18 @@ public class VoWifiManager : IDisposable
         _sessionCts = null;
         _sipTransport?.Dispose();
         _sipTransport = null;
-        _transport?.Dispose();
-        _transport = null;
-
         if (_csharpIkeBackend != null)
         {
             try { await _csharpIkeBackend.StopTunnelAsync(ct).ConfigureAwait(false); }
-            catch { }
+            catch (Exception ex)
+            {
+                EventBus?.Publish(EventTopics.SystemError, "IKE", $"Graceful IKE deletion failed: {ex.Message}");
+            }
             _csharpIkeBackend.Dispose();
             _csharpIkeBackend = null;
         }
+        _transport?.Dispose();
+        _transport = null;
 
         SetState(VoWifiState.Disconnected);
         ConnectedAt = null;
@@ -1481,15 +1532,36 @@ public class VoWifiManager : IDisposable
             }
             if (request.Method.Equals("BYE", StringComparison.OrdinalIgnoreCase))
             {
-                if (Calls != null && (Calls.State == CallState.Active || Calls.State == CallState.Ringing))
+                if (Calls != null && (Calls.State is CallState.Active or CallState.Held))
                     await Calls.HandleIncomingByeAsync(request, Reply).ConfigureAwait(false);
                 else
-                    await Reply(request.CreateResponse(200, "OK")).ConfigureAwait(false);
+                    await Reply(request.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
                 return;
             }
             if (request.Method.Equals("MESSAGE", StringComparison.OrdinalIgnoreCase))
             {
                 await HandleIncomingSipMessageAsync(request, Reply, ct: _sessionCts?.Token ?? default).ConfigureAwait(false);
+                return;
+            }
+            if (request.Method.Equals("UPDATE", StringComparison.OrdinalIgnoreCase))
+            {
+                if (Calls != null && (Calls.State is CallState.Active or CallState.Held))
+                    await Calls.HandleIncomingUpdateAsync(request, Reply).ConfigureAwait(false);
+                else
+                    await Reply(request.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
+                return;
+            }
+            if (request.Method.Equals("NOTIFY", StringComparison.OrdinalIgnoreCase))
+            {
+                await Reply(request.CreateResponse(200, "OK")).ConfigureAwait(false);
+                var eventPackage = request.GetHeader("Event") ?? "unspecified";
+                EventBus?.Publish(EventTopics.SystemLog, "IMS",
+                    $"Accepted network NOTIFY; event={eventPackage}.");
+                if (eventPackage.StartsWith("reg", StringComparison.OrdinalIgnoreCase) &&
+                    (request.Body?.Contains("state=\"terminated\"", StringComparison.OrdinalIgnoreCase) ?? false))
+                {
+                    QueueAutomaticRecovery("IMS registration was terminated by the network.");
+                }
                 return;
             }
             if (request.Method.Equals("ACK", StringComparison.OrdinalIgnoreCase)) return;

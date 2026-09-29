@@ -215,6 +215,11 @@ Console.WriteLine("  vowifi info                   - Query 3GPP ePDG FQDN & reso
 Console.WriteLine("  call dial <num> / call <num>  - Dial phone call via VoWiFi SIP/RTP with live PC audio (e.g. call 185)");
 Console.WriteLine("  call hangup / hangup          - Terminate active call and save WAV audio recording");
 Console.WriteLine("  call dtmf <digit>             - Send in-band / SIP INFO DTMF tone during call");
+Console.WriteLine("  sip-gateway start --bind <WG-IP> --user <ext> --password <pwd> [--port 5060]");
+Console.WriteLine("  sip-gateway status|stop       - Inspect or stop the private SIP/RTP bridge");
+Console.WriteLine("  host-ims probe                - Read-only IMS PDN/P-CSCF and Windows-route capability probe");
+Console.WriteLine("  host-ims status|stop          - Inspect or stop experimental Host IMS registration");
+Console.WriteLine("  host-ims register [--cid N --local IP --pcscf IP] - Experimental ISIM/USIM AKA registration over an already host-owned IMS bearer");
 Console.WriteLine("  reboot                        - Reboot modem baseband (AT+CFUN=1,1)");
 Console.WriteLine("  dtmf <digit>                  - Send modem hardware DTMF tone");
 Console.WriteLine("  mmi <code>                    - Parse & execute MMI code (e.g. mmi *#06#)");

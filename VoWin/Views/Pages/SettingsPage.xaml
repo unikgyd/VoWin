@@ -203,6 +203,51 @@
             <TextBlock Margin="0,10,0,0" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding ViewModel.CallSettingsStatus}" />
           </StackPanel>
         </Border>
+
+        <Border Margin="0,0,0,16" Padding="16,14" Background="{DynamicResource AppCardBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="12">
+          <StackPanel>
+            <TextBlock FontSize="18" FontWeight="SemiBold" Text="WireGuard SIP 网关" />
+            <TextBlock Margin="0,4,0,14" FontSize="13" Foreground="{DynamicResource AppTextSecondaryBrush}" TextWrapping="Wrap" Text="让 Linphone、Zoiper 等标准 SIP 客户端通过 WireGuard 使用 VoWin 当前可用的通话线路。SIP/RTP 不应直接暴露到公网。" />
+            <Border Margin="0,0,0,14" Padding="12,9" Background="{DynamicResource AppWarningSoftBrush}" BorderBrush="{DynamicResource AppWarningBrush}" BorderThickness="1" CornerRadius="8">
+              <TextBlock TextWrapping="Wrap" Text="当前网关优先桥接 Windows 侧 VoWiFi IMS/RTP；蜂窝 Host IMS 在系统状态页确认 HostRoutable 并实验性注册后，也可作为 SIP/RTP 通话线路。两种 IMS 均不可用时，可回退到 AT + Quectel USB Audio 的基带 VoLTE/GSM。Host IMS 的运营商实网通话尚未验收，且不支持要求 ipsec-3gpp 的网络。QDC507 缺失 UAC 路由时才启用模组内 ADB 兼容后备；普通 UAC 与 Host IMS 均不依赖 ADB。密码只保存在本次应用进程内，不会写入磁盘。" />
+            </Border>
+            <Grid Margin="0,0,0,10">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="2*" />
+                <ColumnDefinition Width="12" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
+              <StackPanel Grid.Column="0">
+                <TextBlock Margin="0,0,0,6" Text="WireGuard 本机地址" />
+                <TextBox Text="{Binding ViewModel.SipGatewayBindAddress, UpdateSourceTrigger=PropertyChanged}" ToolTip="例如 10.66.66.1" />
+              </StackPanel>
+              <StackPanel Grid.Column="2">
+                <TextBlock Margin="0,0,0,6" Text="SIP UDP 端口" />
+                <TextBox Text="{Binding ViewModel.SipGatewayPort, UpdateSourceTrigger=PropertyChanged}" />
+              </StackPanel>
+            </Grid>
+            <Grid Margin="0,0,0,14">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="12" />
+                <ColumnDefinition Width="2*" />
+              </Grid.ColumnDefinitions>
+              <StackPanel Grid.Column="0">
+                <TextBlock Margin="0,0,0,6" Text="分机号" />
+                <TextBox Text="{Binding ViewModel.SipGatewayExtension, UpdateSourceTrigger=PropertyChanged}" />
+              </StackPanel>
+              <StackPanel Grid.Column="2">
+                <TextBlock Margin="0,0,0,6" Text="SIP 密码" />
+                <ui:PasswordBox Password="{Binding ViewModel.SipGatewayPassword, UpdateSourceTrigger=PropertyChanged}" />
+              </StackPanel>
+            </Grid>
+            <StackPanel Orientation="Horizontal">
+              <ui:Button Appearance="Primary" Content="{Binding ViewModel.SipGatewayActionText}" Command="{Binding ViewModel.ToggleSipGatewayCommand}" />
+              <ui:Button Margin="10,0,0,0" Content="刷新状态" Command="{Binding ViewModel.RefreshSipGatewayCommand}" />
+            </StackPanel>
+            <TextBlock Margin="0,10,0,0" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding ViewModel.SipGatewayStatus}" TextWrapping="Wrap" />
+          </StackPanel>
+        </Border>
       </StackPanel>
     </ScrollViewer>
   </Grid>

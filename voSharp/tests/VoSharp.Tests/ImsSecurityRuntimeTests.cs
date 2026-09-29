@@ -175,4 +175,37 @@ public class ImsSecurityRuntimeTests
 
         Assert.Equal(3, Volatile.Read(ref requestCount));
     }
+
+    [Fact]
+    public async Task LongGrantedRegistrationDoesNotFailRefreshSchedulerImmediately()
+    {
+        var input = Channel.CreateUnbounded<byte[]>();
+        var requestCount = 0;
+        using var transport = new SipTransport();
+        transport.ConnectCustom(bytes =>
+        {
+            Interlocked.Increment(ref requestCount);
+            var request = SipMessage.Parse(bytes);
+            var response = request.CreateResponse(200, "OK");
+            response.SetHeader("Contact", request.GetHeader("Contact")!
+                .Replace("expires=3600", $"expires={int.MaxValue}", StringComparison.Ordinal));
+            input.Writer.TryWrite(response.ToBytes());
+            return Task.CompletedTask;
+        }, ct => input.Reader.ReadAsync(ct).AsTask());
+        using var session = new SipRegisterSession(transport,
+            new("ue@example.test", "sip:ue@example.test", "example.test", "123456789012345", "10.0.0.1"));
+        Task<(byte[], byte[], byte[])> Aka(byte[] _, byte[] __, CancellationToken ___) =>
+            throw new InvalidOperationException("No challenge expected");
+        var failureCount = 0;
+        session.RegistrationFailed += (_, _) => Interlocked.Increment(ref failureCount);
+
+        var result = await session.RegisterAsync(Aka);
+        Assert.Equal(int.MaxValue, result.ExpiresSeconds);
+        session.StartRefreshing(Aka);
+        await Task.Delay(200);
+        Assert.NotNull(session.LastResult);
+        Assert.Equal(0, Volatile.Read(ref failureCount));
+        Assert.Equal(1, Volatile.Read(ref requestCount));
+        await session.StopRefreshingAsync().WaitAsync(TimeSpan.FromSeconds(2));
+    }
 }

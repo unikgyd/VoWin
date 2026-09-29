@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
 using VoSharp.Common.Aka;
@@ -10,6 +11,53 @@ namespace VoSharp.Ike.Tests;
 
 public class IkeSessionTests
 {
+    [Fact]
+    public void FinalResponderAuth_RejectsMissingWrongMethodAndWrongMic()
+    {
+        var expected = Enumerable.Repeat((byte)0x5A, 32).ToArray();
+        Assert.Throws<AuthenticationException>(() => IkeSession.VerifyFinalResponderAuth(null, expected));
+        Assert.Throws<AuthenticationException>(() => IkeSession.VerifyFinalResponderAuth(
+            new IkePayload(IkePayloadType.Authentication, [1, 0, 0, 0, .. expected]), expected));
+        Assert.Throws<AuthenticationException>(() => IkeSession.VerifyFinalResponderAuth(
+            new IkePayload(IkePayloadType.Authentication, [2, 0, 0, 0, .. new byte[32]]), expected));
+        IkeSession.VerifyFinalResponderAuth(
+            new IkePayload(IkePayloadType.Authentication, [2, 0, 0, 0, .. expected]), expected);
+    }
+
+    [Fact]
+    public void HandshakeResponse_RejectsWrongSpiOrMessageId()
+    {
+        var response = new IkeWire.IkeMessage
+        {
+            InitiatorSpi = 11,
+            ResponderSpi = 22,
+            Exchange = IkeExchangeType.IkeAuth,
+            Flags = IkeFlags.Response,
+            MessageId = 3
+        };
+        IkeSession.ValidateHandshakeResponse(response, 11, 22, IkeExchangeType.IkeAuth, 3);
+        Assert.Throws<IkeFormatException>(() => IkeSession.ValidateHandshakeResponse(
+            response, 12, 22, IkeExchangeType.IkeAuth, 3));
+        Assert.Throws<IkeFormatException>(() => IkeSession.ValidateHandshakeResponse(
+            response, 11, 23, IkeExchangeType.IkeAuth, 3));
+        Assert.Throws<IkeFormatException>(() => IkeSession.ValidateHandshakeResponse(
+            response, 11, 22, IkeExchangeType.IkeAuth, 4));
+    }
+
+    [Fact]
+    public void NegotiatedSuite_MustMatchOfferedProposalNumber()
+    {
+        var offered = new[] { IkeSuite.Preferred };
+        var downgraded = IkeSuite.Preferred with { EncryptionBits = 128 };
+        IkeSession.ValidateChosenSuite(1, IkeSuite.Preferred, offered);
+        Assert.Throws<IkeFormatException>(() => IkeSession.ValidateChosenSuite(1, downgraded, offered));
+        Assert.Throws<IkeFormatException>(() => IkeSession.ValidateChosenSuite(2, IkeSuite.Preferred, offered));
+
+        var childOffered = new[] { EspSuite.Preferred };
+        var childDowngraded = EspSuite.Preferred with { EncryptionBits = 256 };
+        Assert.Throws<IkeFormatException>(() => IkeSession.ValidateChosenSuite(1, childDowngraded, childOffered));
+    }
+
     private sealed class MockAkaProvider : IAkaProvider
     {
         public byte[] Res { get; init; } = new byte[] { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };

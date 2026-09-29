@@ -9,6 +9,7 @@ using VoSharp.Euicc;
 using VoSharp.Euicc.Models;
 using VoSharp.Kernel.Events;
 using VoSharp.Kernel.Pool;
+using VoSharp.Kernel.SipGateway;
 using VoSharp.Modem;
 using VoSharp.Modem.At;
 using VoSharp.Sim;
@@ -40,13 +41,36 @@ public class VoKernel : IVoKernel
     private readonly VoWifiManager _fallbackVoWifi;
     private readonly ImsCallManager _fallbackCalls;
     private readonly IAkaProvider _fallbackAka = SoftwareAkaProvider.FromTestVectors();
+    private SipGateway.SipGateway? _localSipGateway;
 
     public ModemDriver? Modem => Pool.ActiveSlot?.Modem;
     public IAkaProvider AkaProvider => Pool.ActiveSlot?.Aka ?? _fallbackAka;
     public SimIdentity? CurrentSim => Pool.ActiveSlot?.Sim;
     public VoWifiManager VoWifi => Pool.ActiveSlot?.VoWifi ?? _fallbackVoWifi;
     public ImsCallManager Calls => Pool.ActiveSlot?.Calls ?? _fallbackCalls;
+    public SipGateway.SipGateway? LocalSipGateway => _localSipGateway;
+    public ICellularSipMediaProvider? CellularSipMediaProvider { get; set; }
     public SmsService? SmsService => Pool.ActiveSlot?.Sms;
+
+    private ModemSlot ResolveHostImsSlot(string? slotId)
+    {
+        var slot = !string.IsNullOrWhiteSpace(slotId)
+            ? Pool.Slots.TryGetValue(slotId, out var selected) ? selected : null
+            : Pool.ActiveSlot;
+        if (slot is null) throw new InvalidOperationException("No cellular modem slot is selected.");
+        if (slot.IsPcscReader) throw new InvalidOperationException("A PC/SC reader does not provide a cellular IMS bearer.");
+        return slot;
+    }
+
+    public HostImsRegistrationStatus GetHostImsRegistrationStatus(string? slotId = null) =>
+        ResolveHostImsSlot(slotId).GetHostImsRegistrationStatus();
+
+    public Task<HostImsRegistrationStatus> StartHostImsRegistrationAsync(
+        string? slotId = null, HostImsEndpointCandidate? endpoint = null, CancellationToken ct = default) =>
+        ResolveHostImsSlot(slotId).StartHostImsRegistrationAsync(endpoint, ct);
+
+    public Task StopHostImsRegistrationAsync(string? slotId = null) =>
+        ResolveHostImsSlot(slotId).StopHostImsRegistrationAsync();
 
     private EuiccManager? _euiccManager;
     public EuiccManager? EuiccManager
@@ -62,8 +86,70 @@ public class VoKernel : IVoKernel
         }
     }
 
-    public CallSession? ActiveCall { get; private set; }
+    private sealed record TrackedCallEntry(string? SlotId, CallSession Session);
+    private readonly object _trackedCallsGate = new();
+    private readonly Dictionary<string, TrackedCallEntry> _trackedCalls = new(StringComparer.OrdinalIgnoreCase);
+    public CallSession? ActiveCall
+    {
+        get
+        {
+            lock (_trackedCallsGate) return SelectPresentedCall()?.Session;
+        }
+    }
+    public string? ActiveCallSlotId
+    {
+        get
+        {
+            lock (_trackedCallsGate)
+            {
+                var slotId = SelectPresentedCall()?.SlotId;
+                return slotId != null && Pool.Slots.ContainsKey(slotId) ? slotId : null;
+            }
+        }
+    }
     public bool RoamingAllowed { get; private set; } = true;
+
+    private TrackedCallEntry? SelectPresentedCall() => _trackedCalls.Values
+        .OrderByDescending(entry => entry.Session.State == CallState.Active)
+        .ThenByDescending(entry => entry.Session.State is CallState.Ringing or CallState.Held)
+        .ThenBy(entry => entry.Session.StartTime)
+        .FirstOrDefault();
+
+    private static string TrackedCallKey(string? slotId, string callId) =>
+        $"{slotId ?? "fallback"}\0{callId}";
+
+    private void TrackCall(string? slotId, string? callId, string number, bool isOutgoing, CallState state, string? codec = null)
+    {
+        if (string.IsNullOrWhiteSpace(callId)) return;
+        var key = TrackedCallKey(slotId, callId);
+        lock (_trackedCallsGate)
+        {
+            if (state is CallState.Ended or CallState.Idle)
+            {
+                if (_trackedCalls.Remove(key, out var ended)) ended.Session.End();
+                return;
+            }
+
+            if (!_trackedCalls.TryGetValue(key, out var entry))
+                _trackedCalls[key] = entry = new TrackedCallEntry(slotId, new CallSession(number, isOutgoing, callId));
+            var call = entry.Session;
+            call.State = state;
+            if (!string.IsNullOrWhiteSpace(codec)) call.Codec = codec;
+            if (state == CallState.Active && call.ConnectedTime == null)
+                call.ConnectedTime = DateTime.UtcNow;
+        }
+    }
+
+    private void RemoveTrackedCallsForSlot(string slotId)
+    {
+        lock (_trackedCallsGate)
+        {
+            foreach (var key in _trackedCalls.Keys.Where(key => key.StartsWith(slotId + "\0", StringComparison.OrdinalIgnoreCase)).ToArray())
+            {
+                if (_trackedCalls.Remove(key, out var call)) call.Session.End();
+            }
+        }
+    }
 
     // ── Call Events ──────────────────────────────────────────────────────────
     public event EventHandler<CallStateChangedEventArgs>? CallStateChanged;
@@ -149,8 +235,12 @@ public class VoKernel : IVoKernel
 
         Pool.SlotAdded += (s, slot) =>
         {
+            lock (_trackedCallsGate)
+                foreach (var key in _trackedCalls.Keys.Where(key => key.StartsWith("bus:", StringComparison.OrdinalIgnoreCase)).ToArray())
+                    if (_trackedCalls.Remove(key, out var call)) call.Session.End();
             HookSlotEvents(slot);
         };
+        Pool.SlotRemoved += (s, slotId) => RemoveTrackedCallsForSlot(slotId);
         Pool.ActiveSlotChanged += (s, e) =>
         {
             try { ActiveSlotChanged?.Invoke(this, e); } catch { }
@@ -166,18 +256,22 @@ public class VoKernel : IVoKernel
 
         _fallbackCalls.CallStateChanged += (s, e) =>
         {
+            TrackCall(null, e.CallId, e.TargetNumber, e.IsOutgoing, e.NewState, e.Codec);
             try { CallStateChanged?.Invoke(this, e); } catch { }
         };
         _fallbackCalls.IncomingCall += (s, e) =>
         {
+            TrackCall(null, e.CallId, e.CallerNumber, false, CallState.Incoming);
             try { IncomingCall?.Invoke(this, e); } catch { }
         };
         _fallbackCalls.CallConnected += (s, e) =>
         {
+            TrackCall(null, e.CallId, e.TargetNumber, true, CallState.Active, e.Codec);
             try { CallConnected?.Invoke(this, e); } catch { }
         };
         _fallbackCalls.CallEnded += (s, e) =>
         {
+            TrackCall(null, e.CallId, e.TargetNumber, true, CallState.Ended);
             try { CallEnded?.Invoke(this, e); } catch { }
         };
         _fallbackCalls.DtmfReceived += (s, e) =>
@@ -200,20 +294,22 @@ public class VoKernel : IVoKernel
 
         EventBus.Subscribe(EventTopics.CallIncoming, ev =>
         {
+            if (Pool.Slots.Count != 0 || ev.Source == "ImsCallManager") return;
             var caller = ev.Payload?.ToString() ?? "Unknown";
-            ActiveCall = new CallSession(caller, isOutgoing: false);
+            TrackCall("bus:" + ev.Source, "event", caller, false, CallState.Incoming);
         });
 
         EventBus.Subscribe(EventTopics.CallDialing, ev =>
         {
+            if (Pool.Slots.Count != 0) return;
             var dest = ev.Payload?.ToString() ?? "Unknown";
-            ActiveCall = new CallSession(dest, isOutgoing: true);
+            TrackCall("bus:" + ev.Source, "event", dest, true, CallState.Dialing);
         });
 
         EventBus.Subscribe(EventTopics.CallEnded, ev =>
         {
-            ActiveCall?.End();
-            ActiveCall = null;
+            if (Pool.Slots.Count != 0) return;
+            TrackCall("bus:" + ev.Source, "event", string.Empty, true, CallState.Ended);
         });
 
         EventBus.Subscribe(EventTopics.SmsStatusReport, ev =>
@@ -372,8 +468,9 @@ public class VoKernel : IVoKernel
         };
         slot.IncomingCall += (s, e) =>
         {
-            ActiveCall = new CallSession(e.CallerNumber, isOutgoing: false);
-            try { IncomingCall?.Invoke(this, e); } catch { }
+            TrackCall(slot.Id, e.CallId, e.CallerNumber, false, CallState.Incoming);
+            var forwarded = new IncomingCallEventArgs(e.CallId, e.CallerNumber, e.DisplayName, e.IsVoWifi, e.Timestamp, slot.Id);
+            try { IncomingCall?.Invoke(this, forwarded); } catch { }
         };
         slot.SmsReceived += (s, e) =>
         {
@@ -408,37 +505,43 @@ public class VoKernel : IVoKernel
         };
         slot.Calls.CallStateChanged += (s, e) =>
         {
-            try { CallStateChanged?.Invoke(this, e); } catch { }
+            TrackCall(slot.Id, e.CallId, e.TargetNumber, e.IsOutgoing, e.NewState, e.Codec);
+            var forwarded = new CallStateChangedEventArgs(e.CallId, e.TargetNumber, e.OldState, e.NewState,
+                e.Codec, e.WavRecordingPath, e.IsOutgoing, slot.Id);
+            try { CallStateChanged?.Invoke(this, forwarded); } catch { }
         };
         slot.CallStateChanged += (s, e) =>
         {
-            if (e.NewState == CallState.Active)
-                ActiveCall?.Connect();
-            else if (e.NewState == CallState.Ended)
-            {
-                ActiveCall?.End();
-                ActiveCall = null;
-            }
-            try { CallStateChanged?.Invoke(this, e); } catch { }
+            TrackCall(slot.Id, e.CallId, e.TargetNumber, e.IsOutgoing, e.NewState, e.Codec);
+            var forwarded = new CallStateChangedEventArgs(e.CallId, e.TargetNumber, e.OldState, e.NewState,
+                e.Codec, e.WavRecordingPath, e.IsOutgoing, slot.Id);
+            try { CallStateChanged?.Invoke(this, forwarded); } catch { }
         };
         slot.Calls.CallConnected += (s, e) =>
         {
-            try { CallConnected?.Invoke(this, e); } catch { }
+            TrackCall(slot.Id, e.CallId, e.TargetNumber, true, CallState.Active, e.Codec);
+            var forwarded = new CallConnectedEventArgs(e.CallId, e.TargetNumber, e.Codec, e.ConnectedAt, slot.Id);
+            try { CallConnected?.Invoke(this, forwarded); } catch { }
         };
         slot.CallConnected += (s, e) =>
         {
-            ActiveCall?.Connect();
-            try { CallConnected?.Invoke(this, e); } catch { }
+            TrackCall(slot.Id, e.CallId, e.TargetNumber, true, CallState.Active, e.Codec);
+            var forwarded = new CallConnectedEventArgs(e.CallId, e.TargetNumber, e.Codec, e.ConnectedAt, slot.Id);
+            try { CallConnected?.Invoke(this, forwarded); } catch { }
         };
         slot.Calls.CallEnded += (s, e) =>
         {
-            try { CallEnded?.Invoke(this, e); } catch { }
+            TrackCall(slot.Id, e.CallId, e.TargetNumber, true, CallState.Ended);
+            var forwarded = new CallEndedEventArgs(e.CallId, e.TargetNumber, e.Duration, e.Reason,
+                e.WavRecordingPath, e.EndedAt, slot.Id);
+            try { CallEnded?.Invoke(this, forwarded); } catch { }
         };
         slot.CallEnded += (s, e) =>
         {
-            ActiveCall?.End();
-            ActiveCall = null;
-            try { CallEnded?.Invoke(this, e); } catch { }
+            TrackCall(slot.Id, e.CallId, e.TargetNumber, true, CallState.Ended);
+            var forwarded = new CallEndedEventArgs(e.CallId, e.TargetNumber, e.Duration, e.Reason,
+                e.WavRecordingPath, e.EndedAt, slot.Id);
+            try { CallEnded?.Invoke(this, forwarded); } catch { }
         };
         slot.Calls.DtmfReceived += (s, e) =>
         {
@@ -559,9 +662,11 @@ public class VoKernel : IVoKernel
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(number);
 
-        ModemSlot? callSlot = null;
-        if (!string.IsNullOrEmpty(slotId) && Pool.Slots.TryGetValue(slotId, out var explicitSlot))
-            callSlot = explicitSlot;
+        ModemSlot? callSlot;
+        if (!string.IsNullOrEmpty(slotId))
+            callSlot = Pool.Slots.TryGetValue(slotId, out var explicitSlot)
+                ? explicitSlot
+                : throw new KeyNotFoundException($"Call slot '{slotId}' is unavailable.");
         else
             callSlot = Pool.FindSlotForTarget(number) ?? Pool.ActiveSlot ?? Pool.Slots.Values.FirstOrDefault();
 
@@ -577,14 +682,15 @@ public class VoKernel : IVoKernel
         if (!forceCellular && voWifiToUse.State == VoWifiState.ImsRegistered)
         {
             var dialed = await callsToUse.DialAsync(number, voWifiToUse, ct).ConfigureAwait(false);
-            ActiveCall = new CallSession(dialed.TargetNumber, isOutgoing: true);
             return dialed;
         }
+
+        if (!forceCellular && callSlot?.GetHostImsRegistrationStatus().IsRegistered == true)
+            return await callSlot.DialHostImsAsync(number, ct).ConfigureAwait(false);
 
         // Standard phone call via cellular baseband (ATD) for normal mobile SIM cards
         if (callSlot?.Modem != null && callSlot.Modem.IsOpen)
         {
-            ActiveCall = new CallSession(number, isOutgoing: true);
             return await callSlot.DialCellularAsync(number, ct).ConfigureAwait(false);
         }
 
@@ -593,20 +699,22 @@ public class VoKernel : IVoKernel
 
     public async Task<CallInfo?> HangupAsync(string? slotId = null, CancellationToken ct = default)
     {
-        ModemSlot? slot = (!string.IsNullOrEmpty(slotId) && Pool.Slots.TryGetValue(slotId, out var s)) ? s : Pool.ActiveSlot;
+        ModemSlot? slot = !string.IsNullOrEmpty(slotId)
+            ? Pool.Slots.TryGetValue(slotId, out var s) ? s : throw new KeyNotFoundException($"Call slot '{slotId}' is unavailable.")
+            : Pool.ActiveSlot;
         var callsToUse = slot?.Calls ?? Calls;
 
         if (callsToUse.ActiveCall != null)
         {
             var ended = await callsToUse.HangupAsync().ConfigureAwait(false);
-            ActiveCall = null;
+            if (ended != null) TrackCall(slot?.Id, ended.CallId, ended.TargetNumber, ended.IsOutgoing, CallState.Ended);
             return ended;
         }
 
-        if (slot?.Modem != null && slot.Modem.IsOpen)
+        if (slot?.HasCellularCall == true)
         {
             var ended = await slot.HangupAsync(ct).ConfigureAwait(false);
-            ActiveCall = null;
+            if (ended != null) TrackCall(slot.Id, ended.CallId, ended.TargetNumber, ended.IsOutgoing, CallState.Ended);
             return ended;
         }
 
@@ -653,6 +761,23 @@ public class VoKernel : IVoKernel
         return false;
     }
 
+    public async Task StartSipGatewayAsync(SipGatewayOptions options, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (_localSipGateway != null) await StopSipGatewayAsync().ConfigureAwait(false);
+        var gateway = new SipGateway.SipGateway(options, this);
+        gateway.Diagnostic += (_, message) => EventBus.Publish(EventTopics.SystemLog, "SipGateway", message);
+        gateway.StatusChanged += (_, status) => EventBus.Publish("sip.gateway.status", "SipGateway", status);
+        await gateway.StartAsync(ct).ConfigureAwait(false);
+        _localSipGateway = gateway;
+    }
+
+    public async Task StopSipGatewayAsync()
+    {
+        var gateway = Interlocked.Exchange(ref _localSipGateway, null);
+        if (gateway != null) await gateway.DisposeAsync().ConfigureAwait(false);
+    }
+
     // ── Direct SMS Operations ────────────────────────────────────────────────
     public async Task<SmsSubmitResult> SendSmsAsync(
         string recipient,
@@ -665,15 +790,21 @@ public class VoKernel : IVoKernel
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(recipient);
         ArgumentException.ThrowIfNullOrWhiteSpace(text);
+        if (forceVowifi && forceCellular)
+            throw new ArgumentException("VoWiFi and cellular SMS cannot both be forced.");
 
-        ModemSlot? slot = null;
-        if (!string.IsNullOrEmpty(slotId) && Pool.Slots.TryGetValue(slotId, out var sSlot))
-            slot = sSlot;
+        ModemSlot? slot;
+        if (!string.IsNullOrEmpty(slotId))
+            slot = Pool.Slots.TryGetValue(slotId, out var sSlot)
+                ? sSlot
+                : throw new KeyNotFoundException($"SMS slot '{slotId}' is unavailable.");
         else
             slot = Pool.FindSlotForTarget(recipient) ?? Pool.ActiveSlot ?? Pool.Slots.Values.FirstOrDefault();
 
         var voWifiToUse = slot?.VoWifi ?? VoWifi;
         var smsServiceToUse = slot?.Sms ?? SmsService;
+        if (forceVowifi && voWifiToUse.State != VoWifiState.ImsRegistered)
+            throw new InvalidOperationException("VoWiFi IMS is not registered; forced VoWiFi SMS was not sent over cellular.");
 
         if (!forceCellular && voWifiToUse.State == VoWifiState.ImsRegistered)
         {
@@ -905,8 +1036,8 @@ public class VoKernel : IVoKernel
         ModemSlot? slot = (!string.IsNullOrEmpty(slotId) && Pool.Slots.TryGetValue(slotId, out var s)) ? s : Pool.ActiveSlot;
         if (slot != null)
         {
-            await slot.RefreshSimAsync(ct).ConfigureAwait(false);
-            return slot.Sim;
+            if (slot.IsProfileSwitchInProgress) return slot.Sim;
+            return await slot.RefreshSimAsync(ct).ConfigureAwait(false) ? slot.Sim : null;
         }
         if (Modem != null && Modem.IsOpen)
         {
@@ -1094,7 +1225,8 @@ public class VoKernel : IVoKernel
                     {
                         return new KernelCommandResult(false, "No incoming call or connected call bearer is available.");
                     }
-                    ActiveCall?.Connect();
+                    if (answerResult is CallInfo answered)
+                        TrackCall(ansSlot?.Id, answered.CallId, answered.TargetNumber, answered.IsOutgoing, CallState.Active);
                     StateMachine.Fire(StateTrigger.TriggerCallAnswer);
                     return new KernelCommandResult(true, answerMessage, answerResult);
 
@@ -1129,8 +1261,8 @@ public class VoKernel : IVoKernel
                     {
                         return new KernelCommandResult(false, "No incoming call or connected call bearer is available.");
                     }
-                    ActiveCall?.End();
-                    ActiveCall = null;
+                    if (rejectResult is CallInfo rejected)
+                        TrackCall(rejSlot?.Id, rejected.CallId, rejected.TargetNumber, rejected.IsOutgoing, CallState.Ended);
                     StateMachine.Fire(StateTrigger.TriggerCallHangup);
                     return new KernelCommandResult(true, rejectMessage, rejectResult);
 
@@ -1149,8 +1281,8 @@ public class VoKernel : IVoKernel
                     {
                         return new KernelCommandResult(false, "No active call or connected call bearer is available.");
                     }
-                    ActiveCall?.End();
-                    ActiveCall = null;
+                    if (imsHangup != null)
+                        TrackCall(Pool.ActiveSlot?.Id, imsHangup.CallId, imsHangup.TargetNumber, imsHangup.IsOutgoing, CallState.Ended);
                     StateMachine.Fire(StateTrigger.TriggerCallHangup);
                     var hangupMsg = imsHangup?.WavRecordingPath != null
                         ? $"Call terminated. Recording saved: {imsHangup.WavRecordingPath}"
@@ -1352,6 +1484,112 @@ public class VoKernel : IVoKernel
                         return new KernelCommandResult(delOk, delOk ? $"Deleted SMS {(delIdx == 0 ? "ALL" : delIdx.ToString())}" : "Failed to delete SMS.");
                     }
                     return new KernelCommandResult(false, "Usage: sms <send|inbox|outbox|status|list|read|delete>");
+
+                case "sip-gateway" or "sipgw":
+                    var gatewayAction = parts.Length > 1 ? parts[1].ToLowerInvariant() : "status";
+                    if (gatewayAction is "status" or "show")
+                    {
+                        var gatewayStatus = LocalSipGateway?.Status;
+                        return new KernelCommandResult(true,
+                            gatewayStatus?.IsRunning == true
+                                ? $"SIP gateway listening on {gatewayStatus.LocalEndPoint}; {gatewayStatus.Registrations.Count} registered endpoint(s)."
+                                : "SIP gateway is stopped.",
+                            gatewayStatus);
+                    }
+                    if (gatewayAction is "stop" or "off")
+                    {
+                        await StopSipGatewayAsync().ConfigureAwait(false);
+                        return new KernelCommandResult(true, "SIP gateway stopped.");
+                    }
+                    if (gatewayAction is "start" or "on")
+                    {
+                        string? bindText = null;
+                        string? username = null;
+                        string? password = null;
+                        var port = 5060;
+                        var realm = "vowin.local";
+                        for (var i = 2; i < parts.Length; i++)
+                        {
+                            switch (parts[i].ToLowerInvariant())
+                            {
+                                case "--bind" when i + 1 < parts.Length: bindText = parts[++i]; break;
+                                case "--user" when i + 1 < parts.Length: username = parts[++i]; break;
+                                case "--password" when i + 1 < parts.Length: password = parts[++i]; break;
+                                case "--port" when i + 1 < parts.Length && int.TryParse(parts[++i], out var parsedPort): port = parsedPort; break;
+                                case "--realm" when i + 1 < parts.Length: realm = parts[++i]; break;
+                            }
+                        }
+                        if (!IPAddress.TryParse(bindText, out var bindAddress) || string.IsNullOrWhiteSpace(username) || string.IsNullOrEmpty(password))
+                            return new KernelCommandResult(false,
+                                "Usage: sip-gateway start --bind <WireGuard-IP> --user <extension> --password <password> [--port 5060] [--realm vowin.local]");
+                        var gatewayOptions = new SipGatewayOptions
+                        {
+                            BindAddress = bindAddress,
+                            SipPort = port,
+                            Realm = realm,
+                            Accounts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [username] = password }
+                        };
+                        await StartSipGatewayAsync(gatewayOptions, ct).ConfigureAwait(false);
+                        return new KernelCommandResult(true,
+                            $"SIP gateway started on {bindAddress}:{port} for extension '{username}'. Keep this address inside WireGuard/private routing.",
+                            LocalSipGateway?.Status);
+                    }
+                    return new KernelCommandResult(false, "Usage: sip-gateway <start|status|stop> ...");
+
+                case "host-ims" or "hostims":
+                {
+                    const string hostImsUsage = "Usage: host-ims probe|status|register|stop [--cid N --local IP --pcscf IP]";
+                    var action = parts.Length > 1 ? parts[1].ToLowerInvariant() : "probe";
+                    if (action is "status")
+                    {
+                        var status = GetHostImsRegistrationStatus();
+                        return new KernelCommandResult(true, $"Host IMS registration: {status.State}", status);
+                    }
+                    if (action is "stop")
+                    {
+                        await StopHostImsRegistrationAsync().ConfigureAwait(false);
+                        var stopped = GetHostImsRegistrationStatus();
+                        return new KernelCommandResult(true,
+                            stopped.RemoteDeregistered == true
+                                ? "Host IMS SIP de-registration was acknowledged; local session stopped."
+                                : "Local Host IMS SIP session stopped; remote registration may remain until its granted expiry.",
+                            stopped);
+                    }
+                    if (action is "register")
+                    {
+                        int? cid = null;
+                        IPAddress? local = null;
+                        IPAddress? pcscf = null;
+                        for (var i = 2; i < parts.Length; i++)
+                        {
+                            if (parts[i].Equals("--cid", StringComparison.OrdinalIgnoreCase) &&
+                                i + 1 < parts.Length && int.TryParse(parts[++i], out var parsedCid))
+                                cid = parsedCid;
+                            else if (parts[i].Equals("--local", StringComparison.OrdinalIgnoreCase) &&
+                                i + 1 < parts.Length && IPAddress.TryParse(parts[++i], out var parsedLocal))
+                                local = parsedLocal;
+                            else if (parts[i].Equals("--pcscf", StringComparison.OrdinalIgnoreCase) &&
+                                i + 1 < parts.Length && IPAddress.TryParse(parts[++i], out var parsedPcscf))
+                                pcscf = parsedPcscf;
+                            else return new KernelCommandResult(false, hostImsUsage);
+                        }
+                        if ((cid is not null || local is not null || pcscf is not null) &&
+                            (cid is null || local is null || pcscf is null))
+                            return new KernelCommandResult(false, hostImsUsage);
+                        var endpoint = cid is null ? null : new HostImsEndpointCandidate(cid.Value, local!, pcscf!);
+                        var status = await StartHostImsRegistrationAsync(endpoint: endpoint, ct: ct).ConfigureAwait(false);
+                        return new KernelCommandResult(true, $"Host IMS registration: {status.State}", status);
+                    }
+                    if (action is not ("probe" or "diag"))
+                        return new KernelCommandResult(false, hostImsUsage);
+                    if (Modem == null || !Modem.IsOpen)
+                        return new KernelCommandResult(false, "No physical modem is attached.");
+                    var hostIms = await Modem.ProbeHostImsPdnAsync(ct).ConfigureAwait(false);
+                    return new KernelCommandResult(
+                        hostIms.Readiness != HostImsReadiness.ProbeFailed,
+                        $"Host IMS: {hostIms.Readiness}; USB={hostIms.UsbNetworkMode ?? "unknown"}; {hostIms.Summary}",
+                        hostIms);
+                }
 
                 case "vowifi":
                     if (parts.Length < 2 || parts[1].Equals("status", StringComparison.OrdinalIgnoreCase) || parts[1].Equals("diag", StringComparison.OrdinalIgnoreCase) || parts[1].Equals("state", StringComparison.OrdinalIgnoreCase))
@@ -1626,29 +1864,32 @@ public class VoKernel : IVoKernel
                             return new KernelCommandResult(false,
                                 "IMS emergency calling is not implemented. No emergency call was placed.");
                         }
+                        var forceCellular = parts.Any(p => p.Equals("--force-cellular", StringComparison.OrdinalIgnoreCase));
+                        if (forceCellular && callSlot?.Modem is { IsOpen: true })
+                        {
+                            var dialed = await callSlot.DialCellularAsync(num, ct).ConfigureAwait(false);
+                            return new KernelCommandResult(true,
+                                $"Dialing {num} via modem cellular baseband (ATD, awaiting +CLCC)...", dialed);
+                        }
                         else if (voWifiToUse.State == VoWifiState.ImsRegistered)
                         {
                             var dialed = await callsToUse.DialAsync(num, voWifiToUse, ct).ConfigureAwait(false);
-                            ActiveCall = new CallSession(dialed.TargetNumber, isOutgoing: true);
                             return new KernelCommandResult(true, $"Calling {dialed.TargetNumber} via VoWiFi SIP/RTP (Slot: {callSlot?.Id ?? "active"})...", dialed);
+                        }
+                        else if (callSlot?.GetHostImsRegistrationStatus().IsRegistered == true)
+                        {
+                            var dialed = await callSlot.DialHostImsAsync(num, ct).ConfigureAwait(false);
+                            return new KernelCommandResult(true,
+                                $"Calling {dialed.TargetNumber} via Windows Host IMS SIP/RTP (Slot: {callSlot.Id})...", dialed);
                         }
                         else if (callSlot?.Modem != null && callSlot.Modem.IsOpen)
                         {
-                            var forceCellular = parts.Any(p => p.Equals("--force-cellular", StringComparison.OrdinalIgnoreCase));
-                            if (forceCellular)
-                            {
-                                var dialed = await callSlot.DialCellularAsync(num, ct).ConfigureAwait(false);
-                                ActiveCall = new CallSession(num, isOutgoing: true);
-                                return new KernelCommandResult(true,
-                                    $"Dialing {num} via modem cellular baseband (ATD, awaiting +CLCC)...", dialed);
-                            }
-
-                            return new KernelCommandResult(false, "VoWiFi is not registered. Cellular ATD fallback is disabled for safety. Run 'vowifi start' first, or specify '--force-cellular' if cellular dial is explicitly desired.");
+                            return new KernelCommandResult(false, "Neither VoWiFi nor Host IMS is registered. Cellular ATD fallback is disabled for safety; specify '--force-cellular' to use the modem voice path.");
                         }
                         else
                         {
                             return new KernelCommandResult(false,
-                                "No registered VoWiFi session or explicitly enabled cellular bearer is available. No call was placed.");
+                                "No registered IMS session or explicitly enabled cellular bearer is available. No call was placed.");
                         }
                     }
 
@@ -1787,7 +2028,9 @@ public class VoKernel : IVoKernel
                 case "reboot" or "restart":
                     if (Modem == null)
                         return new KernelCommandResult(false, "No physical modem attached.");
-                    bool reb = await Modem.RebootBasebandAsync(ct).ConfigureAwait(false);
+                    bool reb = Pool.ActiveSlot is { } rebootSlot
+                        ? await rebootSlot.RebootAsync(ct).ConfigureAwait(false)
+                        : await Modem.RebootBasebandAsync(ct).ConfigureAwait(false);
                     return new KernelCommandResult(reb, reb ? "Baseband reboot command issued (AT+CFUN=1,1)." : "Reboot command failed.");
 
                 case "euicc":
@@ -2009,6 +2252,7 @@ public class VoKernel : IVoKernel
         {
             try { await _telemetryTask.ConfigureAwait(false); } catch { }
         }
+        try { await StopSipGatewayAsync().ConfigureAwait(false); } catch { }
         try { await Pool.DisposeAsync().ConfigureAwait(false); } catch { }
         try { _fallbackCalls.Dispose(); } catch { }
         try { _fallbackVoWifi.Dispose(); } catch { }
