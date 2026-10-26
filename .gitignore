@@ -34,3 +34,40 @@ Desktop.ini
 
 # Locally cloned upstream source used only to build the bundled AMR native DLL
 voSharp/src/VoSharp.Native/opencore-amr/
+
+# Downloaded redistributables and locally exported OEM driver packages
+packaging/cache/
+packaging/local-drivers/
+packaging/runtime.zip
+packaging/runtime-managed.zip
+
+# Read-only upstream comparison checkouts; never bundle their .git or binaries.
+references/
+
+# Private generated SIP deployments and credentials (never publish with source)
+packaging/asterisk/credentials.json
+packaging/asterisk/vowin-client.json
+packaging/asterisk/config/
+packaging/asterisk/deployment.local.json
+packaging/asterisk/generated/
+*.protected
+**/admin-access.local.txt
+
+# Independent local repositories; do not add as implicit Git submodules.
+/VoCat-sip/
+/SimAdmin-sip/
+
+# Local agent state and test-run output.
+/.agents/
+/.workbuddy-ai/
+**/TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# Local environment and signing credentials.
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
