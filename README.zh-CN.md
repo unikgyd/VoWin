@@ -17,8 +17,10 @@ Linux 端采用独立的 [VoCat-sip](https://github.com/unikgyd/VoCat-sip)（Go 
 | Windows | 继续使用 VoWin／VoSharp（C#）；本次 Linux 补齐不改 Windows 运行代码。 |
 | Linux 基础通话 | 已接入网页电话、USB 模组 PCM、SIP 分机及可选 Asterisk peer、RFC 4733 按键。 |
 | 多模组与恢复 | 已有逐模组控制、Host IMS、按卡 ePDG／重试记录、通话及媒体所有权隔离。 |
-| 独立蜂窝／Wi-Fi 接入 | 正在接入按 ICCID 保存的两个连接开关、默认选路、换卡恢复及管理界面；本次新增源码尚未统一测试。 |
-| 后续能力 | 保持／恢复、自动接听和留言播放、SIP INFO 兼容，以及完整实机生命周期与运营商验收仍待完成。 |
+| 独立蜂窝／Wi-Fi 接入 | VoCat-sip 已实现按 ICCID 保存的连接意愿、默认选路、会话归属、换卡处理及管理界面。 |
+| Linux 高级通话 | 已接保持／恢复、逐卡应答和留言、网页接管、录音、SIP INFO 及独立 RTCP／媒体统计。 |
+| 软件验收 | VoCat-sip 已通过 2025 项原生 Go、2020 项静态 Go、79 项前端、132 次关键竞态、41 项隔离内核检查、vet 及四个 Linux 构建。 |
+| 仍待验收 | 真实模组／SIM 生命周期、USB 音频、真实通话留言／接管、软电话／运营商互通、原生 AMR 依赖及部署／回滚。 |
 
 当前完整差异见 [VoCat 能力并集清单](https://github.com/unikgyd/VoCat-sip/blob/master/docs/FEATURE_UNION.md)。
 历史阶段通过的测试只适用于对应源码快照，不能代替当前工作区或双端整体验收。
@@ -65,7 +67,8 @@ dotnet build VoWin.slnx --no-restore
 dotnet run --project VoWin/VoWin.csproj
 ```
 
-本轮按先实现、后统一测试的顺序推进；README／Git 整理期间未执行测试或构建。
+本轮已按先实现、后统一测试完成软件检查。Linux 独立仓库中的
+`docs/VERIFICATION_20261026.md` 记录实际源码版本、跳过项和构建哈希；Windows 运行代码未改动。
 
 ## 交流与许可
 

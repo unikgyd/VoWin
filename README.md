@@ -19,8 +19,10 @@ existing device, networking, scheduled-task, and notification capabilities.
 | Windows | VoWin/VoSharp (C#) remains the Windows client. The current Linux parity work does not change Windows runtime code. |
 | Linux calls and media | Web phone, physically paired USB PCM, SIP extension and optional Asterisk peer bridges, and RFC 4733 DTMF are wired. |
 | Multiple modems and recovery | Per-modem control, Host IMS, per-SIM ePDG/retry history, and separate call/media ownership are present. |
-| Independent cellular/Wi-Fi access | Per-ICCID connection preferences, default routing, SIM-change recovery, and management UI are being integrated. The latest source has not had final combined validation. |
-| Remaining capabilities | Hold/resume, auto-answer and message playback, SIP INFO compatibility, complete hardware lifecycle, and live carrier acceptance remain pending. |
+| Independent cellular/Wi-Fi access | Per-ICCID connection preferences, default routing, session ownership, SIM-change handling and management UI are implemented in VoCat-sip. |
+| Advanced Linux calls | Hold/resume, per-SIM answering and playback, browser takeover, recording, SIP INFO and separate RTCP/statistics are integrated. |
+| Software verification | VoCat-sip passed 2,025 native Go tests, 2,020 static Go tests, 79 frontend tests, 132 selected race executions, 41 isolated kernel tests, vet and four Linux builds. |
+| Remaining acceptance | Actual modem/SIM lifecycle, USB audio, live playback/takeover, softphone/carrier interoperability, native AMR dependencies and deployment/rollback. |
 
 See the [VoCat feature union checklist](https://github.com/unikgyd/VoCat-sip/blob/master/docs/FEATURE_UNION.md)
 for the full comparison. Historical passing runs apply to their corresponding
@@ -73,8 +75,9 @@ dotnet build VoWin.slnx --no-restore
 dotnet run --project VoWin/VoWin.csproj
 ```
 
-The current workflow completes implementation before running the final combined
-tests. No tests or builds were run during the README/Git cleanup.
+Implementation preceded the final combined software tests. The Linux verification
+record is in `VoCat-sip/docs/VERIFICATION_20261026.md` in that separate repository,
+with exact revision, skips and build hashes. Windows runtime code was kept intact.
 
 ## Community and licensing
 
