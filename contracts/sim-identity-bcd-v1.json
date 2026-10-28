@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "description": "Synthetic EF.ICCID ten-byte swapped BCD; decimal digits then only trailing F padding; 18..20 digits starting 89.",
+  "cases": [
+    {
+      "id": "valid-18",
+      "raw": "981000000000000010ff",
+      "iccid": "890100000000000001"
+    },
+    {
+      "id": "valid-19",
+      "raw": "981000000000000000f1",
+      "iccid": "8901000000000000001"
+    },
+    {
+      "id": "valid-20",
+      "raw": "98100000000000000021",
+      "iccid": "89010000000000000012"
+    },
+    {
+      "id": "empty",
+      "raw": "",
+      "iccid": null
+    },
+    {
+      "id": "short",
+      "raw": "9810000000000000",
+      "iccid": null
+    },
+    {
+      "id": "long",
+      "raw": "981000000000000000f100",
+      "iccid": null
+    },
+    {
+      "id": "all-padding",
+      "raw": "ffffffffffffffffffff",
+      "iccid": null
+    },
+    {
+      "id": "not-89",
+      "raw": "881000000000000000f1",
+      "iccid": null
+    },
+    {
+      "id": "middle-padding",
+      "raw": "9810f0000000000000f1",
+      "iccid": null
+    },
+    {
+      "id": "digit-after-padding",
+      "raw": "9810000000000000001f",
+      "iccid": null
+    },
+    {
+      "id": "hex-letter",
+      "raw": "981000000000000000a1",
+      "iccid": null
+    },
+    {
+      "id": "too-few-digits",
+      "raw": "9810000000000000ffff",
+      "iccid": null
+    }
+  ]
+}

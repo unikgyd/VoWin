@@ -51,6 +51,12 @@ public sealed class VoWifiFlowHardeningTests
         await manager.HandleIncomingInviteAsync(initial, voWifi, Reply);
         await manager.AnswerAsync();
         var dialogTo = replies.Single(response => response.StatusCode == 200).GetHeader("To");
+        var ack = new SipMessage { IsRequest = true, Method = "ACK" };
+        ack.SetHeader("From", initial.GetHeader("From")!);
+        ack.SetHeader("To", dialogTo!);
+        ack.SetHeader("Call-ID", initial.GetHeader("Call-ID")!);
+        ack.SetHeader("CSeq", "1 ACK");
+        manager.HandleIncomingAck(ack);
         replies.Clear();
 
         var refresh = CreateInvite("same-dialog", 2);
@@ -80,11 +86,12 @@ public sealed class VoWifiFlowHardeningTests
     public async Task EpdgDiscovery_UsesAospPriorityAddressPreferenceAndTemporaryExclusion()
     {
         var sim = SimIdentity.FromImsiAndIccid(
-            "999123123456789", "8900000000000000001", mncLength: 3,
+            "999123123456789", Guid.NewGuid().ToString("N"), mncLength: 3,
             homePlmns: ["999123", "00101"]);
         var options = new EpdgDiscoveryOptions(
             StaticAddresses: ["192.0.2.10", "2001:db8::10"],
             RegisteredPlmn: "310260",
+            CarrierPlmns: ["310260"],
             CellularLocationDomains: ["cell.example.test"],
             IsRoaming: true,
             IsEmergency: true,
@@ -109,7 +116,7 @@ public sealed class VoWifiFlowHardeningTests
         Assert.Equal(IPAddress.Parse("192.0.2.44"),
             EpdgResolver.ParsePcoAddress([0x13, 0x00, 0x62, 192, 0, 2, 44]));
 
-        EpdgResolver.ReportConnectionSuccess();
+        EpdgResolutionResult? first = null;
         try
         {
             var resolutionOptions = options with
@@ -119,19 +126,20 @@ public sealed class VoWifiFlowHardeningTests
                 StaticAddresses = ["2001:db8::10"],
                 MethodPriority = [EpdgDiscoveryMethod.Pco, EpdgDiscoveryMethod.Static]
             };
-            var first = await EpdgResolver.ResolveAsync(sim, resolutionOptions);
+            first = await EpdgResolver.ResolveAsync(sim, resolutionOptions);
             Assert.Equal(IPAddress.Parse("2001:db8::10"), first.IpAddresses[0]);
             Assert.Equal("ims.mnc123.mcc999.3gppnetwork.org", first.ImsDomain);
             Assert.Equal("STATIC", first.SelectionMethod);
 
-            EpdgResolver.ReportConnectionFailure(IPAddress.Parse("2001:db8::10"));
+            EpdgResolver.ReportConnectionFailure(first, IPAddress.Parse("2001:db8::10"));
             var second = await EpdgResolver.ResolveAsync(sim, resolutionOptions);
             Assert.DoesNotContain(IPAddress.Parse("2001:db8::10"), second.IpAddresses);
             Assert.Contains(IPAddress.Parse("192.0.2.10"), second.IpAddresses);
         }
         finally
         {
-            EpdgResolver.ReportConnectionSuccess();
+            if (first != null)
+                foreach (var address in first.IpAddresses) EpdgResolver.ReportConnectionSuccess(first, address);
         }
     }
 
@@ -165,6 +173,31 @@ public sealed class VoWifiFlowHardeningTests
 
         await input.Writer.WriteAsync(SipMessage.Parse(snapshots[0]).CreateResponse(200, "OK").ToBytes());
         Assert.Equal(200, (await operation).StatusCode);
+    }
+
+    [Fact]
+    public async Task SipInviteClient_ProvisionalResponseExtendsFinalWaitWithoutRetransmitting()
+    {
+        var input = Channel.CreateUnbounded<byte[]>();
+        var sent = Channel.CreateUnbounded<byte[]>();
+        using var transport = new SipTransport();
+        transport.ConnectCustom(bytes =>
+        {
+            sent.Writer.TryWrite(bytes.ToArray());
+            return Task.CompletedTask;
+        }, ct => input.Reader.ReadAsync(ct).AsTask());
+
+        var invite = CreateRequest("INVITE", "extended-ringing", 1, "z9hG4bKextended");
+        var pending = transport.SendAndReceiveFinalAsync(invite, timeoutMs: 400,
+            provisionalTimeoutMs: 1500);
+        await sent.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        await input.Writer.WriteAsync(invite.CreateResponse(180, "Ringing").ToBytes());
+        await Task.Delay(650);
+        Assert.False(pending.IsCompleted);
+        Assert.False(sent.Reader.TryRead(out _));
+
+        await input.Writer.WriteAsync(invite.CreateResponse(200, "OK").ToBytes());
+        Assert.Equal(200, (await pending.WaitAsync(TimeSpan.FromSeconds(2))).StatusCode);
     }
 
     [Fact]
@@ -301,6 +334,49 @@ public sealed class VoWifiFlowHardeningTests
     }
 
     [Fact]
+    public async Task SipReliable183_RetransmitsUntilMatchingPrackArrives()
+    {
+        var input = Channel.CreateUnbounded<SipDatagram>();
+        var output = Channel.CreateUnbounded<SipDatagram>();
+        var local = new IPEndPoint(IPAddress.Parse("10.0.0.1"), 40000);
+        var remote = new IPEndPoint(IPAddress.Parse("10.0.0.2"), 41000);
+        using var transport = new SipTransport();
+        transport.ConnectDatagrams(local, remote,
+            (packet, _) => { output.Writer.TryWrite(packet); return Task.CompletedTask; },
+            ct => input.Reader.ReadAsync(ct).AsTask());
+        transport.IncomingRequestReceived += async (_, request) =>
+        {
+            if (request.Method == "INVITE")
+            {
+                var progress = request.CreateResponse(183, "Session Progress");
+                progress.SetHeader("To", "<sip:user@example.test>;tag=local");
+                progress.SetHeader("Require", "100rel");
+                progress.SetHeader("RSeq", "1");
+                await transport.SendAsync(progress);
+            }
+            else if (request.Method == "PRACK")
+                await transport.SendAsync(request.CreateResponse(200, "OK"));
+        };
+
+        var invite = CreateRequest("INVITE", "reliable-183", 7, "z9hG4bKinvite183");
+        await input.Writer.WriteAsync(new SipDatagram(invite.ToBytes(), local, remote));
+        var first = await output.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        var retransmission = await output.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(first.Payload, retransmission.Payload);
+
+        var progressResponse = SipMessage.Parse(first.Payload);
+        var prack = CreateRequest("PRACK", "reliable-183", 8, "z9hG4bKprack183");
+        prack.SetHeader("From", progressResponse.GetHeader("From")!);
+        prack.SetHeader("To", progressResponse.GetHeader("To")!);
+        prack.SetHeader("RAck", "1 7 INVITE");
+        await input.Writer.WriteAsync(new SipDatagram(prack.ToBytes(), local, remote));
+        var prackOk = await output.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(200, SipMessage.Parse(prackOk.Payload).StatusCode);
+        await Task.Delay(1100);
+        Assert.False(output.Reader.TryRead(out _));
+    }
+
+    [Fact]
     public async Task SipInviteClient_ReplaysAckWhenFinalResponseIsRetransmitted()
     {
         var input = Channel.CreateUnbounded<byte[]>();
@@ -369,6 +445,7 @@ public sealed class VoWifiFlowHardeningTests
         Assert.Contains("RTP/AVP 96", answer.Body);
         Assert.Contains("a=fmtp:96", answer.Body);
         Assert.Contains("octet-align=1", answer.Body);
+        Assert.Contains("mode-set=7", answer.Body);
         manager.Dispose();
     }
 

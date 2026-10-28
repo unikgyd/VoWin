@@ -44,7 +44,7 @@ namespace VoWin.ViewModels.Windows
             },
             new NavigationViewItem()
             {
-                Content = "远程控制",
+                Content = "控制和提醒",
                 Icon = new SymbolIcon { Symbol = SymbolRegular.Bot24 },
                 TargetPageType = typeof(RemoteControlPage)
             }

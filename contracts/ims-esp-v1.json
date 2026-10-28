@@ -1,0 +1,265 @@
+{
+  "version": 1,
+  "scope": "Synthetic IMS transport ESP; Node/OpenSSL independent oracle",
+  "ckHex": "000102030405060708090a0b0c0d0e0f",
+  "ikHex": "101112131415161718191a1b1c1d1e1f",
+  "payloadHex": "494d532d4553502d636f6e7472616374",
+  "cases": [
+    {
+      "id": "ipv4-hmac-sha-1-96-aes-cbc-valid",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "aes-cbc",
+      "accepted": true,
+      "packetHex": "45000058000040004032b670c0000202c0000201000007d000000001000102030405060708090a0b0c0d0e0f172b1c556aaf8f5774d7f0c4494ef27e31198adef786692ed66e3a94d9ca280919bcb4e710dfc1d58f9bb006"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-des-ede3-cbc-valid",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "des-ede3-cbc",
+      "accepted": true,
+      "packetHex": "45000050000040004032b678c0000202c0000201000007d000000001000102030405060706aefa0d686df7b161d291655e93ca7bfdadb6e8eabbb574c819a629ded28ba2b9a9ff005eda57e52073f6b2"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-valid",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": true,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d000000001a0289c410018659b494d532d4553502d636f6e7472616374010202113e01d4ad004e5c4271f86420"
+    },
+    {
+      "id": "ipv4-hmac-md5-96-aes-cbc-valid",
+      "ipv6": false,
+      "integrity": "hmac-md5-96",
+      "encryption": "aes-cbc",
+      "accepted": true,
+      "packetHex": "45000058000040004032b670c0000202c0000201000007d000000001000102030405060708090a0b0c0d0e0f172b1c556aaf8f5774d7f0c4494ef27e31198adef786692ed66e3a94d9ca280956fa9f838136263e45f390a2"
+    },
+    {
+      "id": "ipv4-hmac-md5-96-des-ede3-cbc-valid",
+      "ipv6": false,
+      "integrity": "hmac-md5-96",
+      "encryption": "des-ede3-cbc",
+      "accepted": true,
+      "packetHex": "45000050000040004032b678c0000202c0000201000007d000000001000102030405060706aefa0d686df7b161d291655e93ca7bfdadb6e8eabbb574c819a629ded28ba23425efe146d02511de7288ef"
+    },
+    {
+      "id": "ipv4-hmac-md5-96-null-valid",
+      "ipv6": false,
+      "integrity": "hmac-md5-96",
+      "encryption": "null",
+      "accepted": true,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d000000001a0289c410018659b494d532d4553502d636f6e7472616374010202115aa7efe59811d1bb32215fe6"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-aes-cbc-valid",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "aes-cbc",
+      "accepted": true,
+      "packetHex": "600000000044324020010db800000000000000000000000220010db8000000000000000000000001000007d000000001000102030405060708090a0b0c0d0e0f36774358b30d19f08beb0bfa52d040b99f9f1caaf1a3d248b7a5eb4d221e0880812bc0ee4a47728783fb0afd"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-des-ede3-cbc-valid",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "des-ede3-cbc",
+      "accepted": true,
+      "packetHex": "60000000003c324020010db800000000000000000000000220010db8000000000000000000000001000007d0000000010001020304050607409864cebeedf190508efe473a54d053b0d1d7cfc16a4f9abd1ec7ca490a96a4dee7d2ff550896ce135f547a"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-valid",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": true,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d000000001a0289c4100188e2a494d532d4553502d636f6e74726163740102021136f79dbb43b9abc8367c3356"
+    },
+    {
+      "id": "ipv6-hmac-md5-96-aes-cbc-valid",
+      "ipv6": true,
+      "integrity": "hmac-md5-96",
+      "encryption": "aes-cbc",
+      "accepted": true,
+      "packetHex": "600000000044324020010db800000000000000000000000220010db8000000000000000000000001000007d000000001000102030405060708090a0b0c0d0e0f36774358b30d19f08beb0bfa52d040b99f9f1caaf1a3d248b7a5eb4d221e088073c67d338a6ebd577dad2cae"
+    },
+    {
+      "id": "ipv6-hmac-md5-96-des-ede3-cbc-valid",
+      "ipv6": true,
+      "integrity": "hmac-md5-96",
+      "encryption": "des-ede3-cbc",
+      "accepted": true,
+      "packetHex": "60000000003c324020010db800000000000000000000000220010db8000000000000000000000001000007d0000000010001020304050607409864cebeedf190508efe473a54d053b0d1d7cfc16a4f9abd1ec7ca490a96a41e41fcbf8cc6186b93dcb157"
+    },
+    {
+      "id": "ipv6-hmac-md5-96-null-valid",
+      "ipv6": true,
+      "integrity": "hmac-md5-96",
+      "encryption": "null",
+      "accepted": true,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d000000001a0289c4100188e2a494d532d4553502d636f6e7472616374010202113199a400084f40622835b75f"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-udp-checksum",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d0000003e8a0289c410018659b494d532d4553502d636f6e74726163750102021155076887b0c3f147329d34e9"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-udp-length",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d0000003e8a0289c410019659b494d532d4553502d636f6e7472616374010202113427d2f4548149f7fc7e66c7"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-udp-short",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d0000003e8a0289c410008659b494d532d4553502d636f6e7472616374010202117d851f3716420972b210adfe"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-zero-checksum",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": true,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d0000003e8a0289c4100180000494d532d4553502d636f6e747261637401020211486b2ea29c86192be1caccf8"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-selector",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d0000003e8a0289c400018659b494d532d4553502d636f6e7472616374010202115d9f913175dacacff6581800"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-padding",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d0000003e8a0289c410018659b494d532d4553502d636f6e74726163746302021159bcfef8a5cfb0254b371fa5"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-next-header",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d0000003e8a0289c410018659b494d532d4553502d636f6e747261637401020206c9b9b7b5565b8683bef2da07"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-icv",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d0000003e8a0289c410018659b494d532d4553502d636f6e7472616374010202112e1fdf3e2bf8d6a88d48f8b6"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-trailing",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000040004032b684c0000202c0000201000007d0000003e8a0289c410018659b494d532d4553502d636f6e7472616374010202112e1fdf3e2bf8d6a88d48f8b700"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-outer-checksum",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000040004032b784c0000202c0000201000007d0000003e8a0289c410018659b494d532d4553502d636f6e7472616374010202112e1fdf3e2bf8d6a88d48f8b7"
+    },
+    {
+      "id": "ipv4-hmac-sha-1-96-null-fragment",
+      "ipv6": false,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "45000044000020004032d684c0000202c0000201000007d0000003e8a0289c410018659b494d532d4553502d636f6e7472616374010202112e1fdf3e2bf8d6a88d48f8b7"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-udp-checksum",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d0000003e8a0289c4100188e2a494d532d4553502d636f6e7472616375010202116410728a457519fe06c744a9"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-udp-length",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d0000003e8a0289c4100198e2a494d532d4553502d636f6e747261637401020211bde69e6cfcf4f3451e4ac347"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-udp-short",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d0000003e8a0289c4100088e2a494d532d4553502d636f6e747261637401020211abaf3827ca7196351a90c1b0"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-zero-checksum",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d0000003e8a0289c4100180000494d532d4553502d636f6e747261637401020211486b2ea29c86192be1caccf8"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-selector",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d0000003e8a0289c4000188e2a494d532d4553502d636f6e7472616374010202118933cf5c5a392a43fe6b7a74"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-padding",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d0000003e8a0289c4100188e2a494d532d4553502d636f6e747261637463020211fad7fea2c0fc2750053f9b7d"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-next-header",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d0000003e8a0289c4100188e2a494d532d4553502d636f6e74726163740102020697d0ecad1e463e7473d6a7d9"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-icv",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d0000003e8a0289c4100188e2a494d532d4553502d636f6e74726163740102021119a97db41b9f48ccd3572e66"
+    },
+    {
+      "id": "ipv6-hmac-sha-1-96-null-trailing",
+      "ipv6": true,
+      "integrity": "hmac-sha-1-96",
+      "encryption": "null",
+      "accepted": false,
+      "packetHex": "600000000030324020010db800000000000000000000000220010db8000000000000000000000001000007d0000003e8a0289c4100188e2a494d532d4553502d636f6e74726163740102021119a97db41b9f48ccd3572e6700"
+    }
+  ]
+}

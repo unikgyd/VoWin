@@ -199,7 +199,7 @@ public static class SmsPdu
                 for (int i = 0; i < total; i++)
                 {
                     int seq = i + 1;
-                    byte[] udh = [0x05, 0x00, 0x03, refByte, (byte)total, (byte)seq];
+                    byte[] udh = [0x00, 0x03, refByte, (byte)total, (byte)seq]; // Encoder adds UDHL once.
                     var pduHex = EncodeSingleSubmitPdu(recipient, chunks[i], null, udh, requestStatusReport, smsc, out int tpduLen, out byte[] tpduBytes, refByte);
                     parts.Add(new SmsSubmitPart(seq, total, refByte, tpduBytes, Convert.ToHexString(tpduBytes), pduHex, tpduLen, recipient, SmsEncoding.Gsm7Bit, refByte));
                 }
@@ -218,7 +218,7 @@ public static class SmsPdu
             }
             else
             {
-                // Multipart UCS-2 (67 characters per segment, surrogate safe)
+                // Multipart UCS-2: 67 UTF-16 code units (134 bytes), never 67 Unicode scalars.
                 byte refByte = concatReference ?? (byte)RandomNumberGenerator.GetInt32(1, 255);
                 var textSegments = SplitUcs2Text(text, 67);
                 int total = textSegments.Count;
@@ -226,7 +226,7 @@ public static class SmsPdu
                 for (int i = 0; i < total; i++)
                 {
                     int seq = i + 1;
-                    byte[] udh = [0x05, 0x00, 0x03, refByte, (byte)total, (byte)seq];
+                    byte[] udh = [0x00, 0x03, refByte, (byte)total, (byte)seq]; // Encoder adds UDHL once.
                     var segmentUcs2 = Encoding.BigEndianUnicode.GetBytes(textSegments[i]);
                     var pduHex = EncodeSingleSubmitPdu(recipient, null, segmentUcs2, udh, requestStatusReport, smsc, out int tpduLen, out byte[] tpduBytes, refByte);
                     parts.Add(new SmsSubmitPart(seq, total, refByte, tpduBytes, Convert.ToHexString(tpduBytes), pduHex, tpduLen, recipient, SmsEncoding.Ucs2, refByte));
@@ -645,7 +645,7 @@ public static class SmsPdu
         return strayCount > 0 && ((double)strayCount / text.Length > 0.15 || strayCount >= 2);
     }
 
-    private static List<string> SplitUcs2Text(string text, int maxRunes)
+    private static List<string> SplitUcs2Text(string text, int maxCodeUnits)
     {
         var result = new List<string>();
         var runes = text.EnumerateRunes().ToArray();
@@ -653,14 +653,14 @@ public static class SmsPdu
 
         while (offset < runes.Length)
         {
-            int count = Math.Min(maxRunes, runes.Length - offset);
             var sb = new StringBuilder();
-            for (int i = 0; i < count; i++)
+            var units = 0;
+            while (offset < runes.Length && units + runes[offset].Utf16SequenceLength <= maxCodeUnits)
             {
-                sb.Append(runes[offset + i].ToString());
+                var rune = runes[offset++];
+                sb.Append(rune.ToString()); units += rune.Utf16SequenceLength;
             }
             result.Add(sb.ToString());
-            offset += count;
         }
 
         return result;

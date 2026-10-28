@@ -17,6 +17,7 @@ public sealed class IkeSessionController : IDisposable
     private readonly ulong _initiatorSpi;
     private readonly ulong _responderSpi;
     private readonly uint _childInboundSpi;
+    private readonly uint _childOutboundSpi;
     private readonly byte[] _skEi;
     private readonly byte[] _skAi;
     private readonly byte[] _skEr;
@@ -24,6 +25,9 @@ public sealed class IkeSessionController : IDisposable
     private readonly SemaphoreSlim _localGate = new(1, 1);
     private readonly SemaphoreSlim _remoteGate = new(1, 1);
     private readonly Action<string>? _diagnosticLog;
+    private readonly bool _fragmentationNegotiated;
+    private IkeEncryptedMessageReceiver? _remoteReceiver;
+    private byte[]? _remoteFirstFragment;
 
     private uint _nextLocalMessageId;
     private uint _nextRemoteMessageId;
@@ -42,23 +46,27 @@ public sealed class IkeSessionController : IDisposable
         ulong responderSpi,
         uint lastLocalMessageId,
         uint childInboundSpi,
+        uint childOutboundSpi,
         byte[] skEi,
         byte[] skAi,
         byte[] skEr,
         byte[] skAr,
-        Action<string>? diagnosticLog = null)
+        Action<string>? diagnosticLog = null,
+        bool fragmentationNegotiated = false)
     {
         _transport = transport;
         _suite = suite;
         _initiatorSpi = initiatorSpi;
         _responderSpi = responderSpi;
         _childInboundSpi = childInboundSpi;
+        _childOutboundSpi = childOutboundSpi;
         _nextLocalMessageId = checked(lastLocalMessageId + 1);
         _skEi = skEi.ToArray();
         _skAi = skAi.ToArray();
         _skEr = skEr.ToArray();
         _skAr = skAr.ToArray();
         _diagnosticLog = diagnosticLog;
+        _fragmentationNegotiated = fragmentationNegotiated;
         _transport.SetIncomingIkeRequestHandler(HandleIncomingRequestAsync);
     }
 
@@ -74,12 +82,11 @@ public sealed class IkeSessionController : IDisposable
         var payloads = await SendLocalInformationalAsync(Array.Empty<IkePayload>(), ct).ConfigureAwait(false);
         if (IsChildSaDeleted)
             throw new InvalidOperationException("The peer has deleted the IMS CHILD_SA.");
-        var error = payloads.FirstOrDefault(payload =>
-            payload.Type == IkePayloadType.Notify &&
-            payload.Body.Length >= 4 &&
-            BinaryPrimitives.ReadUInt16BigEndian(payload.Body.AsSpan(2, 2)) < 16384);
-        if (error != null)
-            throw new IkeFormatException("ePDG rejected the IKE DPD INFORMATIONAL exchange.");
+        foreach (var payload in payloads)
+            if (payload.Type != IkePayloadType.Notify || payload.Body.Length < 4 ||
+                payload.Body[0] != 0 || payload.Body[1] != 0 ||
+                BinaryPrimitives.ReadUInt16BigEndian(payload.Body.AsSpan(2, 2)) < 16384)
+                throw new IkeFormatException("ePDG rejected or returned an invalid IKE DPD INFORMATIONAL response.");
     }
 
     /// <summary>
@@ -102,6 +109,22 @@ public sealed class IkeSessionController : IDisposable
             .ConfigureAwait(false);
     }
 
+    // Failed startup replacement needs a bounded send, not an assumed peer
+    // acknowledgement. Normal explicit Stop still uses DeleteAsync above.
+    public async Task SendIkeDeleteWithoutReplyAsync(CancellationToken ct)
+    {
+        await _localGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_nextLocalMessageId == uint.MaxValue) throw new InvalidOperationException("IKE message ID exhausted.");
+            var packet = IkeCrypto.EncryptPayloads(CreateHeader(IkeExchangeType.Informational, IkeFlags.Initiator, _nextLocalMessageId++),
+                [new(IkePayloadType.Delete, [1, 0, 0, 0])], _suite, _skEi, _skAi);
+            await _transport.SendIkeAsync(packet, ct).ConfigureAwait(false);
+        }
+        finally { _localGate.Release(); }
+    }
+
     private async Task<IReadOnlyList<IkePayload>> SendLocalInformationalAsync(
         IReadOnlyList<IkePayload> payloads,
         CancellationToken ct)
@@ -120,10 +143,11 @@ public sealed class IkeSessionController : IDisposable
             _nextLocalMessageId++;
 
             var request = CreateHeader(IkeExchangeType.Informational, IkeFlags.Initiator, messageId);
-            var encrypted = IkeCrypto.EncryptPayloads(request, payloads, _suite, _skEi, _skAi);
-            var response = await _transport.RoundTripAsync(encrypted, ct).ConfigureAwait(false);
-            var (header, responsePayloads) = IkeCrypto.DecryptPayloads(response, _suite, _skEr, _skAr);
+            var response = await _transport.RoundTripEncryptedAsync(request, payloads, _suite,
+                _skEi, _skAi, _skEr, _skAr, _fragmentationNegotiated, ct).ConfigureAwait(false);
+            var (header, responsePayloads) = (response.Header, response.Payloads);
             ValidateHeader(header, IkeExchangeType.Informational, messageId, requireResponse: true);
+            LastPeerActivity = DateTimeOffset.UtcNow;
             return responsePayloads;
         }
         finally
@@ -139,35 +163,66 @@ public sealed class IkeSessionController : IDisposable
         try
         {
             if (_disposed) return;
-            var (header, payloads) = IkeCrypto.DecryptPayloads(packet, _suite, _skEr, _skAr);
-            ValidateHeader(header, header.Exchange, header.MessageId, requireResponse: false);
-            LastPeerActivity = DateTimeOffset.UtcNow;
-
-            if (_lastRemoteMessageId == header.MessageId &&
-                _lastRemoteExchange == header.Exchange &&
-                _lastRemoteRequest != null &&
+            // Only the exact already-authenticated request (fragment 1 for a
+            // fragmented request) may trigger a cached response retransmission.
+            if (_lastRemoteRequest != null &&
                 _lastRemoteResponse != null &&
                 packet.AsSpan().SequenceEqual(_lastRemoteRequest))
             {
                 await _transport.SendIkeAsync(_lastRemoteResponse).ConfigureAwait(false);
-                Log($"Replayed cached peer response; exchange={header.Exchange}; message-id={header.MessageId}.");
+                Log($"Replayed cached peer response; exchange={_lastRemoteExchange}; message-id={_lastRemoteMessageId}.");
                 return;
             }
-
+            var header = IkeWire.ParseMessage(packet);
+            ValidateHeader(header, header.Exchange, header.MessageId, requireResponse: false);
             if (header.MessageId != _nextRemoteMessageId)
             {
                 Log($"Ignored out-of-window peer request; exchange={header.Exchange}; message-id={header.MessageId}; expected={_nextRemoteMessageId}.");
                 return;
             }
+            var receiver = _remoteReceiver ?? new IkeEncryptedMessageReceiver(header, _suite, _skEr, _skAr,
+                _fragmentationNegotiated, TimeSpan.FromSeconds(30));
+            IkeDecryptedMessage? decrypted;
+            var generation = receiver.AssemblyGeneration;
+            try { decrypted = receiver.Accept(packet); }
+            catch (TimeoutException)
+            {
+                receiver.Dispose(); _remoteReceiver = null; _remoteFirstFragment = null;
+                return;
+            }
+            catch { if (_remoteReceiver == null) receiver.Dispose(); throw; }
+            _remoteReceiver = receiver;
+            if (receiver.AssemblyGeneration != generation) _remoteFirstFragment = null;
+            if (packet[16] == (byte)IkePayloadType.EncryptedFragment &&
+                BinaryPrimitives.ReadUInt16BigEndian(packet.AsSpan(32, 2)) == 1)
+                _remoteFirstFragment ??= packet;
+            if (decrypted == null) return;
+            var payloads = decrypted.Payloads;
+            var cachedRequest = _remoteFirstFragment ?? packet;
+            _remoteReceiver.Dispose(); _remoteReceiver = null; _remoteFirstFragment = null;
+            LastPeerActivity = DateTimeOffset.UtcNow;
 
             IReadOnlyList<IkePayload> responsePayloads = Array.Empty<IkePayload>();
             var hasIkeDelete = false;
             var hasChildDelete = false;
+            var invalidInformational = false;
             if (header.Exchange == IkeExchangeType.Informational)
             {
-                hasIkeDelete = payloads.Any(IsIkeDelete);
-                hasChildDelete = !hasIkeDelete && payloads.Any(IsEspDelete);
-                if (hasChildDelete && _childInboundSpi != 0)
+                foreach (var payload in payloads)
+                {
+                    if (payload.Type == IkePayloadType.Notify && payload.Body.Length >= 4 &&
+                        payload.Body[0] == 0 && payload.Body[1] == 0 &&
+                        BinaryPrimitives.ReadUInt16BigEndian(payload.Body.AsSpan(2, 2)) >= 16384)
+                        continue;
+                    if (payload.Type != IkePayloadType.Delete || !IsValidDelete(payload))
+                    { invalidInformational = true; break; }
+                    hasIkeDelete |= IsIkeDelete(payload);
+                    hasChildDelete |= IsEspDelete(payload);
+                }
+                hasChildDelete &= !hasIkeDelete && !invalidInformational;
+                if (invalidInformational)
+                    responsePayloads = [MakeNotify(7)]; // INVALID_SYNTAX is fatal.
+                else if (hasChildDelete && _childInboundSpi != 0)
                     responsePayloads = [MakeEspDelete(_childInboundSpi)];
             }
             else if (header.Exchange == IkeExchangeType.CreateChildSa)
@@ -191,15 +246,15 @@ public sealed class IkeSessionController : IDisposable
 
             _lastRemoteMessageId = header.MessageId;
             _lastRemoteExchange = header.Exchange;
-            _lastRemoteRequest = packet;
+            _lastRemoteRequest = cachedRequest;
             _lastRemoteResponse = response;
             if (_nextRemoteMessageId == uint.MaxValue)
                 throw new InvalidOperationException("Peer IKE message ID exhausted; establish a fresh SA.");
             _nextRemoteMessageId++;
-            if (hasIkeDelete)
+            if (invalidInformational || hasIkeDelete)
             {
                 Volatile.Write(ref _peerDeleted, true);
-                Log("Peer deleted the IKE security association.");
+                Log(invalidInformational ? "Malformed authenticated INFORMATIONAL; terminated the IKE SA." : "Peer deleted the IKE security association.");
             }
             else if (hasChildDelete)
             {
@@ -245,13 +300,24 @@ public sealed class IkeSessionController : IDisposable
     }
 
     private static bool IsIkeDelete(IkePayload payload) =>
-        payload.Type == IkePayloadType.Delete && payload.Body.Length >= 4 && payload.Body[0] == 1;
+        payload.Type == IkePayloadType.Delete && payload.Body.AsSpan().SequenceEqual(new byte[] { 1, 0, 0, 0 });
 
-    private static bool IsEspDelete(IkePayload payload) =>
-        payload.Type == IkePayloadType.Delete && payload.Body.Length >= 8 &&
-        payload.Body[0] == 3 && payload.Body[1] == 4 &&
-        BinaryPrimitives.ReadUInt16BigEndian(payload.Body.AsSpan(2, 2)) > 0 &&
-        payload.Body.Length == 4 + 4 * BinaryPrimitives.ReadUInt16BigEndian(payload.Body.AsSpan(2, 2));
+    private bool IsEspDelete(IkePayload payload)
+    {
+        if (payload.Type != IkePayloadType.Delete || payload.Body[0] != 3 || _childOutboundSpi == 0) return false;
+        for (var at = 4; at < payload.Body.Length; at += 4)
+            if (BinaryPrimitives.ReadUInt32BigEndian(payload.Body.AsSpan(at, 4)) == _childOutboundSpi) return true;
+        return false;
+    }
+
+    private static bool IsValidDelete(IkePayload payload)
+    {
+        var body = payload.Body;
+        if (body.Length < 4) return false;
+        if (body[0] == 1) return body.AsSpan().SequenceEqual(new byte[] { 1, 0, 0, 0 });
+        return body[0] is 2 or 3 && body[1] == 4 &&
+            body.Length == 4 + 4 * BinaryPrimitives.ReadUInt16BigEndian(body.AsSpan(2, 2));
+    }
 
     private static IkePayload MakeEspDelete(uint spi)
     {
@@ -286,5 +352,6 @@ public sealed class IkeSessionController : IDisposable
         CryptographicOperations.ZeroMemory(_skAr);
         _lastRemoteRequest = null;
         _lastRemoteResponse = null;
+        _remoteReceiver?.Dispose(); _remoteReceiver = null; _remoteFirstFragment = null;
     }
 }

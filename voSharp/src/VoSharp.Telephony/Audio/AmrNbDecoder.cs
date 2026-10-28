@@ -14,68 +14,57 @@ public static class AmrNbDecoder
     /// </summary>
     public static byte[] RtpPayloadToAmrFrame(byte[] payload, bool? forceOctetAligned = null)
     {
-        if (payload == null || payload.Length < 2)
-            return Array.Empty<byte>();
-
-        bool octetAligned = forceOctetAligned ?? DetectOctetAligned(payload);
-
-        if (octetAligned)
-        {
-            // Octet-aligned: byte 0 = CMR, byte 1.. = TOC + speech bytes
-            return payload[1..];
-        }
-
-        // Bandwidth-efficient mode (RFC 4867 §4.3.2):
-        // Byte 0: CMR (4 bits) | F (1 bit) | FT_high (3 bits)
-        // Byte 1: FT_low (1 bit) | Q (1 bit) | Speech bits (6 bits)
-        byte ft = (byte)(((payload[0] & 0x07) << 1) | ((payload[1] >> 7) & 1));
-        byte q = (byte)((payload[1] >> 6) & 1);
-
-        // Validate FT: 0-7 are valid speech modes, 8=SID, 15=NO_DATA; 9-14 are undefined/invalid
-        if (ft >= 9 && ft <= 14)
-            return Array.Empty<byte>();
-
-        byte toc = (byte)((ft << 3) | (q << 2));
-
-        // For NO_DATA (FT=15), return just the TOC byte
-        if (ft == 15)
-            return new byte[] { toc };
-
-        int expectedSpeechBytes = AmrFrameSizes[ft];
-        // Output: 1 TOC byte + exactly expectedSpeechBytes of speech data
-        var outBytes = new byte[1 + expectedSpeechBytes];
-        outBytes[0] = toc;
-
-        // Bit-shift: speech bits start at bit offset 10 in the RTP payload
-        // (CMR=4 + F=1 + FT=4 + Q=1 = 10 bits). Each output byte[i] (1-indexed)
-        // maps to payload[i] << 2 | payload[i+1] >> 6.
-        for (int i = 1; i <= expectedSpeechBytes && i < payload.Length; i++)
-        {
-            byte bCurrent = (byte)(payload[i] << 2);
-            byte bNext = 0;
-            if (i + 1 < payload.Length)
-            {
-                bNext = (byte)(payload[i + 1] >> 6);
-            }
-            outBytes[i] = (byte)(bCurrent | bNext);
-        }
-
-        return outBytes;
+        var frames = RtpPayloadToAmrFrames(payload, forceOctetAligned);
+        return frames.Length == 0 ? [] : frames[0];
     }
 
-    private static bool DetectOctetAligned(byte[] payload)
+    private static readonly int[] NbBits = [95, 103, 118, 134, 148, 159, 204, 244, 39, -1, -1, -1, -1, -1, -1, 0];
+    private static readonly int[] WbBits = [132, 177, 253, 285, 317, 365, 397, 461, 477, 40, -1, -1, -1, -1, 0, 0];
+
+    internal static bool IsStorageFrameValid(byte[] frame, bool wideband = false)
     {
-        if ((payload[0] & 0x0F) == 0 && (payload[1] & 0x03) == 0)
+        if (frame is not { Length: > 0 }) return false;
+        var bits = (wideband ? WbBits : NbBits)[frame[0] >> 3 & 15];
+        return bits >= 0 && frame.Length == 1 + (bits + 7) / 8;
+    }
+
+    /// <summary>Validated mono RFC 4867 payload; reserved/padding bits are ignored on receipt.</summary>
+    public static byte[][] RtpPayloadToAmrFrames(byte[] payload, bool? forceOctetAligned = null, bool isWideband = false)
+    {
+        if (forceOctetAligned is null)
         {
-            int ft = (payload[1] >> 3) & 0x0F;
-            if (ft < AmrFrameSizes.Length && AmrFrameSizes[ft] > 0)
-            {
-                int expectedLen = 2 + AmrFrameSizes[ft];
-                if (payload.Length == expectedLen)
-                    return true;
-            }
+            var aligned = RtpPayloadToAmrFrames(payload, true, isWideband);
+            return aligned.Length != 0 ? aligned : RtpPayloadToAmrFrames(payload, false, isWideband);
         }
-        return false;
+        if (payload is not { Length: >= 2 and <= 1024 }) return [];
+        var sizes = isWideband ? WbBits : NbBits;
+        var octet = forceOctetAligned.Value;
+        var at = octet ? 8 : 4;
+        int Bit(int offset) => payload[offset / 8] >> (7 - offset % 8) & 1;
+        var frames = new List<byte[]>();
+        while (true)
+        {
+            if (frames.Count >= 16 || at + (octet ? 8 : 6) > payload.Length * 8) return [];
+            var more = Bit(at++);
+            var ft = 0;
+            for (var i = 0; i < 4; i++) ft = ft * 2 + Bit(at++);
+            var q = Bit(at++);
+            if (octet) at += 2;
+            var bits = sizes[ft];
+            if (bits < 0) return [];
+            var frame = new byte[1 + (bits + 7) / 8];
+            frame[0] = (byte)(ft << 3 | q << 2);
+            frames.Add(frame);
+            if (more == 0) break;
+        }
+        foreach (var frame in frames)
+        {
+            var bits = sizes[frame[0] >> 3];
+            if (at + bits > payload.Length * 8) return [];
+            for (var i = 0; i < bits; i++) frame[1 + i / 8] |= (byte)(Bit(at++) << (7 - i % 8));
+            if (octet) at = (at + 7) / 8 * 8;
+        }
+        return (at + 7) / 8 == payload.Length ? frames.ToArray() : [];
     }
 
     private static readonly ThreadLocal<AmrNativeCodec> _threadCodec = new(() => new AmrNativeCodec(initEncoder: false));
@@ -88,7 +77,8 @@ public static class AmrNbDecoder
         if (payload == null || payload.Length < 2)
             return new short[160];
 
-        var amrFrame = RtpPayloadToAmrFrame(payload, forceOctetAligned);
+        var frames = RtpPayloadToAmrFrames(payload, forceOctetAligned, isWideband);
+        var amrFrame = frames.Length == 0 ? [] : frames[0];
         if (amrFrame.Length == 0)
             return new short[160];
 

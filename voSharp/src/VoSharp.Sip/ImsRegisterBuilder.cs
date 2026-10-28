@@ -15,7 +15,8 @@ public record ImsProfile(
     string LocalIp,
     int LocalPort = 5060,
     int? ContactPort = null,
-    string? PAccessNetworkInfo = null
+    string? PAccessNetworkInfo = null,
+    bool AdvertiseSmsOverIms = true
 );
 
 public static class ImsRegisterBuilder
@@ -94,18 +95,28 @@ public static class ImsRegisterBuilder
         var imeiInstance = $"\"<urn:gsma:imei:{imeiFormatted}>\"";
 
         var localHost = FormatHost(profile.LocalIp);
-        msg.SetHeader("Via", $"SIP/2.0/UDP {localHost}:{profile.LocalPort};branch={branch};rport");
+        // The outbound UDP source is the protected client port, but IMS expects
+        // the Via sent-by to advertise the protected server port that receives
+        // responses (3GPP TS 24.229). Without this, the P-CSCF may route the
+        // authenticated REGISTER response to the wrong SA/port pair.
+        msg.SetHeader("Via", $"SIP/2.0/UDP {localHost}:{profile.ContactPort ?? profile.LocalPort};branch={branch};rport");
         msg.SetHeader("Max-Forwards", "70");
         msg.SetHeader("From", $"<{publicId}>;tag={tag}");
         msg.SetHeader("To", $"<{publicId}>");
         msg.SetHeader("Call-ID", callId);
         msg.SetHeader("CSeq", $"{cseq} REGISTER");
-        msg.SetHeader("Contact", $"<sip:{user}@{localHost}:{profile.ContactPort ?? profile.LocalPort};transport=udp>;+sip.instance={imeiInstance};+g.3gpp.smsip;audio;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";expires={expiresSeconds}");
+        var smsFeature = profile.AdvertiseSmsOverIms ? ";+g.3gpp.smsip" : string.Empty;
+        msg.SetHeader("Contact", $"<sip:{user}@{localHost}:{profile.ContactPort ?? profile.LocalPort};transport=udp>;+sip.instance={imeiInstance}{smsFeature};audio;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";expires={expiresSeconds}");
         if (!string.IsNullOrWhiteSpace(profile.PAccessNetworkInfo))
             msg.SetHeader("P-Access-Network-Info", profile.PAccessNetworkInfo);
-        msg.SetHeader("Accept-Contact", "*;+g.3gpp.smsip, *;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"");
-        msg.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, MESSAGE, OPTIONS, NOTIFY, PRACK, UPDATE, INFO");
-        msg.SetHeader("Accept", "application/vnd.3gpp.sms, text/plain, multipart/mixed");
+        msg.SetHeader("Accept-Contact", profile.AdvertiseSmsOverIms
+            ? "*;+g.3gpp.smsip, *;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""
+            : "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"");
+        msg.SetHeader("Allow", profile.AdvertiseSmsOverIms
+            ? "INVITE, ACK, CANCEL, BYE, MESSAGE, OPTIONS, NOTIFY, PRACK, UPDATE, INFO"
+            : "INVITE, ACK, CANCEL, BYE, OPTIONS, NOTIFY, PRACK, UPDATE, INFO");
+        if (profile.AdvertiseSmsOverIms)
+            msg.SetHeader("Accept", "application/vnd.3gpp.sms, text/plain, multipart/mixed");
         msg.SetHeader("Supported", "path, gruu");
         msg.SetHeader("User-Agent", "voSharp/1.0.0 (Windows; C# Telephony Kernel)");
         msg.SetHeader("Content-Length", "0");
@@ -124,29 +135,17 @@ public static class ImsRegisterBuilder
     /// </remarks>
     public static DigestChallenge? ParseWwwAuthenticate(string headerValue)
     {
-        if (!headerValue.StartsWith("Digest", StringComparison.OrdinalIgnoreCase))
+        if (!TryParseDigestParameters(headerValue, out var parameters) ||
+            !parameters.TryGetValue("realm", out var realm) || string.IsNullOrEmpty(realm) ||
+            !parameters.TryGetValue("nonce", out var nonce) || string.IsNullOrEmpty(nonce) ||
+            !parameters.TryGetValue("algorithm", out var algorithm) ||
+            !algorithm.Equals("AKAv1-MD5", StringComparison.OrdinalIgnoreCase))
             return null;
-
-        var realmMatch = Regex.Match(headerValue, @"realm=""([^""]+)""");
-        var nonceMatch = Regex.Match(headerValue, @"nonce=""([^""]+)""");
-        var opaqueMatch = Regex.Match(headerValue, @"opaque=""([^""]+)""");
-        var algoMatch = Regex.Match(headerValue, @"algorithm=([a-zA-Z0-9\-_]+)");
-        var qopMatch = Regex.Match(headerValue, @"qop=""?([a-zA-Z0-9\-_,]+)""?");
-
-        if (!realmMatch.Success || !nonceMatch.Success)
-            return null;
-
-        // algorithm is mandatory for IMS AKA — never default it.
-        if (!algoMatch.Success ||
-            !algoMatch.Groups[1].Value.Equals("AKAv1-MD5", StringComparison.OrdinalIgnoreCase))
-        {
-            return null;
-        }
 
         string? qop = null;
-        if (qopMatch.Success)
+        if (parameters.TryGetValue("qop", out var qopValue))
         {
-            var offered = qopMatch.Groups[1].Value
+            var offered = qopValue
                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
             if (!offered.Any(q => q.Equals("auth", StringComparison.OrdinalIgnoreCase)))
@@ -156,12 +155,81 @@ public static class ImsRegisterBuilder
         }
 
         return new DigestChallenge(
-            realmMatch.Groups[1].Value,
-            nonceMatch.Groups[1].Value,
-            opaqueMatch.Success ? opaqueMatch.Groups[1].Value : null,
-            algoMatch.Groups[1].Value,
-            qop
+            realm,
+            nonce,
+            parameters.GetValueOrDefault("opaque"),
+            "AKAv1-MD5",
+            qop,
+            parameters.TryGetValue("stale", out var stale) &&
+                stale.Equals("true", StringComparison.OrdinalIgnoreCase)
         );
+    }
+
+    internal static bool TryParseAuthenticationInfo(string headerValue, out Dictionary<string, string> parameters)
+        => TryParseDigestParameters("Digest " + headerValue, out parameters, allowEmptyValues: true);
+
+    private static bool TryParseDigestParameters(string headerValue,
+        out Dictionary<string, string> parameters, bool allowEmptyValues = false)
+    {
+        parameters = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(headerValue) ||
+            Encoding.UTF8.GetByteCount(headerValue) > 4096 || headerValue.Any(char.IsControl))
+            return false;
+        var input = headerValue.Trim();
+        if (!input.StartsWith("Digest", StringComparison.OrdinalIgnoreCase) ||
+            (input.Length > 6 && input[6] != ' '))
+            return false;
+
+        var pos = 6;
+        while (pos < input.Length)
+        {
+            while (pos < input.Length && char.IsWhiteSpace(input[pos])) pos++;
+            if (pos == input.Length) break;
+            var nameStart = pos;
+            while (pos < input.Length && input[pos] is not ('=' or ',' or ' ' or '\t')) pos++;
+            if (pos == nameStart) return false;
+            var name = input[nameStart..pos];
+            if (!name.All(c => char.IsAsciiLetterOrDigit(c) || c == '-')) return false;
+            while (pos < input.Length && char.IsWhiteSpace(input[pos])) pos++;
+            if (pos == input.Length || input[pos++] != '=') return false;
+            while (pos < input.Length && char.IsWhiteSpace(input[pos])) pos++;
+            if (pos == input.Length) return false;
+
+            string value;
+            if (input[pos] == '"')
+            {
+                pos++;
+                var quoted = new StringBuilder();
+                var closed = false;
+                while (pos < input.Length)
+                {
+                    var c = input[pos++];
+                    if (c == '"') { closed = true; break; }
+                    if (c == '\\')
+                    {
+                        if (pos == input.Length) return false;
+                        c = input[pos++];
+                    }
+                    quoted.Append(c);
+                }
+                if (!closed) return false;
+                value = quoted.ToString();
+            }
+            else
+            {
+                var valueStart = pos;
+                while (pos < input.Length && input[pos] != ',' && !char.IsWhiteSpace(input[pos])) pos++;
+                value = input[valueStart..pos];
+                if (value.Length == 0 || !value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.')) return false;
+            }
+            if ((!allowEmptyValues && value.Length == 0) || parameters.Count >= 32 || !parameters.TryAdd(name, value)) return false;
+            while (pos < input.Length && char.IsWhiteSpace(input[pos])) pos++;
+            if (pos == input.Length) break;
+            if (input[pos++] != ',') return false;
+            while (pos < input.Length && char.IsWhiteSpace(input[pos])) pos++;
+            if (pos == input.Length) return false;
+        }
+        return parameters.Count > 0;
     }
 
     /// <summary>

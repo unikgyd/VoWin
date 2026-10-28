@@ -1,0 +1,20 @@
+{
+  "ServerIp": "192.168.50.2",
+  "WindowsIp": "192.168.50.10",
+  "BindAddress": "192.168.50.2",
+  "SipPort": 5060,
+  "WindowsPort": 5062,
+  "Realm": "vowin.local",
+  "MessageDomain": "192.168.50.2",
+  "TrunkUsername": "gateway",
+  "IncomingTarget": "600",
+  "EchoExtension": "700",
+  "Extensions": ["1001", "1002"],
+  "Lines": [{"Id": "module-a"}, {"Id": "module-b"}],
+  "DialRules": [
+    {"Pattern": "_81X.", "Strip": 2, "Prepend": "+", "LineId": "module-a"},
+    {"Pattern": "_82X.", "Strip": 2, "Prepend": "+", "LineId": "module-b"}
+  ],
+  "TrustedNetworks": ["192.168.50.0/24"],
+  "MessagesEnabled": false
+}

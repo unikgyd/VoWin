@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "source": "SimAdmin simadmin-sms-core scoring algorithm, GPL-3.0-or-later",
+  "cases": [
+    { "text": "验证码1837", "code": "1837" },
+    { "text": "验证码798236", "code": "798236" },
+    { "text": "【谷歌信息】G-248521是您的 Google 验证码", "code": "248521" },
+    { "text": "【大众点评】170426 (登录验证码，请完成验证)", "code": "170426" },
+    { "text": "【建设银行】序号01的验证码089053", "code": "089053" },
+    { "text": "订单号123456，验证码654321", "code": "654321" },
+    { "text": "Telegram code: 25322", "code": "25322" },
+    { "text": "Your code is 482910", "code": "482910" },
+    { "text": "验证码：１２３４５６", "code": "123456" },
+    { "text": "您的 WhatsApp 验证码: 161-675", "code": "161675" },
+    { "text": "[WeChat] Your Weixin is linking or verifying mobile number (035273). Don't forward the code!", "code": "035273" },
+    { "text": "[抖音] 2461 is your verification code, valid for 5 minutes.", "code": "2461" },
+    { "text": "🔐验证码 654321，请勿泄露", "code": "654321" },
+    { "text": "您的订单号123456已发货", "code": null },
+    { "text": "您的订单号123-456已发货", "code": null },
+    { "text": "余额123456元已到账", "code": null },
+    { "text": "手机号13800138000登录成功", "code": null },
+    { "text": "今天温度1234，湿度5678", "code": null },
+    { "text": "服务电话10086，剩余流量200GB", "code": null },
+    { "text": "123456", "code": null },
+    { "text": "", "code": null }
+  ]
+}

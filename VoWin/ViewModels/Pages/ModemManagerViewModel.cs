@@ -1407,9 +1407,12 @@ namespace VoWin.ViewModels.Pages
             _ => TokenMutedBg
         };
 
-        public string SelectedSlotSimStatusText => !string.IsNullOrEmpty(SelectedSlot?.Sim?.Imsi) ? "SIM Ready" : "未插卡";
-        public Brush SelectedSlotSimBrush => !string.IsNullOrEmpty(SelectedSlot?.Sim?.Imsi) ? TokenSuccess : TokenMuted;
-        public Brush SelectedSlotSimBg => !string.IsNullOrEmpty(SelectedSlot?.Sim?.Imsi) ? TokenSuccessBg : TokenMutedBg;
+        public IVoKernelService GatewayService => _kernelService;
+        private bool SelectedSimIsLive => SelectedSlot?.State is SlotState.Online or SlotState.Busy && !string.IsNullOrEmpty(SelectedSlot.Sim?.Imsi);
+        public string SelectedSlotSimStatusText => SelectedSimIsLive ? "SIM 已识别"
+            : !string.IsNullOrEmpty(SelectedSlot?.Sim?.Imsi) ? "SIM 资料已缓存" : "SIM 未就绪";
+        public Brush SelectedSlotSimBrush => SelectedSimIsLive ? TokenSuccess : TokenMuted;
+        public Brush SelectedSlotSimBg => SelectedSimIsLive ? TokenSuccessBg : TokenMutedBg;
 
         public string SelectedSlotRatText => SelectedSlot?.IsFlightMode == true
             ? "射频关闭"
@@ -1483,9 +1486,9 @@ namespace VoWin.ViewModels.Pages
 
         public string VoWifiActionText => IsBusy ? "处理中..." : (SelectedSlotVoWifiState switch
         {
-            VoWifiState.ImsRegistered or VoWifiState.IpsecTunnelEstablished => "断开连接",
-            VoWifiState.ConnectingIkev2 or VoWifiState.ResolvingEpdg or VoWifiState.AuthenticatingEapAka or VoWifiState.ImsRegistering => "取消连接",
-            VoWifiState.Failed => "重新连接",
+            VoWifiState.ImsRegistered or VoWifiState.IpsecTunnelEstablished => "断开 VoWiFi",
+            VoWifiState.ConnectingIkev2 or VoWifiState.ResolvingEpdg or VoWifiState.AuthenticatingEapAka or VoWifiState.ImsRegistering => "取消 VoWiFi",
+            VoWifiState.Failed => "重连 VoWiFi",
             _ => "连接 VoWiFi"
         });
 

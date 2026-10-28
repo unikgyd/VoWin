@@ -24,14 +24,15 @@ internal static class SipGatewaySdp
         return offer != null;
     }
 
-    public static string BuildOffer(IPAddress address, int rtpPort, int rtcpPort, byte payloadType = 8)
+    public static string BuildOffer(IPAddress address, int rtpPort, int rtcpPort, byte payloadType = 8, bool offerBoth = false)
     {
         var family = address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? "IP6" : "IP4";
         var codec = payloadType == 0 ? "PCMU" : "PCMA";
         var sessionId = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         return $"v=0\r\no=VoWin {sessionId} {sessionId} IN {family} {address}\r\n" +
                $"s=VoWin SIP Gateway\r\nc=IN {family} {address}\r\nt=0 0\r\n" +
-               $"m=audio {rtpPort} RTP/AVP {payloadType} 101\r\na=rtcp:{rtcpPort}\r\n" +
+               $"m=audio {rtpPort} RTP/AVP {(offerBoth ? "8 0" : payloadType.ToString())} 101\r\na=rtcp:{rtcpPort}\r\n" +
+               (offerBoth ? "a=rtpmap:0 PCMU/8000\r\n" : "") +
                $"a=rtpmap:{payloadType} {codec}/8000\r\na=rtpmap:101 telephone-event/8000\r\n" +
                "a=fmtp:101 0-15\r\na=ptime:20\r\na=sendrecv\r\n";
     }

@@ -13,6 +13,20 @@ public class ModemDriver : IAsyncDisposable
     private readonly AtSession _session;
     private readonly IQmiModemReader? _qmi;
     private volatile bool _qmiDisabled;
+    private volatile ModemControlPreference _controlPreference;
+    private volatile bool _qmiNeedsReverification;
+    public ModemControlPreference ControlPreference
+    {
+        get => _controlPreference;
+        set
+        {
+            if (!Enum.IsDefined(value)) throw new ArgumentOutOfRangeException(nameof(value));
+            if (value == ModemControlPreference.QmiPreferred && _controlPreference == ModemControlPreference.AtOnly)
+                _qmiNeedsReverification = true;
+            _controlPreference = value;
+        }
+    }
+    private bool PreferQmi => ControlPreference == ModemControlPreference.QmiPreferred && !_qmiDisabled;
     private readonly AsyncEventBus? _eventBus;
     private volatile bool _isRadioStateKnown;
     private volatile bool _isRadioDisabled;
@@ -52,7 +66,7 @@ public class ModemDriver : IAsyncDisposable
     public string PortName => _session.PortName;
     public AtSession Session => _session;
     public bool HasQmiEndpoint => _qmi is not null;
-    public bool IsQmiActive => _qmi is not null && !_qmiDisabled;
+    public bool IsQmiActive => _qmi is not null && PreferQmi;
     public string? LastQmiFallbackReason { get; private set; }
     public string? FirmwareRevision { get; private set; }
 
@@ -66,7 +80,8 @@ public class ModemDriver : IAsyncDisposable
     /// </summary>
     public async Task<IsimIdentityProbeResult?> TryProbeQmiIsimIdentityAsync(CancellationToken ct = default)
     {
-        if (_qmiDisabled || _qmi is not IQmiIsimReader isim) return null;
+        if (!PreferQmi || _qmi is not IQmiIsimReader isim) return null;
+        if (!await VerifyQmiCardBindingAsync(ct).ConfigureAwait(false)) return null;
         try
         {
             var result = await isim.ReadIsimIdentityAsync(ct).ConfigureAwait(false);
@@ -86,17 +101,20 @@ public class ModemDriver : IAsyncDisposable
     }
 
     /// <summary>Does not retry a transmitted AKA vector through AT on QMI failure.</summary>
-    public Task<AkaResult> AuthenticateQmiIsimAkaAsync(AkaChallenge challenge, CancellationToken ct = default)
+    public async Task<AkaResult> AuthenticateQmiIsimAkaAsync(AkaChallenge challenge, CancellationToken ct = default)
     {
         if (_qmiDisabled || _qmi is not IQmiIsimReader isim)
             throw new InvalidOperationException("QMI ISIM is not available for this modem slot.");
-        return isim.AuthenticateIsimAsync(challenge, ct);
+        if (!await VerifyQmiCardBindingAsync(ct).ConfigureAwait(false))
+            throw new InvalidOperationException("QMI ISIM AKA requires a verified matching AT modem.");
+        return await isim.AuthenticateIsimAsync(challenge, ct).ConfigureAwait(false);
     }
 
     /// <summary>Checks QMI USIM capability before a network AKA challenge is consumed.</summary>
     public async Task<bool> TryCanAuthenticateQmiUsimAsync(CancellationToken ct = default)
     {
-        if (_qmiDisabled || _qmi is not IQmiUsimReader usim) return false;
+        if (!PreferQmi || _qmi is not IQmiUsimReader usim) return false;
+        if (!await VerifyQmiCardBindingAsync(ct).ConfigureAwait(false)) return false;
         try
         {
             var available = await usim.CanAuthenticateUsimAsync(ct).ConfigureAwait(false);
@@ -113,11 +131,13 @@ public class ModemDriver : IAsyncDisposable
     }
 
     /// <summary>Never replays a sent QMI AKA challenge through AT on failure.</summary>
-    public Task<AkaResult> AuthenticateQmiUsimAkaAsync(AkaChallenge challenge, CancellationToken ct = default)
+    public async Task<AkaResult> AuthenticateQmiUsimAkaAsync(AkaChallenge challenge, CancellationToken ct = default)
     {
         if (_qmiDisabled || _qmi is not IQmiUsimReader usim)
             throw new InvalidOperationException("QMI USIM is not available for this modem slot.");
-        return usim.AuthenticateUsimAsync(challenge, ct);
+        if (!await VerifyQmiCardBindingAsync(ct).ConfigureAwait(false))
+            throw new InvalidOperationException("QMI USIM AKA requires a verified matching AT modem.");
+        return await usim.AuthenticateUsimAsync(challenge, ct).ConfigureAwait(false);
     }
 
     /// <summary>Runs IMS AKA against ADF.ISIM when the card provisions an ISIM application.</summary>
@@ -146,7 +166,7 @@ public class ModemDriver : IAsyncDisposable
         {
             // Disable AT echo
             await _session.ExecuteCommandAsync("ATE0", 1000, ct).ConfigureAwait(false);
-            if (_qmi is not null && !_qmiDisabled)
+            if (_qmi is not null && PreferQmi)
                 await VerifyQmiMatchesAtModemAsync(ct).ConfigureAwait(false);
             return true;
         }
@@ -159,8 +179,19 @@ public class ModemDriver : IAsyncDisposable
         Func<T, bool> isUsable,
         CancellationToken ct)
     {
-        if (!_qmiDisabled && qmiRead is not null)
+        if (PreferQmi && qmiRead is not null)
         {
+            if (_qmiNeedsReverification)
+            {
+                // Re-enabling QMI must not bypass the physical-modem binding that AT-only ping skipped.
+                if (!_session.IsOpen)
+                {
+                    LastQmiFallbackReason = "QMI re-enable awaits an open AT channel for modem binding verification.";
+                    return await atRead(ct).ConfigureAwait(false);
+                }
+                await VerifyQmiMatchesAtModemAsync(ct).ConfigureAwait(false);
+                if (_qmiDisabled) return await atRead(ct).ConfigureAwait(false);
+            }
             try
             {
                 var value = await qmiRead(ct).ConfigureAwait(false);
@@ -193,13 +224,25 @@ public class ModemDriver : IAsyncDisposable
         IsDecimalIdentifier(atImei, 15, 15) &&
         string.Equals(qmiImei, atImei, StringComparison.Ordinal);
 
+    private async Task<bool> VerifyQmiCardBindingAsync(CancellationToken ct)
+    {
+        if (_qmiDisabled || _qmi is null) return false;
+        if (!_session.IsOpen)
+        {
+            LastQmiFallbackReason = "QMI card access requires an open AT channel for physical modem identity verification.";
+            return false;
+        }
+        await VerifyQmiMatchesAtModemAsync(ct).ConfigureAwait(false);
+        return !_qmiDisabled;
+    }
+
     private async Task VerifyQmiMatchesAtModemAsync(CancellationToken ct)
     {
         try
         {
             var qmiImei = await _qmi!.GetImeiAsync(ct).ConfigureAwait(false);
             var atImei = await GetImeiFromAtAsync(ct).ConfigureAwait(false);
-            if (SameModemImei(qmiImei, atImei)) return;
+            if (SameModemImei(qmiImei, atImei)) { _qmiNeedsReverification = false; return; }
             _qmiDisabled = true;
             LastQmiFallbackReason = "QMI and AT modem identities do not match; using AT for this slot.";
         }
@@ -256,7 +299,7 @@ public class ModemDriver : IAsyncDisposable
     {
         var simInserted = await GetSimInsertedAsync(ct).ConfigureAwait(false);
         HostImsProbeResult? qmiProbe = null;
-        var qmiReader = _qmi;
+        var qmiReader = PreferQmi ? _qmi : null;
         IReadOnlyList<QmiImsProfile> qmiProfiles = [];
         var qmiProfilesChecked = false;
 
@@ -362,15 +405,25 @@ public class ModemDriver : IAsyncDisposable
         if (!activeResponse.Success && runtime.Length == 0) failedQueries.Add("AT+CGACT?");
         if (!runtimeResponse.Success && HostImsPdnParser.IsRuntimeQueryFailureCritical(configured, activation))
             failedQueries.Add("AT+CGCONTRDP");
-        var hostAddresses = HostImsPdnParser.GetHostAddresses();
+        var pppAddresses = HostImsPdnParser.GetActiveImsPppAddresses();
+        string? expectedPppEntry = null;
+        if (pppAddresses.Any(p => p.InterfaceName != HostImsBearerIdentity.LegacyEntryName))
+        {
+            // A shared IMS /64 does not identify the physical modem. Match the
+            // owner's per-IMEI entry before accepting Windows PPP addresses.
+            expectedPppEntry = HostImsBearerIdentity.EntryForImei(await GetImeiAsync(ct).ConfigureAwait(false));
+            pppAddresses = pppAddresses.Where(p => p.InterfaceName == expectedPppEntry).ToArray();
+        }
+        var hostAddresses = HostImsPdnParser.GetHostAddresses(expectedPppEntry);
         var ids = configured.Select(item => item.ContextId).Concat(runtime.Select(item => item.ContextId)).Distinct().Order().ToArray();
         var contexts = ids.Select(cid =>
         {
             var profile = configured.FirstOrDefault(item => item.ContextId == cid);
             var live = runtime.FirstOrDefault(item => item.ContextId == cid);
-            var localAddresses = live?.LocalAddresses ?? [];
-            var interfaces = localAddresses
-                .Where(hostAddresses.ContainsKey)
+            var modemAddresses = live?.LocalAddresses ?? [];
+            var hostOwned = HostImsPdnParser.ResolveHostOwnedAddresses(modemAddresses, hostAddresses, pppAddresses);
+            var localAddresses = modemAddresses.Concat(hostOwned).Distinct().ToArray();
+            var interfaces = hostOwned
                 .SelectMany(address => hostAddresses[address])
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
@@ -385,7 +438,7 @@ public class ModemDriver : IAsyncDisposable
                 live?.PcscfServers ?? [],
                 interfaces)
             {
-                HostOwnedAddresses = localAddresses.Where(hostAddresses.ContainsKey).ToArray()
+                HostOwnedAddresses = hostOwned
             };
         }).ToArray();
 
@@ -426,7 +479,8 @@ public class ModemDriver : IAsyncDisposable
         };
     }
 
-    private string DescribeControlStack() => _qmi is null
+    private string DescribeControlStack() => ControlPreference == ModemControlPreference.AtOnly
+        ? "AT（设置指定）" : _qmi is null
         ? "AT（未配置 QMI 端点）"
         : _qmiDisabled
             ? $"AT（QMI 已停用：{LastQmiFallbackReason ?? "身份核验失败"}）"
@@ -708,10 +762,11 @@ public class ModemDriver : IAsyncDisposable
     {
         foreach (var data in ExtractSuccessfulCrsmData(lines))
         {
-            if (data.Length < 2)
+            if (data.Length < 8 || (data.Length & 1) != 0)
                 continue;
-            var finalOctet = Convert.ToByte(data[^2..], 16);
-            var mncLength = finalOctet & 0x0F;
+            // TS 31.102 4.2.18: octet 4 owns the MNC length. A full-file
+            // response may contain RFU extension octets after it.
+            var mncLength = Convert.ToByte(data.Substring(6, 2), 16) & 0x0F;
             if (mncLength is 2 or 3)
                 return mncLength;
         }
@@ -792,9 +847,12 @@ public class ModemDriver : IAsyncDisposable
                 RegexOptions.IgnoreCase);
             if (!match.Success)
                 continue;
-            var sw1 = int.Parse(match.Groups["sw1"].Value);
-            var sw2 = int.Parse(match.Groups["sw2"].Value);
-            if (sw1 is 144 or 145 or 159 && sw2 == 0)
+            if (!byte.TryParse(match.Groups["sw1"].Value, out var sw1) ||
+                !byte.TryParse(match.Groups["sw2"].Value, out var sw2))
+                continue;
+            // 91xx completes the read and separately advertises a proactive
+            // UICC command (ETSI TS 102 221 10.2.1.1). Do not initiate FETCH.
+            if (sw1 == 145 || sw1 is 144 or 159 && sw2 == 0)
                 yield return match.Groups["data"].Value;
         }
     }
@@ -1331,6 +1389,10 @@ public class ModemDriver : IAsyncDisposable
     {
         return await _session.ExecutePromptCommandAsync($"AT+CMGS={tpduLength}", pduHex, promptTimeoutMs: 3000, completionTimeoutMs: 15000, ct: ct).ConfigureAwait(false);
     }
+
+    public Task<AtResponse> SendPduWithPromptGuardedAsync(int tpduLength, string pduHex, Action beforePayloadWrite, CancellationToken ct = default) =>
+        _session.ExecutePromptCommandGuardedAsync($"AT+CMGS={tpduLength}", pduHex, beforePayloadWrite,
+            promptTimeoutMs: 3000, completionTimeoutMs: 15000, ct: ct);
 
 
     /// <summary>

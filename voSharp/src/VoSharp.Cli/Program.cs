@@ -1,8 +1,11 @@
 using VoSharp.Common.Events;
 using VoSharp.Kernel;
 using VoSharp.Kernel.Ipc;
+using VoSharp.Kernel.Persistence;
 using VoSharp.Modem;
 using VoSharp.StateMachine;
+using VoSharp.Telephony.Sms;
+using System.Text.RegularExpressions;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 Console.WriteLine("==========================================================");
@@ -12,6 +15,11 @@ Console.WriteLine("==========================================================");
 
 bool clientMode = args.Contains("--client");
 bool traceMode = args.Contains("--trace");
+if (args.Contains("--list-mics"))
+{
+    Console.WriteLine(CliMicrophoneCapture.ListDevices());
+    return;
+}
 
 if (clientMode)
 {
@@ -24,7 +32,9 @@ if (clientMode)
         while (true)
         {
             Console.Write("voSharp-cli> ");
-            var input = Console.ReadLine()?.Trim();
+            var line = Console.ReadLine();
+            if (line is null) break;
+            var input = line.Trim();
             if (string.IsNullOrEmpty(input)) continue;
             if (input is "quit" or "exit") break;
 
@@ -40,7 +50,15 @@ if (clientMode)
 }
 
 // Daemon / Host Mode
-await using var kernel = new VoKernel();
+await using var kernel = new VoKernel(ikeRetry: IkeRetryStorage.CreateDefaultGate());
+using var microphone = new CliMicrophoneCapture(kernel);
+var answerOnce = new CliHostImsAnswerOnce(kernel, microphone);
+kernel.CallEnded += (_, ended) =>
+{
+    microphone.StopForCall(ended.CallId);
+    answerOnce.OnEnded(ended);
+};
+kernel.CallConnected += (_, connected) => answerOnce.OnConnected(connected);
 
 if (traceMode)
 {
@@ -86,6 +104,18 @@ kernel.StateMachine.OnEnter(TelephonyState.CallEnded, (from, to, payload) =>
     Console.WriteLine($"[State] Transition -> {to} (Call ended)");
     Console.ResetColor();
 });
+
+kernel.IncomingCall += (_, incoming) =>
+{
+    var autoAnswering = answerOnce.OnIncoming(incoming);
+    var suffix = incoming.CallerNumber.Length <= 4
+        ? "****" : $"***{incoming.CallerNumber[^4..]}";
+    Console.ForegroundColor = ConsoleColor.Yellow;
+    Console.WriteLine($"\n[INCOMING CALL] {suffix} on {incoming.SlotId ?? "modem"}; " +
+        (autoAnswering ? "one-shot Host IMS answer triggered." : "use 'answer' to accept."));
+    Console.ResetColor();
+    Console.Write("voSharp> ");
+};
 
 kernel.EventBus.Subscribe("sms.received", ev =>
 {
@@ -207,7 +237,7 @@ Console.WriteLine("  euicc info                    - Query eUICC chip capabiliti
 Console.WriteLine("  sms list [all|unread|read]    - List stored SMS messages");
 Console.WriteLine("  sms read <index>              - Read SMS message by index");
 Console.WriteLine("  sms delete <index|all>        - Delete SMS message by index or all");
-Console.WriteLine("  sms send <num> <text>         - Send 3GPP PDU SMS (e.g. sms send 10086 CXCX)");
+Console.WriteLine("  sms send <num> <text> --host-ims --no-receipt - Experimental Windows IMS MO SMS; RP-ACK is not handset delivery");
 Console.WriteLine("  vowifi status                 - Check VoWiFi & IMS registration status");
 Console.WriteLine("  vowifi start [epdg] [--force-natt] [--local-address <ip>] - Establish VoWiFi; diagnostic switches force UDP/4500 or a local NIC address");
 Console.WriteLine("  vowifi stop                   - Disconnect VoWiFi tunnel");
@@ -215,11 +245,16 @@ Console.WriteLine("  vowifi info                   - Query 3GPP ePDG FQDN & reso
 Console.WriteLine("  call dial <num> / call <num>  - Dial phone call via VoWiFi SIP/RTP with live PC audio (e.g. call 185)");
 Console.WriteLine("  call hangup / hangup          - Terminate active call and save WAV audio recording");
 Console.WriteLine("  call dtmf <digit>             - Send in-band / SIP INFO DTMF tone during call");
+Console.WriteLine("  mic list|start [index]|stop|status - Explicit host microphone for an active Host IMS call");
+Console.WriteLine("  answer-next <caller> [--mic]|status|off - Answer one exact Host IMS caller within 10 minutes");
 Console.WriteLine("  sip-gateway start --bind <WG-IP> --user <ext> --password <pwd> [--port 5060]");
 Console.WriteLine("  sip-gateway status|stop       - Inspect or stop the private SIP/RTP bridge");
 Console.WriteLine("  host-ims probe                - Read-only IMS PDN/P-CSCF and Windows-route capability probe");
 Console.WriteLine("  host-ims status|stop          - Inspect or stop experimental Host IMS registration");
-Console.WriteLine("  host-ims register [--cid N --local IP --pcscf IP] - Experimental ISIM/USIM AKA registration over an already host-owned IMS bearer");
+Console.WriteLine("  host-ims media-status         - Read RTP send/receive/decoded counters for the active Host IMS call");
+Console.WriteLine("  host-ims register [--cid N --local IP --pcscf IP] [--userspace-esp] [--sms-receive] - Optional experimental MT SMS receiver");
+Console.WriteLine("  host-ims bearer-start|bearer-status|bearer-stop - Guarded Windows IMS PPP lease (requires VOWIN_HOST_IMS_PPP_OWNER)");
+Console.WriteLine("  host-ims bearer-route-check    - Verify PPP route-control on the existing P-CSCF /128 without SIP traffic");
 Console.WriteLine("  reboot                        - Reboot modem baseband (AT+CFUN=1,1)");
 Console.WriteLine("  dtmf <digit>                  - Send modem hardware DTMF tone");
 Console.WriteLine("  mmi <code>                    - Parse & execute MMI code (e.g. mmi *#06#)");
@@ -227,15 +262,124 @@ Console.WriteLine("  aka <rand> <autn>             - Execute 3GPP Milenage AKA e
 Console.WriteLine("  reset                         - Reset state machine to INIT");
 Console.WriteLine("  quit / exit                   - Terminate voSharp Kernel\n");
 
+Task? pendingHostImsDial = null;
 while (true)
 {
     Console.Write("voSharp> ");
-    var input = Console.ReadLine()?.Trim();
+    var line = Console.ReadLine();
+    if (line is null) break;
+    var input = line.Trim();
     if (string.IsNullOrEmpty(input)) continue;
     if (input is "quit" or "exit")
     {
         Console.WriteLine("Shutting down voSharp kernel daemon...");
         break;
+    }
+
+    if (input.Equals("mic", StringComparison.OrdinalIgnoreCase) ||
+        input.StartsWith("mic ", StringComparison.OrdinalIgnoreCase))
+    {
+        try
+        {
+            var micParts = input.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var message = micParts.Length switch
+            {
+                2 when micParts[1].Equals("list", StringComparison.OrdinalIgnoreCase) => CliMicrophoneCapture.ListDevices(),
+                2 when micParts[1].Equals("status", StringComparison.OrdinalIgnoreCase) => microphone.Status(),
+                2 when micParts[1].Equals("stop", StringComparison.OrdinalIgnoreCase) => StopMicrophone(),
+                2 when micParts[1].Equals("start", StringComparison.OrdinalIgnoreCase) => microphone.Start(),
+                3 when micParts[1].Equals("start", StringComparison.OrdinalIgnoreCase) &&
+                    int.TryParse(micParts[2], out var device) => microphone.Start(device),
+                _ => "Usage: mic list|start [device-index]|stop|status"
+            };
+            Console.WriteLine(message);
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[Microphone] {ex.Message}");
+            Console.ResetColor();
+        }
+        continue;
+    }
+
+    if (input.Equals("answer-next", StringComparison.OrdinalIgnoreCase) ||
+        input.StartsWith("answer-next ", StringComparison.OrdinalIgnoreCase))
+    {
+        try
+        {
+            var parts = input.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var message = parts.Length switch
+            {
+                2 when parts[1].Equals("status", StringComparison.OrdinalIgnoreCase) => answerOnce.Status(),
+                2 when parts[1].Equals("off", StringComparison.OrdinalIgnoreCase) => answerOnce.Disarm(),
+                2 => answerOnce.ArmForCaller(parts[1], startMicrophone: false),
+                3 when parts[2].Equals("--mic", StringComparison.OrdinalIgnoreCase) =>
+                    answerOnce.ArmForCaller(parts[1], startMicrophone: true),
+                _ => "Usage: answer-next <caller> [--mic]|status|off"
+            };
+            Console.WriteLine(message);
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[Host IMS] {ex.Message}");
+            Console.ResetColor();
+        }
+        continue;
+    }
+
+    if (input.Equals("host-ims media-status", StringComparison.OrdinalIgnoreCase))
+    {
+        var slot = kernel.Pool.ActiveSlot;
+        var stats = slot?.Calls.IsHostImsCall == true ? slot.Calls.GetMediaStats() : null;
+        var playback = stats?.Playback is { } output
+            ? $"playback-open={output.IsOpen}, MMRESULT={output.OpenResult}, " +
+              $"queued={output.FramesQueued}, written={output.FramesWritten}, " +
+              $"dropped={output.FramesDropped}, write-errors={output.WriteErrors}"
+            : "playback=not configured";
+        Console.WriteLine(stats is null
+            ? "No active Host IMS media session."
+            : $"Host IMS media: state={slot!.Calls.State}, codec={slot.Calls.ActiveCall?.Codec ?? "pending"}, " +
+              $"RTP sent={stats.PacketsSent}, received={stats.PacketsReceived}, " +
+              $"decoded={stats.AudioFramesDecoded}, send-errors={stats.SendErrors}; " +
+              $"{playback}; {microphone.Status()}");
+        continue;
+    }
+
+    // Keep the REPL responsive while a Host IMS INVITE is in the early dialog.
+    // The network can ring for minutes; the operator must still be able to
+    // issue `call hangup` (CANCEL) without closing the process or bearer.
+    var callWords = input.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    var isCallDial = callWords.Length >= 2 &&
+        (callWords[0].Equals("call", StringComparison.OrdinalIgnoreCase) ||
+         callWords[0].Equals("dial", StringComparison.OrdinalIgnoreCase)) &&
+        !new[] { "hangup", "stop", "end", "cancel", "answer", "accept", "reject",
+            "decline", "status", "info", "dtmf" }
+            .Contains(callWords[1], StringComparer.OrdinalIgnoreCase) &&
+        !callWords.Contains("--force-cellular", StringComparer.OrdinalIgnoreCase);
+    if (isCallDial && kernel.Pool.ActiveSlot?.GetHostImsRegistrationStatus().IsRegistered == true)
+    {
+        if (pendingHostImsDial is { IsCompleted: false })
+        {
+            Console.WriteLine("A Host IMS dial is already pending; use `call hangup` to cancel it.");
+            continue;
+        }
+        var command = input;
+        pendingHostImsDial = Task.Run(async () =>
+        {
+            try
+            {
+                var dialResult = await kernel.ExecuteCommandAsync(command).ConfigureAwait(false);
+                Console.WriteLine(dialResult.Success ? dialResult.ToJson() : $"[Error] {dialResult.Message}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Host IMS dial] {ex.Message}");
+            }
+        });
+        Console.WriteLine("Host IMS dial started; `call hangup` remains available during ringing.");
+        continue;
     }
 
     var result = await kernel.ExecuteCommandAsync(input);
@@ -249,6 +393,22 @@ while (true)
     {
         Console.ForegroundColor = ConsoleColor.Red;
         Console.WriteLine($"[Error] {result.Message}");
+        if (result.Data is SmsSubmitResult sms &&
+            sms.PartResults.Any(part => part.AtResponse is not null))
+        {
+            var modemReply = sms.PartResults.LastOrDefault()?.AtResponse ?? string.Empty;
+            var modemError = Regex.Match(modemReply,
+                @"\+(?:CMS|CME) ERROR:[^\r\n]*|(?:^|\n)ERROR\b", RegexOptions.IgnoreCase);
+            Console.WriteLine(modemError.Success
+                ? $"[SMS modem diagnostic] {modemError.Value.Trim()}"
+                : "[SMS modem diagnostic] No specific CMS/CME error was returned before failure.");
+        }
         Console.ResetColor();
     }
+}
+
+string StopMicrophone()
+{
+    microphone.Stop();
+    return "Microphone capture stopped.";
 }

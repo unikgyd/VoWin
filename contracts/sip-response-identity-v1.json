@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "expected_call_id": "Opaque-Call-A",
+  "expected_from_tag": "OpaqueTagA",
+  "cases": [
+    {
+      "name": "success",
+      "call_id": "Opaque-Call-A",
+      "from_tag": "OpaqueTagA",
+      "status": 200,
+      "accept": true
+    },
+    {
+      "name": "provisional",
+      "call_id": "Opaque-Call-A",
+      "from_tag": "OpaqueTagA",
+      "status": 100,
+      "accept": true
+    },
+    {
+      "name": "wrong-call-id-case",
+      "call_id": "opaque-call-a",
+      "from_tag": "OpaqueTagA",
+      "status": 200,
+      "accept": false
+    },
+    {
+      "name": "wrong-from-tag-case",
+      "call_id": "Opaque-Call-A",
+      "from_tag": "opaquetaga",
+      "status": 200,
+      "accept": false
+    },
+    {
+      "name": "missing-from-tag",
+      "call_id": "Opaque-Call-A",
+      "from_tag": "",
+      "status": 200,
+      "accept": false
+    },
+    {
+      "name": "wrong-from-tag",
+      "call_id": "Opaque-Call-A",
+      "from_tag": "other",
+      "status": 200,
+      "accept": false
+    },
+    {
+      "name": "duplicate-from-header",
+      "call_id": "Opaque-Call-A",
+      "from_tag": "OpaqueTagA",
+      "status": 200,
+      "duplicate_from": true,
+      "accept": false
+    },
+    {
+      "name": "duplicate-from-tag",
+      "call_id": "Opaque-Call-A",
+      "from_tag": "OpaqueTagA;tag=OpaqueTagA",
+      "status": 200,
+      "accept": false
+    },
+    {
+      "name": "invalid-status",
+      "call_id": "Opaque-Call-A",
+      "from_tag": "OpaqueTagA",
+      "status": 900,
+      "accept": false
+    }
+  ]
+}

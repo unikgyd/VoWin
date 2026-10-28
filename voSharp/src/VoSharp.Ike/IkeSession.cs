@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Net;
+using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
@@ -36,7 +37,10 @@ public sealed record IkeSessionRequest(
     Action<string>? DiagnosticLog = null,
     bool ForceNatt = false,
     IPAddress? LocalAddress = null,
-    byte EapMethod = EapType.Aka
+    byte EapMethod = EapType.Aka,
+    IkeResponderAuthenticationOptions? ResponderAuthentication = null,
+    Func<IPAddress, CancellationToken, Task>? BeforeInitialSend = null,
+    Func<IkeNetworkRejection, IPAddress, CancellationToken, Task>? ObserveNetworkRejection = null
 );
 
 public sealed record IkeSessionResult(
@@ -59,7 +63,18 @@ public sealed record IkeSessionResult(
     bool EapSucceeded = false,
     IkeAddressFamilyMode AddressFamilyMode = IkeAddressFamilyMode.Ipv6,
     IkeSessionController? Controller = null,
-    byte? RequestedEapType = null
+    byte? RequestedEapType = null,
+    bool RetryableTransportFailure = false,
+    bool RetryableAddressFamilyFailure = false,
+    IkeChildPolicy? ChildPolicy = null,
+    bool RetryableIdentityRejection = false,
+    bool RetryableInitialTimeout = false,
+    bool RetryableInitialProposal = false,
+    bool PreEapFamilyFailure = false,
+    bool FinalAuthVerified = false,
+    bool FailureCleanupComplete = false,
+    bool InitialResponderAuthVerified = false,
+    IkeNetworkRejection? NetworkRejection = null
 );
 
 /// <summary>
@@ -112,17 +127,43 @@ public static class IkeSession
             throw new ArgumentException("All IKE proposals in one IKE_SA_INIT must use the KE payload's DH group.", nameof(request));
 
         var socksClient = request.Socks5Client ?? VoSharp.Ike.Transport.Socks5Client.TryParse(request.ProxyUrl);
-        var transport = new IkeTransport(
-            request.EpdgIp,
-            initialPort: request.EpdgPort,
-            socks5Client: socksClient,
-            diagnosticLog: message => request.DiagnosticLog?.Invoke(message),
-            localAddress: request.LocalAddress);
+        IkeTransport? transport = null;
         var eapSucceeded = false;
+        var retryableFamilyFailure = false;
+        var preEapFamilyFailure = false;
+        var backoffSeen = false;
+        var finalAuthVerified = false;
+        var initialResponderAuthVerified = false;
+        IkeNetworkRejection? networkRejection = null;
+        var initialTimeout = false;
+        var initialRouteFailure = false;
+        var initialProposalFailure = false;
+        var identityRejectedBeforeChallenge = false;
+        Func<CancellationToken, Task>? deletePendingIke = null;
+        uint nextCleanupMessageId = 1;
         var stage = "IKE_SA_INIT";
+        IkeKeys? ownedIkeKeys = null;
+        byte[][]? uncommittedChildKeys = null;
+        var temporarySecrets = new List<byte[]>();
+        byte[] Secret(byte[] value) { temporarySecrets.Add(value); return value; }
         void Trace(string message) => request.DiagnosticLog?.Invoke(message);
         try
         {
+            ct.ThrowIfCancellationRequested();
+            try { transport = new IkeTransport(request.EpdgIp, initialPort: request.EpdgPort,
+                socks5Client: socksClient, diagnosticLog: message => request.DiagnosticLog?.Invoke(message),
+                localAddress: request.LocalAddress, beforeInitialSend: request.BeforeInitialSend); }
+            catch (Exception error) { initialRouteFailure = IsRouteFailure(error); throw; }
+            async Task<byte[]> ExchangeInit(byte[] packet)
+            {
+                try { return await transport.RoundTripAsync(packet, ct).ConfigureAwait(false); }
+                catch (Exception error)
+                {
+                    initialTimeout = error is TimeoutException;
+                    initialRouteFailure = IsRouteFailure(error);
+                    throw;
+                }
+            }
             if (request.ForceNatt)
             {
                 transport.FloatTo4500();
@@ -162,7 +203,8 @@ public static class IkeSession
                 new(IkePayloadType.Nonce, initiatorNonce),
                 MakeNotify(NotifyNatDetectionSourceIp, natSrcHash),
                 MakeNotify(NotifyNatDetectionDestinationIp, natDstHash),
-                MakeNotify(NotifyIkeFragmentationSupported, Array.Empty<byte>())
+                MakeNotify(NotifyIkeFragmentationSupported, Array.Empty<byte>()),
+                MakeNotify(IkeResponderAuthentication.SignatureHashAlgorithms, [0, 2, 0, 3, 0, 4])
             };
 
             var initRequest = new IkeWire.IkeMessage
@@ -177,41 +219,47 @@ public static class IkeSession
 
             var initReqBytes = IkeWire.SerializeMessage(initRequest);
             Trace($"IKE stage=IKE_SA_INIT send; endpoint-family={request.EpdgIp.AddressFamily}; port={request.EpdgPort}; dh={ikeSuite.DhGroupId}; proposals={ikeSuites.Count()}; proxy={socksClient is not null}; packet-bytes={initReqBytes.Length}.");
-            var initRespBytes = await transport.RoundTripAsync(initReqBytes, ct).ConfigureAwait(false);
+            var initRespBytes = await ExchangeInit(initReqBytes).ConfigureAwait(false);
             var initResp = IkeWire.ParseMessage(initRespBytes);
             ValidateHandshakeResponse(initResp, initiatorSpi, 0, IkeExchangeType.IkeSaInit, 0, allowZeroResponderSpi: true);
 
             // RFC 7296 section 2.6: a responder under load can remain
-            // stateless and answer IKE_SA_INIT with N(COOKIE), SPIr=0. Retry
+            // stateless and answer IKE_SA_INIT with N(COOKIE), usually SPIr=0.
+            // A nonzero response SPI alone does not invalidate the challenge. Retry
             // message ID 0 with that Notify as the first payload and leave
             // SA, KE, Ni and the remaining notifications unchanged.
-            for (var cookieAttempt = 0; initResp.ResponderSpi == 0 && cookieAttempt < 3; cookieAttempt++)
+            for (var cookieAttempt = 0; ; cookieAttempt++)
             {
-                var cookiePayload = initResp.Payloads.FirstOrDefault(payload =>
-                    payload.Type == IkePayloadType.Notify &&
-                    payload.Body.Length is >= 5 and <= 68 &&
-                    BinaryPrimitives.ReadUInt16BigEndian(payload.Body.AsSpan(2, 2)) == NotifyCookie);
+                var cookiePayload = ReadInitCookie(initResp);
                 if (cookiePayload == null)
                     break;
+                if (cookieAttempt >= 3)
+                    throw new IkeFormatException("ePDG requested too many COOKIE challenges.");
 
                 initRequest.Payloads.Clear();
                 initRequest.Payloads.Add(MakeNotify(NotifyCookie, cookiePayload.Body[4..]));
                 initRequest.Payloads.AddRange(initPayloads);
                 initReqBytes = IkeWire.SerializeMessage(initRequest);
                 Trace($"IKE stage=IKE_SA_INIT retry-cookie; attempt={cookieAttempt + 1}; packet-bytes={initReqBytes.Length}.");
-                initRespBytes = await transport.RoundTripAsync(initReqBytes, ct).ConfigureAwait(false);
+                initRespBytes = await ExchangeInit(initReqBytes).ConfigureAwait(false);
                 initResp = IkeWire.ParseMessage(initRespBytes);
                 ValidateHandshakeResponse(initResp, initiatorSpi, 0, IkeExchangeType.IkeSaInit, 0, allowZeroResponderSpi: true);
             }
 
+            // RFC 7296 2.6 also accepts these error responses with a nonzero
+            // responder SPI. The precise Notify, not SPI allocation, proves it.
+            if (IsInitialProposalRejection(initResp.Payloads))
+            {
+                initialProposalFailure = true;
+                throw new IkeFormatException(DescribeIkeSaInitError(initResp.Payloads));
+            }
             if (initResp.ResponderSpi == 0)
                 throw new IkeFormatException(DescribeIkeSaInitError(initResp.Payloads));
 
             var responderSpi = initResp.ResponderSpi;
 
             // Extract selected proposal and peer KE / Nonce
-            var chosenSaPayload = initResp.Payloads.FirstOrDefault(p => p.Type == IkePayloadType.SecurityAssociation)
-                ?? throw new IkeFormatException("IKE_SA_INIT response missing SA payload.");
+            var chosenSaPayload = RequireSingleInitPayload(initResp, IkePayloadType.SecurityAssociation);
             var chosenProposals = IkeWire.DecodeProposals(chosenSaPayload.Body);
             if (chosenProposals.Count != 1)
                 throw new IkeFormatException("IKE_SA_INIT response must select exactly one proposal.");
@@ -219,8 +267,7 @@ public static class IkeSession
             var negotiatedSuite = IkeSuite.FromProposal(chosenProposals[0]);
             ValidateChosenSuite(chosenProposals[0].ProposalNumber, negotiatedSuite, ikeSuites);
 
-            var peerKePayload = initResp.Payloads.FirstOrDefault(p => p.Type == IkePayloadType.KeyExchange)
-                ?? throw new IkeFormatException("IKE_SA_INIT response missing KE payload.");
+            var peerKePayload = RequireSingleInitPayload(initResp, IkePayloadType.KeyExchange);
             if (peerKePayload.Body.Length < 4)
                 throw new IkeFormatException("IKE_SA_INIT response KE payload is truncated.");
 
@@ -228,15 +275,24 @@ public static class IkeSession
             if (peerDhGroup != negotiatedSuite.DhGroupId)
                 throw new IkeFormatException($"Peer chose DH group {peerDhGroup} which differs from KE group {negotiatedSuite.DhGroupId}.");
 
-            var peerPublic = peerKePayload.Body.AsSpan(4);
-            var sharedSecret = dh.ComputeSharedSecret(peerPublic);
-
-            var peerNoncePayload = initResp.Payloads.FirstOrDefault(p => p.Type == IkePayloadType.Nonce)
-                ?? throw new IkeFormatException("IKE_SA_INIT response missing Nonce payload.");
+            var peerNoncePayload = RequireSingleInitPayload(initResp, IkePayloadType.Nonce);
             var responderNonce = peerNoncePayload.Body;
+            ValidateInitNonce(responderNonce, negotiatedSuite);
+            var fragmentationNegotiated = ReadFragmentationSupport(initResp.Payloads);
+            var signatureHashesNegotiated = IkeResponderAuthentication.ReadSignatureHashSupport(initResp.Payloads);
 
             // Compute IKE keys
-            var ikeKeys = IkeCrypto.DeriveIkeKeys(negotiatedSuite, sharedSecret, initiatorNonce, responderNonce, initiatorSpi, responderSpi);
+            var sharedSecret = dh.ComputeSharedSecret(peerKePayload.Body.AsSpan(4));
+            IkeKeys ikeKeys;
+            try { ikeKeys = IkeCrypto.DeriveIkeKeys(negotiatedSuite, sharedSecret, initiatorNonce, responderNonce, initiatorSpi, responderSpi); }
+            finally { CryptographicOperations.ZeroMemory(sharedSecret); }
+            ownedIkeKeys = ikeKeys;
+            deletePendingIke = cleanupToken => transport.SendIkeAsync(IkeCrypto.EncryptPayloads(new()
+            {
+                InitiatorSpi = initiatorSpi, ResponderSpi = responderSpi,
+                Exchange = IkeExchangeType.Informational, Flags = IkeFlags.Initiator,
+                MessageId = nextCleanupMessageId
+            }, [new(IkePayloadType.Delete, [1, 0, 0, 0])], negotiatedSuite, ikeKeys.SkEi, ikeKeys.SkAi), cleanupToken);
 
             // Check NAT detection
             var isNatDetected = DetectNat(initResp.Payloads, initiatorSpi, responderSpi, localEp, remoteEp);
@@ -248,7 +304,7 @@ public static class IkeSession
 
             // ── 2. First IKE_AUTH request (EAP-AKA start) ────────────────────
             stage = "IKE_AUTH/EAP-AKA";
-            var eapClient = new EapAkaClient(
+            using var eapClient = new EapAkaClient(
                 request.AkaProvider,
                 request.Imsi,
                 request.HomeMcc,
@@ -305,20 +361,45 @@ public static class IkeSession
                 MessageId = authMsgId
             };
 
-            var firstAuthEncrypted = IkeCrypto.EncryptPayloads(firstAuthMsg, firstAuthInner, negotiatedSuite, ikeKeys.SkEi, ikeKeys.SkAi);
-            Trace($"IKE stage=IKE_AUTH send initial EAP request; address-family={request.AddressFamilyMode}; apn={request.Apn}; child-proposals={childSuites.Count()}; packet-bytes={firstAuthEncrypted.Length}.");
-            var firstAuthRespBytes = await transport.RoundTripAsync(firstAuthEncrypted, ct).ConfigureAwait(false);
-
-            var (firstAuthHeader, currentInnerPayloads) = IkeCrypto.DecryptPayloads(firstAuthRespBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
+            Trace($"IKE stage=IKE_AUTH send initial EAP request; address-family={request.AddressFamilyMode}; child-proposals={childSuites.Count()}; fragmentation={fragmentationNegotiated}.");
+            nextCleanupMessageId = authMsgId + 1;
+            var firstAuthResponse = await transport.RoundTripEncryptedAsync(firstAuthMsg, firstAuthInner, negotiatedSuite,
+                ikeKeys.SkEi, ikeKeys.SkAi, ikeKeys.SkEr, ikeKeys.SkAr, fragmentationNegotiated, ct).ConfigureAwait(false);
+            var (firstAuthHeader, currentInnerPayloads) = (firstAuthResponse.Header, firstAuthResponse.Payloads);
             ValidateHandshakeResponse(firstAuthHeader, initiatorSpi, responderSpi, IkeExchangeType.IkeAuth, authMsgId);
-            var peerIdrPayload = currentInnerPayloads.FirstOrDefault(p => p.Type == IkePayloadType.IdentificationResponder);
+            var peerIdrPayload = IkeChildNegotiation.MergeIdentity(null, currentInnerPayloads);
+            initialResponderAuthVerified = IkeResponderAuthentication.Verify(currentInnerPayloads, initRespBytes, initiatorNonce,
+                negotiatedSuite, ikeKeys.SkPr, request.ResponderAuthentication ?? new(request.EpdgIp.ToString()), signatureHashesNegotiated);
 
             // ── 3. EAP-AKA Rounds Loop ──────────────────────────────────────
             for (var round = 0; round < 10; round++)
             {
-                var eapPayload = currentInnerPayloads.FirstOrDefault(p => p.Type == IkePayloadType.Eap);
+                var eapPayloads = currentInnerPayloads.Where(p => p.Type == IkePayloadType.Eap).ToArray();
+                if (eapPayloads.Length > 1) throw new IkeFormatException("Duplicate EAP payloads in IKE_AUTH.");
+                networkRejection = IkeNetworkRejection.Capture(currentInnerPayloads, initialResponderAuthVerified);
+                if (networkRejection != null && request.ObserveNetworkRejection != null)
+                {
+                    using var commit = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await request.ObserveNetworkRejection(networkRejection, transport.GatewayAddress, commit.Token).ConfigureAwait(false);
+                }
+                foreach (var note in currentInnerPayloads.Where(p => p.Type == IkePayloadType.Notify))
+                {
+                    if (note.Body.Length < 4 || note.Body[1] > note.Body.Length - 4)
+                        throw new IkeFormatException("Malformed IKE_AUTH notification.");
+                    var kind = BinaryPrimitives.ReadUInt16BigEndian(note.Body.AsSpan(2, 2));
+                    backoffSeen |= kind == NotifyBackoffTimer;
+                    if (kind < 16384 && !(round == 0 && eapPayloads.Length == 0 && IsAddressFamilyRejection(currentInnerPayloads)))
+                        throw new IkeFormatException(DescribeIkeAuthFailure(currentInnerPayloads) ?? $"ePDG returned fatal IKE_AUTH Notify {kind}.");
+                }
+                var eapPayload = eapPayloads.SingleOrDefault();
                 if (eapPayload == null)
                 {
+                    if (round == 0 && IsAddressFamilyRejection(currentInnerPayloads))
+                    {
+                        retryableFamilyFailure = true;
+                        preEapFamilyFailure = true;
+                        throw new IkeFormatException("ePDG rejected the requested inner IP family (INTERNAL_ADDRESS_FAILURE / TS_UNACCEPTABLE) before any AKA challenge.");
+                    }
                     var authFailure = DescribeIkeAuthFailure(currentInnerPayloads);
                     if (authFailure != null)
                         throw new IkeFormatException(authFailure);
@@ -338,7 +419,14 @@ public static class IkeSession
                 }
 
                 Trace($"IKE stage=IKE_AUTH EAP round={round + 1}; payload-bytes={eapPayload.Body.Length}.");
-                var (eapResponse, isSuccess) = await eapClient.HandleAsync(eapPayload.Body, ct).ConfigureAwait(false);
+                (byte[]? eapResponse, bool isSuccess) eapStep;
+                try { eapStep = await eapClient.HandleAsync(eapPayload.Body, ct).ConfigureAwait(false); }
+                catch (AuthenticationException)
+                {
+                    identityRejectedBeforeChallenge = eapClient.IdentityRejectedBeforeChallenge;
+                    throw;
+                }
+                var (eapResponse, isSuccess) = eapStep;
                 if (isSuccess)
                 {
                     eapSucceeded = true;
@@ -371,14 +459,14 @@ public static class IkeSession
                     MessageId = authMsgId
                 };
 
-                var encNext = IkeCrypto.EncryptPayloads(nextReq, nextReqInner, negotiatedSuite, ikeKeys.SkEi, ikeKeys.SkAi);
                 Trace($"IKE stage=IKE_AUTH send EAP response; round={round + 1}; response-bytes={eapResponse.Length}; device-identity={deviceRequest is not null && !string.IsNullOrWhiteSpace(request.Imei)}.");
-                var respBytes = await transport.RoundTripAsync(encNext, ct).ConfigureAwait(false);
-
-                var (roundHeader, inner) = IkeCrypto.DecryptPayloads(respBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
+                nextCleanupMessageId = authMsgId + 1;
+                var roundResponse = await transport.RoundTripEncryptedAsync(nextReq, nextReqInner, negotiatedSuite,
+                    ikeKeys.SkEi, ikeKeys.SkAi, ikeKeys.SkEr, ikeKeys.SkAr, fragmentationNegotiated, ct).ConfigureAwait(false);
+                var (roundHeader, inner) = (roundResponse.Header, roundResponse.Payloads);
                 ValidateHandshakeResponse(roundHeader, initiatorSpi, responderSpi, IkeExchangeType.IkeAuth, authMsgId);
                 currentInnerPayloads = inner;
-                peerIdrPayload ??= currentInnerPayloads.FirstOrDefault(p => p.Type == IkePayloadType.IdentificationResponder);
+                peerIdrPayload = IkeChildNegotiation.MergeIdentity(peerIdrPayload, currentInnerPayloads);
 
                 if (round == 9)
                     throw new TimeoutException("EAP exchange exceeded maximum 10 rounds.");
@@ -397,12 +485,12 @@ public static class IkeSession
             // signed = initRequestBytes + responderNonce + idHash
             // paddedKey = prf(MSK, "Key Pad for IKEv2")
             // authValue = prf(paddedKey, signed)
-            var idHash = IkeCrypto.Prf(negotiatedSuite, ikeKeys.SkPi, idiPayload.Body);
-            var signedOctets = Combine(initReqBytes, responderNonce, idHash);
-            var keyPad = IkeCrypto.Prf(negotiatedSuite, msk, Encoding.ASCII.GetBytes("Key Pad for IKEv2"));
-            var authValue = IkeCrypto.Prf(negotiatedSuite, keyPad, signedOctets);
+            var idHash = Secret(IkeCrypto.Prf(negotiatedSuite, ikeKeys.SkPi, idiPayload.Body));
+            var signedOctets = Secret(Combine(initReqBytes, responderNonce, idHash));
+            var keyPad = Secret(IkeCrypto.Prf(negotiatedSuite, msk, Encoding.ASCII.GetBytes("Key Pad for IKEv2")));
+            var authValue = Secret(IkeCrypto.Prf(negotiatedSuite, keyPad, signedOctets));
 
-            var authBody = Combine(new byte[] { AuthMethodSharedKeyMic, 0, 0, 0 }, authValue);
+            var authBody = Secret(Combine(new byte[] { AuthMethodSharedKeyMic, 0, 0, 0 }, authValue));
             var initiatorAuthPayload = new IkePayload(IkePayloadType.Authentication, authBody);
 
             var finalReq = new IkeWire.IkeMessage
@@ -414,28 +502,51 @@ public static class IkeSession
                 MessageId = authMsgId
             };
 
-            var finalEnc = IkeCrypto.EncryptPayloads(finalReq, new[] { initiatorAuthPayload }, negotiatedSuite, ikeKeys.SkEi, ikeKeys.SkAi);
-            Trace($"IKE stage=final-AUTH send; packet-bytes={finalEnc.Length}.");
-            var finalRespBytes = await transport.RoundTripAsync(finalEnc, ct).ConfigureAwait(false);
-
-            var (finalHeader, finalPayloads) = IkeCrypto.DecryptPayloads(finalRespBytes, negotiatedSuite, ikeKeys.SkEr, ikeKeys.SkAr);
+            Trace("IKE stage=final-AUTH send.");
+            nextCleanupMessageId = authMsgId + 1;
+            var finalResponse = await transport.RoundTripEncryptedAsync(finalReq, new[] { initiatorAuthPayload }, negotiatedSuite,
+                ikeKeys.SkEi, ikeKeys.SkAi, ikeKeys.SkEr, ikeKeys.SkAr, fragmentationNegotiated, ct).ConfigureAwait(false);
+            var (finalHeader, finalPayloads) = (finalResponse.Header, finalResponse.Payloads);
             ValidateHandshakeResponse(finalHeader, initiatorSpi, responderSpi, IkeExchangeType.IkeAuth, authMsgId);
-            peerIdrPayload ??= finalPayloads.FirstOrDefault(p => p.Type == IkePayloadType.IdentificationResponder);
+            peerIdrPayload = IkeChildNegotiation.MergeIdentity(peerIdrPayload, finalPayloads);
+            void VerifyCurrentFinalAUTH()
+            {
+                var respAuthPayload = IkeChildNegotiation.Require(finalPayloads, IkePayloadType.Authentication);
+                if (peerIdrPayload?.Body is not { Length: > 4 })
+                    throw new AuthenticationException("Responder did not provide an identity for final AUTH verification.");
+                var respIdBody = peerIdrPayload.Body;
+                var respIdHash = Secret(IkeCrypto.Prf(negotiatedSuite, ikeKeys.SkPr, respIdBody));
+                var respSignedOctets = Secret(Combine(initRespBytes, initiatorNonce, respIdHash));
+                var expectedRespAuth = Secret(IkeCrypto.Prf(negotiatedSuite, keyPad, respSignedOctets));
+                VerifyFinalResponderAuth(respAuthPayload, expectedRespAuth);
+                finalAuthVerified = true;
+            }
+            // A coherent Notify alone is not evidence: defer its policy until
+            // the current MSK AUTH authenticates an EAP-only responder.
+            if (!initialResponderAuthVerified && IkeNetworkRejection.Capture(finalPayloads, true) != null)
+                VerifyCurrentFinalAUTH();
+            networkRejection = IkeNetworkRejection.Capture(finalPayloads, initialResponderAuthVerified || finalAuthVerified);
+            if (networkRejection != null && request.ObserveNetworkRejection != null)
+            {
+                using var commit = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await request.ObserveNetworkRejection(networkRejection, transport.GatewayAddress, commit.Token).ConfigureAwait(false);
+            }
+            foreach (var note in finalPayloads.Where(p => p.Type == IkePayloadType.Notify))
+            {
+                if (note.Body.Length < 4 || note.Body[1] > note.Body.Length - 4)
+                    throw new IkeFormatException("Malformed final IKE_AUTH notification.");
+                var kind = BinaryPrimitives.ReadUInt16BigEndian(note.Body.AsSpan(2, 2));
+                backoffSeen |= kind == NotifyBackoffTimer;
+                if (kind < 16384)
+                    throw new IkeFormatException(DescribeIkeAuthFailure(finalPayloads) ?? $"ePDG returned fatal final IKE_AUTH Notify {kind}.");
+            }
 
             // ── 5. Verify Responder AUTH (RFC 7296 §2.15 / 3GPP TS 33.402) ────
-            var respAuthPayload = finalPayloads.FirstOrDefault(p => p.Type == IkePayloadType.Authentication);
-            if (peerIdrPayload?.Body is not { Length: > 4 })
-                throw new AuthenticationException("Responder did not provide an identity for final AUTH verification.");
-            var respIdBody = peerIdrPayload.Body;
-            var respIdHash = IkeCrypto.Prf(negotiatedSuite, ikeKeys.SkPr, respIdBody);
-            var respSignedOctets = Combine(initRespBytes, initiatorNonce, respIdHash);
-            var expectedRespAuth = IkeCrypto.Prf(negotiatedSuite, keyPad, respSignedOctets);
-            VerifyFinalResponderAuth(respAuthPayload, expectedRespAuth);
+            VerifyCurrentFinalAUTH();
 
             // ── 6. Parse CHILD_SA, CP, and Key Material ──────────────────────
             stage = "CHILD_SA/configuration";
-            var finalSaPayload = finalPayloads.FirstOrDefault(p => p.Type == IkePayloadType.SecurityAssociation)
-                ?? throw new IkeFormatException("Final IKE_AUTH response missing SA payload.");
+            var finalSaPayload = IkeChildNegotiation.Require(finalPayloads, IkePayloadType.SecurityAssociation);
             var finalProposals = IkeWire.DecodeProposals(finalSaPayload.Body);
             if (finalProposals.Count != 1 || finalProposals[0].Spi.Length != 4)
                 throw new IkeFormatException("Final IKE_AUTH response has invalid ESP proposals.");
@@ -446,18 +557,15 @@ public static class IkeSession
                 throw new IkeFormatException($"ePDG selected unknown ESP proposal {finalProposals[0].ProposalNumber}.");
             ValidateChosenSuite(finalProposals[0].ProposalNumber, negotiatedChildSuite, childSuites);
 
+            IkeChildConfiguration config;
+            try { config = IkeChildNegotiation.Configuration(finalPayloads, tsiPayload, tsrPayload, request.AddressFamilyMode, request.FallbackPcscf); }
+            catch (IkeChildAddressFamilyException) { retryableFamilyFailure = true; throw; }
+            var assignedIp = config.Assigned;
+            var finalPcscf = config.Pcscf;
+            var dnsList = config.Dns;
             var (outEnc, outAuth, inEnc, inAuth) = IkeCrypto.DeriveChildSaKeys(
                 negotiatedSuite, negotiatedChildSuite, ikeKeys.SkD, initiatorNonce, responderNonce);
-
-            // Parse CP (Configuration Payload)
-            var cpRespPayload = finalPayloads.FirstOrDefault(p => p.Type == IkePayloadType.Configuration);
-            var (assignedIp, dnsList, pcscfList) = cpRespPayload != null
-                ? ParseConfigurationPayload(cpRespPayload.Body)
-                : (null, new List<string>(), new List<string>());
-
-            var finalPcscf = PickPcscf(pcscfList, assignedIp) ?? request.FallbackPcscf;
-            if (string.IsNullOrEmpty(finalPcscf))
-                throw new InvalidOperationException("P-CSCF IP was not provided by ePDG and no fallback was configured.");
+            uncommittedChildKeys = [outEnc, outAuth, inEnc, inAuth];
             var assignedFamily = IPAddress.TryParse(assignedIp, out var assignedAddress)
                 ? assignedAddress.AddressFamily.ToString()
                 : "unknown";
@@ -468,8 +576,9 @@ public static class IkeSession
 
             var controller = new IkeSessionController(
                 transport, negotiatedSuite, initiatorSpi, responderSpi, authMsgId,
-                childInboundSpi, ikeKeys.SkEi, ikeKeys.SkAi, ikeKeys.SkEr, ikeKeys.SkAr,
-                request.DiagnosticLog);
+                childInboundSpi, childOutboundSpi, ikeKeys.SkEi, ikeKeys.SkAi, ikeKeys.SkEr, ikeKeys.SkAr,
+                request.DiagnosticLog, fragmentationNegotiated);
+            uncommittedChildKeys = null;
 
             return new IkeSessionResult(
                 Success: true,
@@ -490,13 +599,18 @@ public static class IkeSession
                 LivenessProbe: new IkeLivenessProbe(controller),
                 EapSucceeded: true,
                 AddressFamilyMode: request.AddressFamilyMode,
-                Controller: controller
+                Controller: controller,
+                ChildPolicy: config.Policy,
+                FinalAuthVerified: true,
+                InitialResponderAuthVerified: initialResponderAuthVerified
             );
         }
         catch (Exception ex)
         {
+            var cleanupError = await CleanupFailedAttemptAsync(deletePendingIke, () => transport?.Dispose()).ConfigureAwait(false);
+            var retryProofAllowed = cleanupError == null && !backoffSeen && !ct.IsCancellationRequested && !IkeAdmissionException.Contains(ex);
             Trace($"IKE stage={stage} failed; exception={ex.GetType().Name}; detail={ex.Message}");
-            transport.Dispose();
+            ct.ThrowIfCancellationRequested();
             return new IkeSessionResult(
                 Success: false,
                 AssignedIp: null,
@@ -512,11 +626,28 @@ public static class IkeSession
                 EspSuite: null,
                 Transport: null,
                 IsNatDetected: false,
-                ErrorMessage: ex.Message,
+                ErrorMessage: cleanupError == null ? ex.Message : $"{ex.Message} Pending IKE cleanup failed: {cleanupError.GetType().Name}.",
                 EapSucceeded: eapSucceeded,
                 AddressFamilyMode: request.AddressFamilyMode,
-                RequestedEapType: (ex as EapMethodMismatchException)?.RequestedType
+                RequestedEapType: retryProofAllowed && ex is EapMethodMismatchException { IdentityOnlyExchange: true } mismatch ? mismatch.RequestedType : null,
+                RetryableTransportFailure: retryProofAllowed && initialRouteFailure,
+                RetryableAddressFamilyFailure: retryProofAllowed && retryableFamilyFailure,
+                RetryableIdentityRejection: retryProofAllowed && identityRejectedBeforeChallenge && ex is AuthenticationException,
+                RetryableInitialTimeout: retryProofAllowed && initialTimeout,
+                RetryableInitialProposal: retryProofAllowed && initialProposalFailure,
+                PreEapFamilyFailure: retryProofAllowed && preEapFamilyFailure,
+                FinalAuthVerified: finalAuthVerified,
+                FailureCleanupComplete: cleanupError == null,
+                InitialResponderAuthVerified: initialResponderAuthVerified,
+                NetworkRejection: networkRejection
             );
+        }
+
+        finally
+        {
+            foreach (var secret in temporarySecrets) CryptographicOperations.ZeroMemory(secret);
+            if (uncommittedChildKeys != null) foreach (var key in uncommittedChildKeys) CryptographicOperations.ZeroMemory(key);
+            if (ownedIkeKeys != null) foreach (var key in new[] { ownedIkeKeys.SkD, ownedIkeKeys.SkAi, ownedIkeKeys.SkAr, ownedIkeKeys.SkEi, ownedIkeKeys.SkEr, ownedIkeKeys.SkPi, ownedIkeKeys.SkPr }) CryptographicOperations.ZeroMemory(key);
         }
 
         static string currentPayloadNames(IEnumerable<IkePayload> payloads) =>
@@ -525,9 +656,9 @@ public static class IkeSession
 
     internal static void VerifyFinalResponderAuth(IkePayload? authPayload, ReadOnlySpan<byte> expectedMic)
     {
-        if (authPayload?.Body is not { Length: >= 5 } body ||
+        if (authPayload?.Type != IkePayloadType.Authentication || authPayload.Body is not { Length: >= 5 } body ||
             body[0] != AuthMethodSharedKeyMic ||
-            body[1] != 0 || body[2] != 0 || body[3] != 0 ||
+            expectedMic.Length is not (20 or 32 or 48 or 64) ||
             body.Length != expectedMic.Length + 4 ||
             !CryptographicOperations.FixedTimeEquals(body.AsSpan(4), expectedMic))
         {
@@ -730,23 +861,11 @@ public static class IkeSession
         if (data.Length == 0 || data.Length > 2 || data.Length == 2 && data[0] != 1)
             return null;
 
-        var encoded = data[^1];
-        var units = encoded >> 5;
-        var value = encoded & 0x1F;
-        if (units == 7)
+        var timer = IkeBackoffTimer.DecodeValue(data[^1]);
+        if (timer.Status == IkeBackoffTimerStatus.Deactivated)
             return "does not expire";
 
-        var duration = units switch
-        {
-            0 => TimeSpan.FromSeconds(value * 2),
-            1 => TimeSpan.FromMinutes(value),
-            2 => TimeSpan.FromMinutes(value * 10),
-            3 => TimeSpan.FromHours(value),
-            4 => TimeSpan.FromHours(value * 10),
-            5 => TimeSpan.FromMinutes(value * 2),
-            6 => TimeSpan.FromSeconds(value * 30),
-            _ => TimeSpan.Zero
-        };
+        var duration = timer.Duration!.Value;
 
         if (duration.TotalDays >= 1)
             return $"{duration.TotalDays:0.##} days";
@@ -885,52 +1004,129 @@ public static class IkeSession
         return new IkePayload(IkePayloadType.Configuration, body);
     }
 
-    internal static (string? AssignedIp, List<string> DnsList, List<string> PcscfList) ParseConfigurationPayload(ReadOnlySpan<byte> body)
+    internal static (string? AssignedIp, List<string> DnsList, List<string> PcscfList) ParseConfigurationPayload(ReadOnlySpan<byte> body,
+        IkeAddressFamilyMode mode = IkeAddressFamilyMode.Dual, string? fallbackPcscf = null)
     {
         if (body.Length < 4 || body[0] != 2) // CFG_REPLY
             return (null, new List<string>(), new List<string>());
 
-        string? assignedIp = null;
-        var dnsList = new List<string>();
-        var pcscfList = new List<string>();
+        // Parse atomically: a malformed suffix must not leave a usable-looking
+        // address/P-CSCF pair from the prefix of an invalid payload.
+        var config = IkeConfigurationReply.Parse(body);
+        var assignedIps = config.AssignedAddresses.Select(value => value.ToString()).ToList();
+        var dnsList = config.DnsAddresses.Select(value => value.ToString()).ToList();
+        var pcscfList = config.PcscfAddresses.Select(value => value.ToString()).ToList();
 
-        var offset = 4;
-        while (offset + 4 <= body.Length)
-        {
-            var attrType = (ushort)(BinaryPrimitives.ReadUInt16BigEndian(body.Slice(offset, 2)) & 0x7FFF);
-            var attrLength = BinaryPrimitives.ReadUInt16BigEndian(body.Slice(offset + 2, 2));
-            offset += 4;
-
-            if (offset + attrLength > body.Length)
-                break;
-
-            var val = body.Slice(offset, attrLength);
-            offset += attrLength;
-
-            switch (attrType)
-            {
-                case 1 when attrLength == 4: // INTERNAL_IP4_ADDRESS
-                    assignedIp = new IPAddress(val).ToString();
-                    break;
-                case 3 when attrLength == 4: // INTERNAL_IP4_DNS
-                    dnsList.Add(new IPAddress(val).ToString());
-                    break;
-                case 20 when attrLength == 4: // P_CSCF_IP4_ADDRESS
-                    pcscfList.Add(new IPAddress(val).ToString());
-                    break;
-                case 8 when attrLength is 16 or 17: // INTERNAL_IP6_ADDRESS (+ optional prefix length)
-                    assignedIp ??= new IPAddress(val[..16]).ToString();
-                    break;
-                case 10 when attrLength == 16: // INTERNAL_IP6_DNS
-                    dnsList.Add(new IPAddress(val).ToString());
-                    break;
-                case 21 when attrLength == 16: // P_CSCF_IP6_ADDRESS
-                    pcscfList.Add(new IPAddress(val).ToString());
-                    break;
-            }
-        }
-
+        // CP attribute order is not a preference. Preserve both families until
+        // choosing a complete assigned-address/P-CSCF pair, independently of
+        // the outer IKE socket's family. One IMS flow uses one coherent pair.
+        var preferred = mode == IkeAddressFamilyMode.Ipv4 ? AddressFamily.InterNetwork : AddressFamily.InterNetworkV6;
+        var ordered = assignedIps.Distinct().OrderBy(value => IPAddress.Parse(value).AddressFamily == preferred ? 0 : 1).ToArray();
+        var assignedIp = ordered.FirstOrDefault(value => IsUsablePdn(value, PickCompatiblePcscf(pcscfList, value, fallbackPcscf)))
+            ?? ordered.FirstOrDefault();
         return (assignedIp, dnsList, pcscfList);
+    }
+
+    internal static bool IsRouteFailure(Exception error)
+    {
+        if (IkeAdmissionException.Contains(error)) return false;
+        if (error is SocketException socket)
+            return socket.SocketErrorCode is SocketError.NetworkDown or SocketError.NetworkUnreachable or SocketError.HostUnreachable or
+                SocketError.AddressNotAvailable or SocketError.AddressFamilyNotSupported or SocketError.ProtocolNotSupported or
+                SocketError.ConnectionRefused or SocketError.ConnectionReset;
+        return error is InvalidOperationException && error.InnerException != null && IsRouteFailure(error.InnerException);
+    }
+
+    internal static bool IsAddressFamilyRejection(IReadOnlyList<IkePayload> payloads)
+    {
+        var found = false;
+        foreach (var payload in payloads)
+        {
+            if (payload.Type is IkePayloadType.IdentificationResponder or IkePayloadType.Authentication or IkePayloadType.Certificate)
+            {
+                if (payload.Body.Length < (payload.Type == IkePayloadType.Certificate ? 1 : 5)) return false;
+                continue;
+            }
+            if (payload.Type != IkePayloadType.Notify || payload.Body.Length < 4 || payload.Body[1] != 0) return false;
+            // Protocol ID is ignored on receipt when the SPI is empty.
+            var type = BinaryPrimitives.ReadUInt16BigEndian(payload.Body.AsSpan(2, 2));
+            if (type is 36 or 38)
+            {
+                if (payload.Body.Length != 4) return false;
+                found = true;
+            }
+            else if (type < 16384 || type == NotifyBackoffTimer) return false;
+        }
+        return found;
+    }
+
+    internal static async Task<Exception?> CleanupFailedAttemptAsync(Func<CancellationToken, Task>? delete, Action close)
+    {
+        Exception? failure = null;
+        if (delete != null)
+        {
+            using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            try { await delete(cleanup.Token).ConfigureAwait(false); }
+            catch (Exception error) { failure = error; }
+        }
+        try { close(); }
+        catch (Exception error) { failure = failure == null ? error : new AggregateException(failure, error); }
+        return failure;
+    }
+
+    private static bool IsInitialProposalRejection(IReadOnlyList<IkePayload> payloads)
+    {
+        var found = false;
+        foreach (var note in payloads)
+        {
+            if (note.Type != IkePayloadType.Notify || note.Body.Length < 4 || note.Body[1] != 0) return false;
+            var type = BinaryPrimitives.ReadUInt16BigEndian(note.Body.AsSpan(2, 2));
+            if (type == 14 && note.Body.Length == 4 || type == 17 && note.Body.Length == 6) found = true;
+            else if (type < 16384 || type == NotifyBackoffTimer) return false;
+        }
+        return found;
+    }
+
+    internal static IkePayload RequireSingleInitPayload(IkeWire.IkeMessage message, IkePayloadType type)
+    {
+        var values = message.Payloads.Where(payload => payload.Type == type).ToArray();
+        if (values.Length != 1) throw new IkeFormatException("IKE_SA_INIT requires exactly one SA, KE and Nonce payload.");
+        return values[0];
+    }
+
+    internal static bool ReadFragmentationSupport(IReadOnlyList<IkePayload> payloads)
+    {
+        var notes = payloads.Where(p => p.Type == IkePayloadType.Notify && p.Body.Length >= 4 &&
+            BinaryPrimitives.ReadUInt16BigEndian(p.Body.AsSpan(2, 2)) == NotifyIkeFragmentationSupported).ToArray();
+        if (notes.Length > 1 || notes.Any(p => p.Body.Length != 4 || p.Body[0] != 0 || p.Body[1] != 0))
+            throw new IkeFormatException("Invalid IKE fragmentation support notification.");
+        return notes.Length == 1;
+    }
+
+    internal static IkePayload? ReadInitCookie(IkeWire.IkeMessage message)
+    {
+        var cookies = message.Payloads.Where(payload => payload.Type == IkePayloadType.Notify && payload.Body.Length >= 4 &&
+            BinaryPrimitives.ReadUInt16BigEndian(payload.Body.AsSpan(2, 2)) == NotifyCookie).ToArray();
+        if (cookies.Length == 0) return null;
+        // RFC 7296 3.10: Protocol ID is ignored on receipt when SPI is empty.
+        if (cookies.Length != 1 || cookies[0].Body.Length is < 5 or > 68 || cookies[0].Body[1] != 0 ||
+            message.Payloads.Any(payload => payload.Type is IkePayloadType.SecurityAssociation or IkePayloadType.KeyExchange or IkePayloadType.Nonce ||
+                payload.Type == IkePayloadType.Notify && (payload.Body.Length < 4 || payload.Body[1] > payload.Body.Length - 4 ||
+                    BinaryPrimitives.ReadUInt16BigEndian(payload.Body.AsSpan(2, 2)) < 16384)))
+            throw new IkeFormatException("Invalid or ambiguous IKE stateless cookie challenge.");
+        return cookies[0];
+    }
+
+    internal static void ValidateInitNonce(ReadOnlySpan<byte> nonce, IkeSuite suite)
+    {
+        if (nonce.Length < Math.Max(16, suite.PrfLength / 2) || nonce.Length > 256)
+            throw new IkeFormatException("IKE_SA_INIT nonce length is invalid.");
+    }
+
+    private static string? PickCompatiblePcscf(IReadOnlyList<string> candidates, string? assigned, string? fallback)
+    {
+        var selected = PickPcscf(candidates, assigned);
+        return IsUsablePdn(assigned, selected) ? selected : IsUsablePdn(assigned, fallback) ? fallback : selected ?? fallback;
     }
 
     /// <summary>
@@ -982,7 +1178,7 @@ public static class IkeSession
         {
             RandomNumberGenerator.Fill(buf);
             var val = BinaryPrimitives.ReadUInt32BigEndian(buf);
-            if (val != 0) return val;
+            if (val >= 256) return val;
         }
     }
 

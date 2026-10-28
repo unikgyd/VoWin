@@ -10,7 +10,14 @@ public sealed record HostImsRouteCheck(
     bool IsVerified,
     string? InterfaceName,
     int? InterfaceIndex,
-    string Summary);
+    string Summary)
+{
+    public ulong? InterfaceLuid { get; init; }
+}
+
+internal sealed record HostImsRouteAdapter(string Name, int InterfaceIndex, IReadOnlyList<IPAddress> Addresses);
+internal sealed record HostImsRouteObservation(bool Success, int InterfaceIndex,
+    IPAddress? SourceAddress, uint Error, ulong InterfaceLuid = 0);
 
 /// <summary>
 /// Read-only Windows route check for a P-CSCF. The source address, selected
@@ -20,73 +27,116 @@ public sealed record HostImsRouteCheck(
 public static class HostImsRouteVerifier
 {
     public static IReadOnlyList<HostImsRouteCheck> Check(
-        IReadOnlyList<HostImsEndpointCandidate> candidates)
+        IReadOnlyList<HostImsEndpointCandidate> candidates,
+        int? expectedInterfaceIndex = null, ulong? expectedInterfaceLuid = null)
     {
         ArgumentNullException.ThrowIfNull(candidates);
+        if (expectedInterfaceIndex is <= 0 || expectedInterfaceLuid is 0 ||
+            expectedInterfaceLuid is not null && expectedInterfaceIndex is null)
+            throw new ArgumentException("An IMS interface owner must have a positive index and optional nonzero LUID.");
         if (!OperatingSystem.IsWindows())
             return candidates.Select(candidate => new HostImsRouteCheck(candidate, false, null, null,
                 "Windows IP route verification is unavailable on this platform.")).ToArray();
 
-        NetworkInterface[] adapters;
-        try { adapters = NetworkInterface.GetAllNetworkInterfaces(); }
+        IReadOnlyList<HostImsRouteAdapter> adapters;
+        try { adapters = ReadAdapters(candidates); }
         catch (Exception ex)
         {
             return candidates.Select(candidate => new HostImsRouteCheck(candidate, false, null, null,
                 $"Windows adapters could not be enumerated: {ex.GetType().Name}.")).ToArray();
         }
 
-        return candidates.Select(candidate => Check(candidate, adapters)).ToArray();
+        return candidates.Select(candidate => CheckWithRoutes(candidate, adapters,
+            WindowsRoute.TryGetBestRoute, expectedInterfaceIndex, expectedInterfaceLuid)).ToArray();
     }
 
-    private static HostImsRouteCheck Check(HostImsEndpointCandidate candidate, NetworkInterface[] adapters)
+    /// <summary>Raw injection is not socket-pinned: prove the unconstrained Windows route too.</summary>
+    public static HostImsRouteCheck CheckUnpinnedOutput(HostImsEndpointCandidate candidate,
+        int expectedInterfaceIndex, ulong? expectedInterfaceLuid = null)
     {
-        if (candidate.LocalAddress.AddressFamily != candidate.PcscfAddress.AddressFamily)
-            return new(candidate, false, null, null, "IMS address and P-CSCF use different IP families.");
+        if (expectedInterfaceIndex <= 0 || expectedInterfaceLuid is 0)
+            throw new ArgumentException("Raw IMS output requires an explicit interface owner.");
+        if (!OperatingSystem.IsWindows())
+            return new(candidate, false, null, null, "Windows IP route verification is unavailable on this platform.");
+        try
+        {
+            return CheckWithRoutes(candidate, ReadAdapters([candidate]), WindowsRoute.TryGetBestRoute,
+                expectedInterfaceIndex, expectedInterfaceLuid, requireGlobalBest: true);
+        }
+        catch (Exception ex)
+        {
+            return new(candidate, false, null, null, $"Windows raw-output route could not be checked: {ex.GetType().Name}.");
+        }
+    }
 
-        HostImsRouteCheck? firstFailure = null;
-        foreach (var nic in adapters)
+    private static IReadOnlyList<HostImsRouteAdapter> ReadAdapters(IReadOnlyList<HostImsEndpointCandidate> candidates)
+    {
+        var adapters = new List<HostImsRouteAdapter>();
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
         {
             if (!HostImsPdnParser.IsHostImsDataInterface(nic.Name, nic.Description,
                     nic.NetworkInterfaceType, nic.OperationalStatus)) continue;
-            try
+            var properties = nic.GetIPProperties();
+            var addresses = properties.UnicastAddresses.Select(item => item.Address).ToArray();
+            foreach (var family in candidates.Select(candidate => candidate.LocalAddress.AddressFamily).Distinct())
             {
-                var properties = nic.GetIPProperties();
-                if (!properties.UnicastAddresses.Any(item => item.Address.Equals(candidate.LocalAddress))) continue;
-                var index = candidate.LocalAddress.AddressFamily == AddressFamily.InterNetwork
-                    ? properties.GetIPv4Properties()?.Index
-                    : properties.GetIPv6Properties()?.Index;
-                if (index is not > 0)
-                {
-                    firstFailure ??= new(candidate, false, nic.Name, null,
-                        "The IMS adapter has no usable IP interface index.");
-                    continue;
-                }
-
-                var route = WindowsRoute.TryGetBestRoute(index.Value,
-                    candidate.LocalAddress, candidate.PcscfAddress);
-                if (!route.Success)
-                {
-                    firstFailure ??= new(candidate, false, nic.Name, index,
-                        $"Windows has no matching P-CSCF route on this IMS interface (error {route.Error}).");
-                    continue;
-                }
-                if (route.InterfaceIndex != index.Value || !route.SourceAddress!.Equals(candidate.LocalAddress))
-                {
-                    firstFailure ??= new(candidate, false, nic.Name, index,
-                        "Windows would use a different interface or source address for this P-CSCF.");
-                    continue;
-                }
-                return new(candidate, true, nic.Name, index,
-                    "Windows selected the IMS interface and IMS source address for the P-CSCF route.");
-            }
-            catch (Exception ex)
-            {
-                firstFailure ??= new(candidate, false, nic.Name, null,
-                    $"The IMS interface route could not be checked: {ex.GetType().Name}.");
+                var index = family == AddressFamily.InterNetwork
+                    ? properties.GetIPv4Properties()?.Index : properties.GetIPv6Properties()?.Index;
+                if (index is > 0)
+                    adapters.Add(new(nic.Name, index.Value, addresses.Where(address => address.AddressFamily == family).ToArray()));
             }
         }
-        return firstFailure ?? new(candidate, false, null, null,
-            "The IMS address is not assigned to a connected Windows cellular adapter.");
+        return adapters;
+    }
+
+    // Pure route oracle for deterministic overlap/owner/reuse tests. Production
+    // callers always use the native inventory and GetBestRoute2 above.
+    internal static HostImsRouteCheck CheckWithRoutes(HostImsEndpointCandidate candidate,
+        IReadOnlyList<HostImsRouteAdapter> adapters,
+        Func<int, IPAddress, IPAddress, HostImsRouteObservation> lookup,
+        int? expectedInterfaceIndex = null, ulong? expectedInterfaceLuid = null,
+        bool requireGlobalBest = false)
+    {
+        if (!HostImsPdnParser.IsUsableEndpointAddress(candidate.LocalAddress) ||
+            !HostImsPdnParser.IsUsableEndpointAddress(candidate.PcscfAddress) ||
+            candidate.LocalAddress.Equals(candidate.PcscfAddress))
+            return new(candidate, false, null, null, "IMS endpoints must be distinct usable unicast addresses.");
+        if (candidate.LocalAddress.AddressFamily != candidate.PcscfAddress.AddressFamily)
+            return new(candidate, false, null, null, "IMS address and P-CSCF use different IP families.");
+
+        var owners = adapters.Where(adapter => adapter.Addresses.Contains(candidate.LocalAddress)).ToArray();
+        if (expectedInterfaceIndex is null && owners.Length > 1)
+            return new(candidate, false, null, null, "The IMS source address belongs to multiple interfaces; an explicit bearer owner is required.");
+        if (expectedInterfaceIndex is { } expected)
+            owners = owners.Where(adapter => adapter.InterfaceIndex == expected).ToArray();
+        if (owners.Length != 1)
+            return new(candidate, false, null, expectedInterfaceIndex, "The IMS address is not uniquely assigned to the selected bearer interface.");
+        var owner = owners[0];
+        try
+        {
+            var route = lookup(owner.InterfaceIndex, candidate.LocalAddress, candidate.PcscfAddress);
+            if (!route.Success || route.InterfaceIndex != owner.InterfaceIndex ||
+                !candidate.LocalAddress.Equals(route.SourceAddress) ||
+                expectedInterfaceLuid is { } luid && route.InterfaceLuid != luid)
+                return new(candidate, false, owner.Name, owner.InterfaceIndex,
+                    "Windows did not select the owned IMS interface, LUID and source for this endpoint.");
+            if (requireGlobalBest)
+            {
+                var actual = lookup(0, candidate.LocalAddress, candidate.PcscfAddress);
+                if (!actual.Success || actual.InterfaceIndex != owner.InterfaceIndex ||
+                    actual.InterfaceLuid != route.InterfaceLuid || !candidate.LocalAddress.Equals(actual.SourceAddress))
+                    return new(candidate, false, owner.Name, owner.InterfaceIndex,
+                        "The unpinned Windows output route does not select the owned IMS bearer.");
+            }
+            return new(candidate, true, owner.Name, owner.InterfaceIndex,
+                "Windows selected the owned IMS interface and source address for this endpoint.")
+                { InterfaceLuid = route.InterfaceLuid };
+        }
+        catch (Exception ex)
+        {
+            return new(candidate, false, owner.Name, owner.InterfaceIndex,
+                $"The IMS interface route could not be checked: {ex.GetType().Name}.");
+        }
     }
 
     internal static class WindowsRoute
@@ -136,6 +186,7 @@ public static class HostImsRouteVerifier
         [StructLayout(LayoutKind.Explicit, Size = 256)]
         private struct RouteRowBuffer
         {
+            [FieldOffset(0)] public ulong InterfaceLuid;
             [FieldOffset(8)] public uint InterfaceIndex;
         }
 
@@ -149,18 +200,18 @@ public static class HostImsRouteVerifier
             out RouteRowBuffer bestRoute,
             out SockaddrInet bestSourceAddress);
 
-        internal static (bool Success, int InterfaceIndex, IPAddress? SourceAddress, uint Error)
+        internal static HostImsRouteObservation
             TryGetBestRoute(int interfaceIndex, IPAddress source, IPAddress destination)
         {
-            if (interfaceIndex <= 0 || source.AddressFamily != destination.AddressFamily)
-                return (false, 0, null, 87);
+            if (interfaceIndex < 0 || source.AddressFamily != destination.AddressFamily)
+                return new(false, 0, null, 87);
             var sourceSockaddr = SockaddrInet.FromAddress(source);
             var destinationSockaddr = SockaddrInet.FromAddress(destination);
             var error = GetBestRoute2(IntPtr.Zero, checked((uint)interfaceIndex),
                 in sourceSockaddr, in destinationSockaddr, 0, out var row, out var bestSource);
             return error == 0
-                ? (true, checked((int)row.InterfaceIndex), bestSource.ToAddress(), 0)
-                : (false, 0, null, error);
+                ? new(true, checked((int)row.InterfaceIndex), bestSource.ToAddress(), 0, row.InterfaceLuid)
+                : new(false, 0, null, error);
         }
     }
 }

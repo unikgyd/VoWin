@@ -87,13 +87,14 @@ public class Ipv4FragmentReassemblerTests
     [Fact]
     public void ReassemblesImsEspBeforeUnprotectingSipInvite()
     {
-        var ueProposal = new SecurityProposal("hmac-sha-1-96", "aes-cbc", 100, 200, 40000, 40001);
+        // RFC 4303 reserves SPI 1..255; all four test SAs need distinct, usable SPIs.
+        var ueProposal = new SecurityProposal("hmac-sha-1-96", "aes-cbc", 1101, 1102, 40000, 40001);
         var pcscfProposal = new SecurityProposal("hmac-sha-1-96", "aes-cbc", 1001, 1002, 41000, 41001);
         var key = Enumerable.Range(0, 16).Select(i => (byte)i).ToArray();
         using var ue = new ImsIpsecTransport(Ue, Pcscf, ueProposal);
         using var pcscf = new ImsIpsecTransport(Pcscf, Ue, pcscfProposal);
         ue.Activate(new SecurityAgreement(ueProposal, "verify", 1001, 1002, 41000, 41001), key, key);
-        pcscf.Activate(new SecurityAgreement(pcscfProposal, "verify", 100, 200, 40000, 40001), key, key);
+        pcscf.Activate(new SecurityAgreement(pcscfProposal, "verify", 1101, 1102, 40000, 40001), key, key);
 
         var protectedInvite = pcscf.Protect(new SipDatagram(
             BuildInvite(), new IPEndPoint(Pcscf, 41000), new IPEndPoint(Ue, 40001)));

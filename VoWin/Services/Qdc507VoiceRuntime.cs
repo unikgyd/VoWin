@@ -12,9 +12,19 @@ namespace VoWin.Services;
 /// </summary>
 internal sealed class Qdc507VoiceRuntime
 {
+    private readonly string? _atPort;
+    private readonly Guid _expectedContainer;
+    private readonly string? _expectedImei;
+    public Qdc507VoiceRuntime(string? atPort = null, Guid expectedContainer = default, string? expectedImei = null)
+    {
+        _atPort = atPort;
+        _expectedContainer = expectedContainer;
+        _expectedImei = expectedImei;
+    }
     private const string RuntimeVersion = "qdc507-3.18.44-voice-20260712.5";
     private const string Commit = "0443dfdaf8aec086fd76ba2ee9152fd908114524";
     private const string RemoteDirectory = "/tmp/vowin-call";
+    internal const string IdentityProbeCommand = "uname -r; cat /sys/devices/soc0/machine; id -u";
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _prepared;
 
@@ -43,6 +53,8 @@ internal sealed class Qdc507VoiceRuntime
             var directory = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "VoWin", "voice-runtime", RuntimeVersion);
+            if (BundledRuntime.Find("voice/qdc507_voice.ko") is { } bundledVoice)
+                directory = Path.GetDirectoryName(bundledVoice)!;
             Directory.CreateDirectory(directory);
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
             foreach (var file in Files)
@@ -50,6 +62,8 @@ internal sealed class Qdc507VoiceRuntime
                 var localPath = Path.Combine(directory, file.Name);
                 if (!await VerifyAsync(localPath, file, cancellationToken).ConfigureAwait(false))
                 {
+                    if (BundledRuntime.IsAvailable)
+                        throw new InvalidDataException($"内置 QDC507 组件损坏：{file.Name}，请重新启动以修复组件。");
                     var url = $"https://raw.githubusercontent.com/moluncn/mavo/{Commit}/Resources/ModuleVoice/{file.Name}";
                     var bytes = await http.GetByteArrayAsync(url, cancellationToken).ConfigureAwait(false);
                     await File.WriteAllBytesAsync(localPath, bytes, cancellationToken).ConfigureAwait(false);
@@ -146,14 +160,14 @@ internal sealed class Qdc507VoiceRuntime
         (await TryAdbShellAsync($"{RemoteDirectory}/mavo-pcm-bridge.armv7 --check", ct).ConfigureAwait(false))
             .Contains("required symbols", StringComparison.OrdinalIgnoreCase);
 
-    private static async Task<bool> SoundDevicesReadyAsync(CancellationToken ct)
+    private async Task<bool> SoundDevicesReadyAsync(CancellationToken ct)
     {
         const string check = "test -c /dev/snd/controlC0 && test -c /dev/snd/pcmC0D4p && test -c /dev/snd/pcmC0D4c && " +
                              "test -c /dev/snd/pcmC0D5p && test -c /dev/snd/pcmC0D6c && grep -Fq mdm9607-tomtom-i2s-snd-card /proc/asound/cards";
         return await AdbShellExitCodeAsync(check, ct).ConfigureAwait(false) == 0;
     }
 
-    private static async Task<bool> RouteReadyAsync(CancellationToken ct)
+    private async Task<bool> RouteReadyAsync(CancellationToken ct)
     {
         const string check = "test -s /run/vowin-voice-route.pid && read pid expected_start </run/vowin-voice-route.pid && " +
                              "test \"$(cut -d ' ' -f 22 /proc/$pid/stat 2>/dev/null)\" = \"$expected_start\" && " +
@@ -165,7 +179,7 @@ internal sealed class Qdc507VoiceRuntime
         return await AdbShellExitCodeAsync(check, ct).ConfigureAwait(false) == 0;
     }
 
-    private static async Task PushScriptAsync(string name, string contents, CancellationToken ct)
+    private async Task PushScriptAsync(string name, string contents, CancellationToken ct)
     {
         var localPath = Path.Combine(Path.GetTempPath(), $"vowin-{Guid.NewGuid():N}-{name}");
         try
@@ -187,125 +201,137 @@ internal sealed class Qdc507VoiceRuntime
         return hash.Equals(expected.Sha256, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static async Task<string> AdbShellAsync(string command, TimeSpan timeout, CancellationToken ct) =>
+    private async Task<string> AdbShellAsync(string command, TimeSpan timeout, CancellationToken ct) =>
         (await RunAdbAsync(["shell", command], timeout, ct).ConfigureAwait(false)).Output;
 
-    private static async Task<string> TryAdbShellAsync(string command, CancellationToken ct)
+    private async Task<string> TryAdbShellAsync(string command, CancellationToken ct)
     {
         try { return await AdbShellAsync(command, TimeSpan.FromSeconds(10), ct).ConfigureAwait(false); }
         catch { return string.Empty; }
     }
 
-    private static async Task<int> AdbShellExitCodeAsync(string command, CancellationToken ct)
+    private async Task<int> AdbShellExitCodeAsync(string command, CancellationToken ct)
     {
         try { return (await RunAdbAsync(["shell", command], TimeSpan.FromSeconds(10), ct, false).ConfigureAwait(false)).ExitCode; }
         catch { return -1; }
     }
 
-    private static async Task<ProcessResult> RunAdbAsync(
-        IReadOnlyList<string> arguments, TimeSpan timeout, CancellationToken ct, bool throwOnFailure = true,
-        bool resolveDevice = true)
+    private static readonly AdbServerClient AdbClient = new();
+    private static readonly SemaphoreSlim AdbServerGate = new(1, 1);
+
+    private async Task<ProcessResult> RunAdbAsync(
+        IReadOnlyList<string> arguments, TimeSpan timeout, CancellationToken ct, bool throwOnFailure = true)
     {
-        var adb = FindAdb();
-        var startInfo = new ProcessStartInfo(adb)
-        {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-        if (resolveDevice)
-        {
-            var serial = await ResolveAdbSerialAsync(ct).ConfigureAwait(false);
-            if (!string.IsNullOrEmpty(serial))
-            {
-                startInfo.ArgumentList.Add("-s");
-                startInfo.ArgumentList.Add(serial);
-            }
-        }
-        foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
-        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Unable to start adb.exe.");
-        var stdout = process.StandardOutput.ReadToEndAsync(ct);
-        var stderr = process.StandardError.ReadToEndAsync(ct);
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(timeout);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(timeout);
         try
         {
-            await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
+            for (var attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    var transportId = await ResolveAdbTransportAsync(deadline.Token).ConfigureAwait(false);
+                    ProcessResult result;
+                    if (arguments is ["shell", var command])
+                    {
+                        var shell = await AdbClient.ShellAsync(transportId,
+                            Qdc507AdbIdentity.GuardCommand(_expectedImei!, command), deadline.Token).ConfigureAwait(false);
+                        result = new(shell.ExitCode, shell.Output);
+                    }
+                    else if (arguments is ["push", var local, var remote])
+                    {
+                        await using var stream = File.OpenRead(local);
+                        await AdbClient.PushAsync(transportId, stream, remote, deadline.Token).ConfigureAwait(false);
+                        result = new(0, "Voice runtime uploaded.");
+                    }
+                    else throw new ArgumentException("Unsupported managed ADB operation.");
+                    if (throwOnFailure && result.ExitCode != 0)
+                        throw new InvalidOperationException($"Modem shell failed ({result.ExitCode}): {result.Output.Trim()}");
+                    return result;
+                }
+                catch (System.Net.Sockets.SocketException ex) when (
+                    attempt == 0 && ex.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionRefused)
+                {
+                    // Only connect-refused is retryable: no remote command can have run yet.
+                    // Never restart/kill an existing shared ADB service.
+                    await StartAdbServerIfAbsentAsync(deadline.Token).ConfigureAwait(false);
+                }
+            }
         }
-        catch
-        {
-            try { process.Kill(true); } catch { }
-            throw;
-        }
-        var output = (await stdout.ConfigureAwait(false)) + (await stderr.ConfigureAwait(false));
-        if (process.ExitCode != 0 && output.Contains("device not found", StringComparison.OrdinalIgnoreCase))
-            Volatile.Write(ref _adbSerial, null); // The modem re-enumerated; pick the target again next time.
-        if (throwOnFailure && process.ExitCode != 0)
-            throw new InvalidOperationException($"adb {string.Join(' ', arguments.Take(2))} failed ({process.ExitCode}): {output.Trim()}");
-        return new ProcessResult(process.ExitCode, output);
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        { throw new TimeoutException("Modem ADB operation timed out."); }
     }
 
-    private static string? _adbSerial;
-
-    /// <summary>
-    /// adb refuses every command with "more than one device/emulator" as soon as a phone and the
-    /// QDC507 module (or an emulator) are attached at the same time. Resolve one target —
-    /// ANDROID_SERIAL first, then a single attached device, then the first non-emulator device —
-    /// and pass -s on every invocation so the rest of the runtime keeps working unchanged.
-    /// </summary>
-    private static async Task<string?> ResolveAdbSerialAsync(CancellationToken ct)
+    private static async Task StartAdbServerIfAbsentAsync(CancellationToken ct)
     {
-        var configured = Environment.GetEnvironmentVariable("ANDROID_SERIAL");
-        if (!string.IsNullOrWhiteSpace(configured))
-            return configured.Trim();
-
-        var cached = Volatile.Read(ref _adbSerial);
-        if (!string.IsNullOrEmpty(cached)) return cached;
-
-        var output = (await RunAdbAsync(["devices"], TimeSpan.FromSeconds(10), ct, false, resolveDevice: false)
-            .ConfigureAwait(false)).Output;
-        var devices = new List<string>();
-        foreach (var line in output.Split('\n'))
+        await AdbServerGate.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            var fields = line.Trim().Split('\t', StringSplitOptions.RemoveEmptyEntries);
-            if (fields.Length < 2) continue;
-            if (!fields[1].Trim().Equals("device", StringComparison.OrdinalIgnoreCase)) continue;
-            var serial = fields[0].Trim();
-            if (serial.Length > 0) devices.Add(serial);
+            try { _ = await AdbClient.DevicesAsync(ct).ConfigureAwait(false); return; }
+            catch (System.Net.Sockets.SocketException ex) when (
+                ex.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionRefused) { }
+            var start = new ProcessStartInfo(FindAdb())
+            {
+                UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardOutput = true, RedirectStandardError = true
+            };
+            start.ArgumentList.Add("start-server"); // USB/auth server bootstrap only; never per-command CLI.
+            using var process = Process.Start(start) ?? throw new IOException("Unable to start the bundled ADB service.");
+            var stdout = process.StandardOutput.ReadToEndAsync(ct);
+            var stderr = process.StandardError.ReadToEndAsync(ct);
+            try { await process.WaitForExitAsync(ct).ConfigureAwait(false); }
+            catch { try { process.Kill(); } catch { } throw; } // Never kill the shared daemon tree.
+            _ = await stdout.ConfigureAwait(false);
+            _ = await stderr.ConfigureAwait(false);
+            if (process.ExitCode != 0) throw new IOException("The bundled ADB service could not start.");
         }
-
-        // A modem never shows up as an emulator; a phone left plugged in is not the voice runtime.
-        var candidates = devices.Where(d => !d.StartsWith("emulator-", StringComparison.OrdinalIgnoreCase)).ToList();
-        if (candidates.Count == 0) candidates = devices;
-
-        var selected = candidates.Count == 1 ? candidates[0] : await SelectQdc507Async(candidates, ct).ConfigureAwait(false);
-        Volatile.Write(ref _adbSerial, selected);
-        return selected;
+        finally { AdbServerGate.Release(); }
     }
 
-    /// <summary>
-    /// Picks the attached device that really is the QDC507 module. The phone and any emulator
-    /// that happen to be plugged in report a different kernel, so the voice runtime binds to the
-    /// one running 3.18.44 instead of whichever adb lists first.
-    /// </summary>
-    private static async Task<string?> SelectQdc507Async(List<string> candidates, CancellationToken ct)
+    private async Task<ulong> ResolveAdbTransportAsync(CancellationToken ct)
     {
+        if (_atPort == null) throw new InvalidOperationException("QDC507 runtime requires a selected physical modem.");
+        Qdc507AdbIdentity.RequireImei(_expectedImei);
+        UsbAudioModemBinding.RequireQdc507Runtime(qmiSharp.Transport.WindowsUsbTopology.EnumeratePresent(),
+            _atPort, _expectedContainer, _expectedImei);
+        // Re-enumerate transport IDs and read DMS IMEI every time. Neither duplicate
+        // '?' serials nor IDs reused after reconnect can bypass the on-device guard.
+        var devices = AdbServerClient.ParseDeviceTransports(await AdbClient.DevicesLongAsync(ct).ConfigureAwait(false),
+            Environment.GetEnvironmentVariable("ANDROID_SERIAL"));
+        return await Qdc507AdbIdentity.SelectTransportAsync(devices, _expectedImei!,
+            (id, token) => Qdc507AdbIdentity.ReadImeiAsync(AdbClient, id, token), ct).ConfigureAwait(false);
+    }
+
+    internal static async Task<string> SelectQdc507Async(IEnumerable<string> candidates,
+        Func<string, CancellationToken, Task<AdbShellResult>> probe, CancellationToken ct)
+    {
+        var matches = new List<string>();
         foreach (var serial in candidates)
         {
+            ct.ThrowIfCancellationRequested();
             try
             {
-                var result = await RunAdbAsync(["-s", serial, "shell", "uname", "-r"], TimeSpan.FromSeconds(8), ct,
-                    throwOnFailure: false, resolveDevice: false).ConfigureAwait(false);
-                if (result.Output.Contains("3.18.44", StringComparison.Ordinal)) return serial;
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                deadline.CancelAfter(TimeSpan.FromSeconds(3));
+                var result = await probe(serial, deadline.Token).ConfigureAwait(false);
+                var lines = result.Output.Replace("\r", "", StringComparison.Ordinal).Split('\n');
+                // Before preparation this firmware legitimately has no ALSA sound cards.
+                // Verify hardware/root instead; the exact sound route is checked AFTER driver loading.
+                if (result.ExitCode == 0 && lines.Length >= 3 && lines[0].Trim() == "3.18.44" &&
+                    lines[1].Trim() is "MDM9207" or "MDM9607" && lines[2].Trim() == "0") matches.Add(serial);
             }
-            catch { }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+            catch (IOException) { }
         }
-        return candidates.FirstOrDefault();
+        return matches.Count == 1 ? matches[0] :
+            throw new InvalidOperationException($"Expected exactly one verified QDC507 voice device; found {matches.Count}. No runtime changes made.");
     }
 
     private static string FindAdb()
     {
+        if (BundledRuntime.Find("adb/adb.exe") is { } bundled) return bundled;
+        if (BundledRuntime.IsAvailable)
+            throw new FileNotFoundException("内置 ADB 组件缺失，请重新启动以修复组件。");
         var candidates = new List<string>();
         var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
         candidates.AddRange(path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)

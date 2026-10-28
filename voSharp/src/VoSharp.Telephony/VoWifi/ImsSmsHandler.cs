@@ -12,7 +12,11 @@ public record RpMessage(
     byte Reference,
     byte[]? Tpdu,
     byte[]? RawPayload = null
-);
+)
+{
+    public byte? Cause => MessageType is 4 or 5 && RawPayload is { Length: >= 4 }
+        ? (byte)(RawPayload[3] & 0x7f) : null;
+}
 
 /// <summary>
 /// Handles 3GPP TS 24.341 / TS 24.011 SMS over IP (VoWiFi / IMS) delivery via SIP MESSAGE.
@@ -51,38 +55,55 @@ public static class ImsSmsHandler
     /// </summary>
     public static RpMessage ParseRpdu(byte[] data)
     {
-        if (data == null || data.Length < 2)
+        if (data == null || data.Length < 2 || data.Length > 259)
             throw new ArgumentException("RPDU is truncated.", nameof(data));
 
         byte msgType = (byte)(data[0] & 0x07);
         byte reference = data[1];
 
-        // 0 = RP-MO-DATA, 1 = RP-MT-DATA
-        if (msgType != 0 && msgType != 1)
-        {
-            return new RpMessage(msgType, reference, null, data);
-        }
-
         int index = 2;
-        // Skip RP-Originator Address and RP-Destination Address
-        for (int count = 0; count < 2; count++)
+        byte[] ReadLv(int min, int max)
         {
-            if (index >= data.Length)
-                throw new ArgumentException("RP-DATA address is truncated.", nameof(data));
+            if (index >= data.Length) throw new ArgumentException("Truncated RP field.", nameof(data));
             int len = data[index++];
-            if (len > data.Length - index)
-                throw new ArgumentException("RP-DATA address length is invalid.", nameof(data));
+            if (len < min || len > max || len > data.Length - index)
+                throw new ArgumentException("Invalid RP field length.", nameof(data));
+            var value = data.AsSpan(index, len).ToArray();
             index += len;
+            return value;
         }
-
-        if (index >= data.Length)
-            throw new ArgumentException("RP-DATA omitted user data.", nameof(data));
-
-        int tpduLen = data[index++];
-        if (tpduLen == 0 || tpduLen > data.Length - index)
-            throw new ArgumentException("RP-DATA user-data length is invalid.", nameof(data));
-
-        var tpdu = data.AsSpan(index, tpduLen).ToArray();
+        byte[]? OptionalUserData()
+        {
+            if (index == data.Length) return null;
+            if (data[index++] != 0x41) throw new ArgumentException("Unsupported RP optional field.", nameof(data));
+            return ReadLv(1, 232);
+        }
+        byte[]? tpdu = null;
+        switch (msgType)
+        {
+            case 0:
+            case 1:
+                // TS 24.011 7.3.1 allows both addresses to be nonempty.
+                for (int count = 0; count < 2; count++)
+                    if (ReadLv(0, 11).Length == 1)
+                        throw new ArgumentException("RP address omitted its digits.", nameof(data));
+                tpdu = ReadLv(1, 232);
+                break;
+            case 2:
+            case 3:
+                tpdu = OptionalUserData();
+                break;
+            case 4:
+            case 5:
+                _ = ReadLv(1, 2); // Mandatory RP-Cause, with optional diagnostic.
+                tpdu = OptionalUserData();
+                break;
+            case 6:
+                break;
+            default:
+                throw new ArgumentException("Reserved RP message type.", nameof(data));
+        }
+        if (index != data.Length) throw new ArgumentException("Trailing RP data.", nameof(data));
         return new RpMessage(msgType, reference, tpdu, data);
     }
 
@@ -135,7 +156,7 @@ public static class ImsSmsHandler
     public static byte[] EncodeRpAddress(string value)
     {
         var clean = value.Trim();
-        var digits = clean.TrimStart('+');
+        var digits = clean.StartsWith('+') ? clean[1..] : clean;
         if (digits.Length < 1 || digits.Length > 20 || !digits.All(char.IsAsciiDigit))
             throw new ArgumentException("RP address must be a SIM-provisioned phone number in E.164-compatible digits.", nameof(value));
 
@@ -324,7 +345,7 @@ public static class ImsSmsHandler
         try
         {
             var rpdu = ParseRpdu(rpDataPayload);
-            if (rpdu.Tpdu == null || rpdu.Tpdu.Length == 0) return null;
+            if (rpdu.MessageType != 1 || rpdu.Tpdu == null || rpdu.Tpdu.Length == 0) return null;
 
             var pduHex = "00" + Convert.ToHexString(rpdu.Tpdu);
             var incoming = SmsPdu.DecodePdu(pduHex);

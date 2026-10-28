@@ -24,7 +24,8 @@ public sealed class HostImsSaPlanTests
         AssertPair(plan.ServerPair, local, remote, 40667, 50601, 1002, 2001);
         Assert.Equal(IpsecAuthAlgorithm.HmacSha1_96, plan.ClientPair.Inbound.Auth);
         Assert.Equal(IpsecCipherAlgorithm.AesCbc128, plan.ClientPair.Outbound.Cipher);
-        Assert.Equal(uint.MaxValue, plan.ClientPair.Inbound.LifetimeSeconds);
+        Assert.Equal(HostImsSaPlan.WindowsSaLifetimeSeconds,
+            plan.ClientPair.Inbound.LifetimeSeconds);
     }
 
     [Fact]

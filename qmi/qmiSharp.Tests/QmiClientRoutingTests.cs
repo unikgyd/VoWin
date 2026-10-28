@@ -155,6 +155,42 @@ public sealed class QmiClientRoutingTests
     }
 
     [Fact]
+    public async Task WdsStartFailurePreservesCallEndReasonsAndReleasesCid()
+    {
+        await using var transport = new ProtocolHarnessTransport();
+        await using var client = new QmiClient(transport, new QmiClientOptions
+        {
+            SyncOnOpen = false,
+            DefaultTimeout = TimeSpan.FromSeconds(2)
+        });
+        var wds = new WdsService(client, dedicatedClientId: true);
+
+        var start = wds.StartNetworkInterfaceAsync("ims");
+        var allocate = QmiPacket.Unmarshal(await transport.Sent.Reader.ReadAsync());
+        transport.QueueResponse(SuccessResponse(allocate,
+            extra: new QmiTlv(0x01, [(byte)QmiServiceType.WDS, 12])));
+        var request = QmiPacket.Unmarshal(await transport.Sent.Reader.ReadAsync());
+        var rejection = new QmiPacket(request.ServiceType, request.ClientId,
+            request.TransactionId, request.MessageId) { IsResponse = true };
+        rejection.TLVs.Add(new QmiTlv(0x02, [1, 0, 14, 0]));
+        rejection.TLVs.Add(new QmiTlv(0x10, [0xF8, 0x03]));
+        rejection.TLVs.Add(new QmiTlv(0x11, [6, 0, 0x21, 0]));
+        transport.QueueResponse(rejection);
+
+        var error = await Assert.ThrowsAsync<WdsStartNetworkException>(() => start);
+        Assert.Equal((ushort)1016, error.CallEndReason);
+        Assert.Equal((ushort)6, error.VerboseType);
+        Assert.Equal((short)33, error.VerboseReason);
+        Assert.Null(wds.OwnedPacketDataHandle);
+
+        var disposing = wds.DisposeAsync().AsTask();
+        var release = QmiPacket.Unmarshal(await transport.Sent.Reader.ReadAsync());
+        Assert.Equal((ushort)0x0023, release.MessageId);
+        transport.QueueResponse(SuccessResponse(release));
+        await disposing;
+    }
+
+    [Fact]
     public async Task FailedWdsAbortReportsIndeterminateBearerState()
     {
         await using var transport = new ProtocolHarnessTransport();

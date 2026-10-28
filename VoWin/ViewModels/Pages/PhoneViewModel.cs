@@ -30,12 +30,35 @@ namespace VoWin.ViewModels.Pages
     public partial class PhoneViewModel : ObservableObject
     {
         private readonly IVoKernelService _kernelService;
+        public IVoKernelService GatewayService => _kernelService;
         private readonly DispatcherTimer _durationTimer;
         private DateTime? _callConnectedTime;
         private CancellationTokenSource? _statusResetCts;
         private string? _callEndReasonTitle;
         private string? _callEndReasonDetail;
         private bool _isShowingEndedSummary;
+        private bool _hangupRequested;
+        private string? _dialSlotId;
+        private VoSharp.Kernel.SipGateway.SipIncomingCallClaimed? _sipPickup;
+        [ObservableProperty] private MicrophoneUplinkStatus _microphoneStatus = new();
+        [ObservableProperty] private bool _isMicrophoneRestarting;
+        public bool ShowMicrophoneStatus => IsCallTimerVisible && MicrophoneStatus.HasSession;
+        public bool CanControlMicrophone => IsCallTimerVisible && MicrophoneStatus.HasSession;
+        public bool CanRestartMicrophone => IsCallConnected && MicrophoneStatus.CanRestart && !IsMicrophoneRestarting;
+        public string MicrophoneRestartText => MicrophoneStatus.IsMessagePlayback ? "切换到麦克风" : "重新打开麦克风";
+        partial void OnMicrophoneStatusChanged(MicrophoneUplinkStatus value)
+        {
+            IsMuted = value.IsMuted;
+            OnPropertyChanged(nameof(ShowMicrophoneStatus));
+            OnPropertyChanged(nameof(CanControlMicrophone));
+            OnPropertyChanged(nameof(CanRestartMicrophone));
+            OnPropertyChanged(nameof(MicrophoneRestartText));
+        }
+        partial void OnIsMicrophoneRestartingChanged(bool value) => OnPropertyChanged(nameof(CanRestartMicrophone));
+        internal void RefreshMicrophoneStatus() => MicrophoneStatus = _kernelService.GetMicrophoneUplinkStatus();
+        [ObservableProperty] private bool _isHangupOperationPending;
+        [ObservableProperty] private string? _callActionError;
+        partial void OnCallActionErrorChanged(string? value) => OnPropertyChanged(nameof(CallStatusSubtitle));
 
         public ObservableCollection<ModemSlot> Slots => _kernelService.Slots;
         public ObservableCollection<CallRecordModel> CallHistory => _kernelService.CallHistory;
@@ -64,7 +87,7 @@ namespace VoWin.ViewModels.Pages
         private string _callDurationText = "00:00";
 
         [ObservableProperty]
-        private string _codecInfo = "VoWiFi AMR-WB 16kHz";
+        private string _codecInfo = "等待通话协商音频";
 
         [ObservableProperty]
         [NotifyCanExecuteChangedFor(nameof(DialCommand))]
@@ -88,7 +111,25 @@ namespace VoWin.ViewModels.Pages
         public CallState CurrentCallState => _kernelService.CurrentCallState;
         public string? ActiveCallNumber => _kernelService.CurrentCallNumber;
         public bool HasIncomingCall => _kernelService.HasIncomingCall;
+        public bool IsSipRemoteCall => _sipPickup is { IsLocal: false } pickup &&
+            string.Equals(pickup.CallId, _kernelService.Kernel.ActiveCall?.CallId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(pickup.SlotId, _kernelService.Kernel.ActiveCallSlotId, StringComparison.OrdinalIgnoreCase);
+        public bool ShowIncomingControls => CurrentPhase == CallPhase.Incoming && !IsSipRemoteCall;
+        public bool ShowHangupControl => !IsEndedVisible && !ShowIncomingControls;
+        public bool ShowRegularCallActions => CurrentPhase is CallPhase.Connected or CallPhase.Held;
+        public bool CanAcceptIncoming => ShowIncomingControls && !IsCallOperationPending;
         public string? IncomingCallerNumber => _kernelService.IncomingCallerNumber;
+        public string CurrentCallLine
+        {
+            get
+            {
+                var owner = Slots.FirstOrDefault(slot => slot.Id == _kernelService.Kernel.ActiveCallSlotId);
+                if (owner == null) return "当前通话线路：等待确认";
+                var mode = owner.HasCellularCall ? "模组语音桥接" : owner.Calls.IsHostImsCall ? "Host IMS"
+                    : owner.Calls.ActiveCall != null ? "VoWiFi" : "线路待确认";
+                return $"当前通话：{owner.DisplayTitle} · {mode}（不随下方呼出设备切换）";
+            }
+        }
 
         public CallPhase CurrentPhase
         {
@@ -98,13 +139,13 @@ namespace VoWin.ViewModels.Pages
                     return CallPhase.Incoming;
                 if (_isShowingEndedSummary)
                     return CallPhase.Ended;
-                if (CurrentCallState == CallState.Active)
-                    return IsHeld ? CallPhase.Held : CallPhase.Connected;
+                if (CurrentCallState is CallState.Active or CallState.Held)
+                    return IsHeld || CurrentCallState == CallState.Held ? CallPhase.Held : CallPhase.Connected;
                 if (CurrentCallState == CallState.Ringing)
                     return CallPhase.Ringing;
                 if (CurrentCallState == CallState.Dialing)
                     return CallPhase.Dialing;
-                if (IsCallOperationPending)
+                if (IsCallOperationPending && !_hangupRequested)
                     return CallPhase.Preparing;
                 return CallPhase.Idle;
             }
@@ -122,38 +163,35 @@ namespace VoWin.ViewModels.Pages
             CallPhase.Preparing => "正在准备呼叫...",
             CallPhase.Dialing => "正在呼叫...",
             CallPhase.Ringing => "对方正在响铃...",
-            CallPhase.Connected => "通话中",
+            CallPhase.Connected => IsSipRemoteCall ? "其他分机通话中" : "通话中",
             CallPhase.Held => "通话已保持",
-            CallPhase.Incoming => "来电请求",
+            CallPhase.Incoming => IsSipRemoteCall ? "其他分机接听中" : "来电请求",
             CallPhase.Ended => _callEndReasonTitle ?? "通话已结束",
-            _ => "准备就绪"
+            _ => "拨号"
         };
 
-        public string CallStatusSubtitle => CurrentPhase switch
+        public string CallStatusSubtitle => CallActionError ?? (CurrentPhase switch
         {
-            CallPhase.Preparing => ForceCellular ? "正在发起模组蜂窝语音呼叫..." :
-                IsVoWifiRegistered ? "正在建立 VoWiFi 语音通道..." :
-                IsHostImsRegistered ? "正在建立 Windows 蜂窝 IMS 通话..." : "正在发起蜂窝移动网络呼叫...",
+            CallPhase.Preparing => ForceCellular ? "正在建立所选设备的蜂窝呼叫..." :
+                _kernelService.GetGatewayStatus(_dialSlotId ?? SelectedSlot?.Id).Route.Value,
             CallPhase.Dialing => "正在向核心网建立信令会话...",
             CallPhase.Ringing => "等待受话人接听...",
-            CallPhase.Connected => CodecInfo,
+            CallPhase.Connected => IsSipRemoteCall ? "SIP 分机已接听 · 本机麦克风未启用" : CodecInfo,
             CallPhase.Held => "对方已被置于保持状态，麦克风已暂停发送",
+            CallPhase.Incoming when IsSipRemoteCall => "本机已停止响铃 · 正在等待运营商确认接通",
+            CallPhase.Incoming when _kernelService.Kernel.LocalSipGateway?.RoutesIncomingCall(_kernelService.Kernel.ActiveCallSlotId) == true
+                => "本机与 SIP 分机同时响铃 · 任选一端接听 · 拒接结束整通",
             CallPhase.Incoming => $"SIM 卡槽: {Slots.FirstOrDefault(slot =>
                 string.Equals(slot.Id, _kernelService.Kernel.ActiveCallSlotId, StringComparison.OrdinalIgnoreCase))?.DisplayTitle
                 ?? SelectedSlot?.DisplayTitle ?? "默认卡槽"}",
             CallPhase.Ended => _callEndReasonDetail ?? (CallDurationText != "00:00" ? $"通话时长: {CallDurationText}" : "呼叫已释放"),
-            _ => VoWifiStateText
-        };
+            _ => GatewayRouteText
+        });
 
         public VoSharp.Telephony.VoWifi.VoWifiState VoWifiState => SelectedSlot?.VoWifi?.State ?? VoSharp.Telephony.VoWifi.VoWifiState.Disconnected;
         public bool IsVoWifiRegistered => VoWifiState == VoSharp.Telephony.VoWifi.VoWifiState.ImsRegistered;
         public bool IsHostImsRegistered => SelectedSlot?.GetHostImsRegistrationStatus().IsRegistered == true;
-        public string VoWifiStateText => VoWifiState switch
-        {
-            VoSharp.Telephony.VoWifi.VoWifiState.ImsRegistered => "VoWiFi 高清语音已就绪",
-            VoSharp.Telephony.VoWifi.VoWifiState.ConnectingIkev2 or VoSharp.Telephony.VoWifi.VoWifiState.ImsRegistering or VoSharp.Telephony.VoWifi.VoWifiState.IpsecTunnelEstablished or VoSharp.Telephony.VoWifi.VoWifiState.AuthenticatingEapAka or VoSharp.Telephony.VoWifi.VoWifiState.ResolvingEpdg => "VoWiFi 正在建立通道...",
-            _ => "VoWiFi 未连接 (拨号时自动建立)"
-        };
+        public string GatewayRouteText => _kernelService.GetGatewayStatus(SelectedSlot?.Id).Route.Value;
 
         public PhoneViewModel(IVoKernelService kernelService)
         {
@@ -164,28 +202,30 @@ namespace VoWin.ViewModels.Pages
 
             _durationTimer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromSeconds(1)
+                Interval = TimeSpan.FromMilliseconds(250)
             };
             _durationTimer.Tick += (s, e) =>
             {
-                if (_callConnectedTime is { } connTime && CurrentCallState == CallState.Active)
+                if (_callConnectedTime is { } connTime && CurrentCallState is CallState.Active or CallState.Held)
                 {
                     var span = DateTime.UtcNow - connTime;
                     CallDurationText = $"{(int)span.TotalMinutes:D2}:{span.Seconds:D2}";
+                    RefreshMicrophoneStatus();
                     NotifyCallStateVisuals();
 
-                    if (Views.Windows.InCallFloatingWindow.IsShowing)
-                    {
-                        Views.Windows.InCallFloatingWindow.UpdateDurationText(CallDurationText);
-                        if (!string.IsNullOrEmpty(ActiveCallNumber))
-                        {
-                            Views.Windows.InCallFloatingWindow.UpdateNumberText(ActiveCallNumber);
-                        }
-                    }
                 }
             };
 
             // Listen to state changes
+            _kernelService.Kernel.SipIncomingCallClaimed += (_, pickup) =>
+            {
+                void Apply()
+                {
+                    PresentSipIncomingPickup(pickup);
+                }
+                if (App.Current?.Dispatcher is { } dispatcher && !dispatcher.CheckAccess()) dispatcher.BeginInvoke((Action)Apply);
+                else Apply();
+            };
             _kernelService.Kernel.CallStateChanged += (s, e) =>
             {
                 App.Current?.Dispatcher.BeginInvoke(new Action(() =>
@@ -195,9 +235,10 @@ namespace VoWin.ViewModels.Pages
                     if (e.NewState == CallState.Active)
                     {
                         _isShowingEndedSummary = false;
-                        _callConnectedTime = DateTime.UtcNow;
+                        IsHeld = false;
+                        _callConnectedTime = _kernelService.Kernel.ActiveCall?.ConnectedTime ?? DateTime.UtcNow;
                         _durationTimer.Start();
-                        CodecInfo = !string.IsNullOrEmpty(e.Codec) ? e.Codec : "VoWiFi AMR-WB 16kHz";
+                        CodecInfo = !string.IsNullOrEmpty(e.Codec) ? e.Codec : "等待实际音频格式";
                     }
                     else if (e.NewState == CallState.Ringing)
                     {
@@ -206,6 +247,10 @@ namespace VoWin.ViewModels.Pages
                     else if (e.NewState == CallState.Dialing)
                     {
                         _isShowingEndedSummary = false;
+                    }
+                    else if (e.NewState == CallState.Held)
+                    {
+                        IsHeld = true;
                     }
                     NotifyCallStateVisuals();
                 }), DispatcherPriority.DataBind);
@@ -239,12 +284,7 @@ namespace VoWin.ViewModels.Pages
                     {
                         var promoted = _kernelService.Kernel.ActiveCall;
                         if (promoted == null || !_kernelService.IsPresentedCallEvent(promoted.CallId)) return;
-                        _isShowingEndedSummary = false;
-                        _callConnectedTime = promoted.State == CallState.Active ? promoted.ConnectedTime : null;
-                        if (!string.IsNullOrWhiteSpace(promoted.Codec)) CodecInfo = promoted.Codec;
-                        if (_callConnectedTime.HasValue) _durationTimer.Start();
-                        else _durationTimer.Stop();
-                        NotifyCallStateVisuals();
+                        ShowPromotedCall(promoted);
                         return;
                     }
                     _durationTimer.Stop();
@@ -349,7 +389,24 @@ namespace VoWin.ViewModels.Pages
             OnPropertyChanged(nameof(CallStatusSubtitle));
             OnPropertyChanged(nameof(ActiveCallNumber));
             OnPropertyChanged(nameof(HasIncomingCall));
+            OnPropertyChanged(nameof(IsSipRemoteCall));
+            OnPropertyChanged(nameof(ShowIncomingControls));
+            OnPropertyChanged(nameof(ShowHangupControl));
+            OnPropertyChanged(nameof(ShowRegularCallActions));
+            OnPropertyChanged(nameof(CanAcceptIncoming));
             OnPropertyChanged(nameof(IncomingCallerNumber));
+            OnPropertyChanged(nameof(CurrentCallLine));
+            OnPropertyChanged(nameof(ShowMicrophoneStatus));
+            OnPropertyChanged(nameof(CanControlMicrophone));
+            OnPropertyChanged(nameof(CanRestartMicrophone));
+        }
+
+        internal void PresentSipIncomingPickup(VoSharp.Kernel.SipGateway.SipIncomingCallClaimed pickup)
+        {
+            if (!_kernelService.IsPresentedCallEvent(pickup.CallId) ||
+                !string.Equals(_kernelService.Kernel.ActiveCallSlotId, pickup.SlotId, StringComparison.OrdinalIgnoreCase)) return;
+            _sipPickup = pickup;
+            NotifyCallStateVisuals();
         }
 
         private void ScheduleStatusReset(TimeSpan delay)
@@ -357,6 +414,25 @@ namespace VoWin.ViewModels.Pages
             _statusResetCts?.Cancel();
             _statusResetCts = new CancellationTokenSource();
             _ = ResetStatusLaterAsync(delay, _statusResetCts.Token);
+        }
+
+        private void ShowPromotedCall(CallSession call)
+        {
+            _statusResetCts?.Cancel();
+            _isShowingEndedSummary = false;
+            _callEndReasonTitle = null;
+            _callEndReasonDetail = null;
+            CallActionError = null;
+            DtmfSentHistory = string.Empty;
+            ShowInCallKeypad = false;
+            IsHeld = call.State == CallState.Held;
+            _callConnectedTime = call.State is CallState.Active or CallState.Held ? call.ConnectedTime : null;
+            var duration = _callConnectedTime.HasValue ? DateTime.UtcNow - _callConnectedTime.Value : TimeSpan.Zero;
+            CallDurationText = $"{(int)duration.TotalMinutes:D2}:{duration.Seconds:D2}";
+            CodecInfo = !string.IsNullOrWhiteSpace(call.Codec) ? call.Codec : "等待通话协商音频";
+            if (_callConnectedTime.HasValue) _durationTimer.Start();
+            else _durationTimer.Stop();
+            NotifyCallStateVisuals();
         }
 
         private async Task ResetStatusLaterAsync(TimeSpan delay, CancellationToken token)
@@ -442,6 +518,9 @@ namespace VoWin.ViewModels.Pages
             if (string.IsNullOrWhiteSpace(PhoneNumber) || IsCallOperationPending) return;
 
             IsCallOperationPending = true;
+            _hangupRequested = false;
+            CallActionError = null;
+            _dialSlotId = SelectedSlot?.Id;
             _isShowingEndedSummary = false;
             _callEndReasonTitle = null;
             _callEndReasonDetail = null;
@@ -453,8 +532,9 @@ namespace VoWin.ViewModels.Pages
             {
                 _callConnectedTime = null;
                 CallDurationText = "00:00";
-                await _kernelService.DialAsync(PhoneNumber.Trim(), SelectedSlot?.Id, ForceCellular);
+                await _kernelService.DialAsync(PhoneNumber.Trim(), _dialSlotId, ForceCellular);
             }
+            catch (OperationCanceledException) when (_hangupRequested) { }
             catch (Exception ex)
             {
                 _callEndReasonTitle = "呼叫发起失败";
@@ -465,6 +545,7 @@ namespace VoWin.ViewModels.Pages
             finally
             {
                 IsCallOperationPending = false;
+                _dialSlotId = null;
                 NotifyCallStateVisuals();
             }
         }
@@ -479,7 +560,7 @@ namespace VoWin.ViewModels.Pages
                 bool ok = await _kernelService.StartVoWifiAsync(SelectedSlot.Id);
                 OnPropertyChanged(nameof(VoWifiState));
                 OnPropertyChanged(nameof(IsVoWifiRegistered));
-                OnPropertyChanged(nameof(VoWifiStateText));
+                OnPropertyChanged(nameof(GatewayRouteText));
                 OnPropertyChanged(nameof(CallStatusSubtitle));
             }
             catch (Exception ex)
@@ -498,22 +579,31 @@ namespace VoWin.ViewModels.Pages
             OnPropertyChanged(nameof(VoWifiState));
             OnPropertyChanged(nameof(IsVoWifiRegistered));
             OnPropertyChanged(nameof(IsHostImsRegistered));
-            OnPropertyChanged(nameof(VoWifiStateText));
+            OnPropertyChanged(nameof(GatewayRouteText));
             OnPropertyChanged(nameof(CallStatusSubtitle));
         }
 
         [RelayCommand]
         private async Task HangupAsync()
         {
-            if (IsCallOperationPending) return;
-            IsCallOperationPending = true;
+            // INVITE can wait minutes for a final response. Hangup must remain
+            // available during that wait, on the original call's slot.
+            if (IsHangupOperationPending) return;
+            IsHangupOperationPending = true;
+            _hangupRequested = true;
+            CallActionError = null;
+            var originalCall = _kernelService.Kernel.ActiveCall;
             try
             {
-                await _kernelService.HangupAsync(_kernelService.Kernel.ActiveCallSlotId ?? SelectedSlot?.Id);
-            }
-            finally
-            {
-                IsCallOperationPending = false;
+                await _kernelService.HangupAsync(_kernelService.Kernel.ActiveCallSlotId ?? _dialSlotId ?? SelectedSlot?.Id);
+                // Ending this call can promote another module's call before
+                // the command returns. Its UI/media belong to that new call,
+                // not to this completed command's delayed continuation.
+                if (_kernelService.Kernel.ActiveCall is { } next && !ReferenceEquals(next, originalCall))
+                {
+                    ShowPromotedCall(next);
+                    return;
+                }
                 _durationTimer.Stop();
                 _callConnectedTime = null;
                 Views.Windows.InCallFloatingWindow.Dismiss();
@@ -523,6 +613,13 @@ namespace VoWin.ViewModels.Pages
                 NotifyCallStateVisuals();
                 ScheduleStatusReset(TimeSpan.FromSeconds(4.5));
             }
+            catch (Exception ex)
+            {
+                _hangupRequested = false;
+                CallActionError = $"挂断失败：{ex.Message}";
+                NotifyCallStateVisuals();
+            }
+            finally { IsHangupOperationPending = false; }
         }
 
         [RelayCommand]
@@ -549,8 +646,9 @@ namespace VoWin.ViewModels.Pages
         [RelayCommand]
         private async Task AnswerAsync()
         {
-            if (IsCallOperationPending) return;
+            if (IsCallOperationPending || IsSipRemoteCall) return;
             IsCallOperationPending = true;
+            CallActionError = null;
             try
             {
                 await _kernelService.AnswerAsync(_kernelService.Kernel.ActiveCallSlotId ?? SelectedSlot?.Id);
@@ -559,10 +657,8 @@ namespace VoWin.ViewModels.Pages
             }
             catch (Exception ex)
             {
-                _callEndReasonTitle = "接听失败";
-                _callEndReasonDetail = ex.Message;
-                _isShowingEndedSummary = true;
-                ScheduleStatusReset(TimeSpan.FromSeconds(4.5));
+                CallActionError = $"接听失败：{ex.Message}";
+                NotifyCallStateVisuals();
             }
             finally
             {
@@ -576,9 +672,16 @@ namespace VoWin.ViewModels.Pages
         {
             if (IsCallOperationPending) return;
             IsCallOperationPending = true;
+            CallActionError = null;
+            var originalCall = _kernelService.Kernel.ActiveCall;
             try
             {
                 await _kernelService.RejectAsync(_kernelService.Kernel.ActiveCallSlotId ?? SelectedSlot?.Id);
+                if (_kernelService.Kernel.ActiveCall is { } next && !ReferenceEquals(next, originalCall))
+                {
+                    ShowPromotedCall(next);
+                    return;
+                }
                 _isShowingEndedSummary = true;
                 _callEndReasonTitle = "已拒接";
                 _callEndReasonDetail = "已拒绝该来电";
@@ -587,10 +690,8 @@ namespace VoWin.ViewModels.Pages
             }
             catch (Exception ex)
             {
-                _callEndReasonTitle = "拒接异常";
-                _callEndReasonDetail = ex.Message;
-                _isShowingEndedSummary = true;
-                ScheduleStatusReset(TimeSpan.FromSeconds(3.5));
+                CallActionError = $"拒接失败：{ex.Message}";
+                NotifyCallStateVisuals();
             }
             finally
             {
@@ -602,7 +703,21 @@ namespace VoWin.ViewModels.Pages
         [RelayCommand]
         private void ToggleMute()
         {
-            IsMuted = !IsMuted;
+            if (_kernelService.SetMicrophoneMuted(!IsMuted)) RefreshMicrophoneStatus();
+        }
+
+        [RelayCommand]
+        private async Task RestartMicrophoneAsync()
+        {
+            if (!CanRestartMicrophone) return;
+            IsMicrophoneRestarting = true;
+            try
+            {
+                await _kernelService.RestartMicrophoneAsync();
+                RefreshMicrophoneStatus();
+            }
+            catch (Exception ex) { CallActionError = $"麦克风重试失败：{ex.GetType().Name}"; }
+            finally { IsMicrophoneRestarting = false; }
         }
 
         [RelayCommand]

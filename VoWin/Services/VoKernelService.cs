@@ -29,7 +29,7 @@ using VoWin.Models;
 
 namespace VoWin.Services
 {
-    public class VoKernelService : IVoKernelService, INotifyPropertyChanged, ICellularSipMediaProvider
+    public partial class VoKernelService : IVoKernelService, INotifyPropertyChanged, ICellularSipMediaProvider
     {
         public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -58,6 +58,7 @@ namespace VoWin.Services
         }
 
         private readonly ConcurrentDictionary<string, byte> _autoVoWifiStarts = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingDialCancellations = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, long> _voWifiIntentVersions = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, bool> _voWifiDesiredStates = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, Lazy<Task<bool>>> _profileSwitchTasks = new(StringComparer.OrdinalIgnoreCase);
@@ -107,6 +108,7 @@ namespace VoWin.Services
         public IPreferenceDatabaseService Preferences { get; }
         private readonly Dispatcher _dispatcher;
         private CancellationTokenSource? _usbDebounceCts;
+        private readonly object _usbDebounceGate = new();
         private readonly ConcurrentQueue<LogEntryModel> _pendingUiLogs = new();
         private readonly Channel<string> _logLines = Channel.CreateBounded<string>(new BoundedChannelOptions(4096)
         {
@@ -117,18 +119,16 @@ namespace VoWin.Services
         private readonly CancellationTokenSource _logWriterCts = new();
         private readonly Task _logWriterTask;
         private readonly SemaphoreSlim _slotDiscoveryGate = new(1, 1);
+        private readonly CancellationTokenSource _discoveryShutdown = new();
         private int _logDrainScheduled;
         private int _slotSyncScheduled;
         private int _slotSyncRequestVersion;
 
         // Microphone capture
         private NAudio.Wave.WaveIn? _waveIn;
-        private readonly CellularAudioBridge _cellularAudioBridge = new();
-        private readonly Qdc507VoiceRuntime _qdc507VoiceRuntime = new();
-        private int _qdc507VoiceRouteActive;
+        private DesktopMicrophoneSession? _microphoneSession;
         private readonly CallAlerting _callAlerting = new();
         private readonly CallExperienceSettingsStore _callExperienceStore = new();
-        private CancellationTokenSource? _cellularCallAudioCts;
         private string? _desktopAudioCallId;
         private string? _desktopAudioSlotId;
         private enum DesktopAudioKind { None, Microphone, CellularUsb }
@@ -140,10 +140,13 @@ namespace VoWin.Services
         private readonly ConcurrentDictionary<string, DateTime> _recordedCallEvents = new(StringComparer.OrdinalIgnoreCase);
         private readonly SemaphoreSlim _desktopAudioTransition = new(1, 1);
         private CancellationTokenSource? _incomingAutoAnswerCts;
+        private readonly SemaphoreSlim _incomingAnswerGate = new(1, 1);
         private CallExperienceSettings _callExperience = new();
-        private string? _pendingAutoAnswerMessagePath;
+        private readonly AutoAnswerMessageRequests _autoAnswerMessages = new();
+        private CancellationTokenSource? _autoAnswerPlaybackCts;
+        private Task? _autoAnswerPlaybackTask;
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _syncingSlots = new();
-        private readonly ConcurrentDictionary<string, byte> _cellularSipReservations = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, CellularSipReservation> _cellularSipReservations = new(StringComparer.OrdinalIgnoreCase);
         private readonly object _cellularSipReservationGate = new();
 
         private static string CallEventKey(string? slotId, string callId) => $"{slotId ?? "fallback"}\0{callId}";
@@ -155,6 +158,10 @@ namespace VoWin.Services
             IncomingCallerNumber = callerNumber;
             CurrentCallNumber = callerNumber;
             CurrentCallState = CallState.Incoming;
+            if (Kernel.LocalSipGateway?.RoutesIncomingCall(slotId) == true)
+            {
+                AddLog("INFO", "SipGateway", "Incoming call rings on this desktop and SIP endpoints; first pickup owns the call.");
+            }
             if (string.Equals(_shownIncomingCallId, callId, StringComparison.OrdinalIgnoreCase)) return;
             _shownIncomingCallId = callId;
 
@@ -169,7 +176,8 @@ namespace VoWin.Services
                     await AnswerAsync(slotId);
                     TrayManager.RestoreMainWindow();
                 },
-                onReject: async () => { await RejectAsync(slotId); });
+                onReject: async () => { await RejectAsync(slotId); },
+                simultaneousSip: Kernel.LocalSipGateway?.RoutesIncomingCall(slotId) == true);
             StartIncomingAlertingAndAutoAnswer(slotId);
         }
 
@@ -177,7 +185,7 @@ namespace VoWin.Services
         {
             lock (_cellularSipReservationGate)
             {
-                if (kind == DesktopAudioKind.CellularUsb && !_cellularSipReservations.IsEmpty)
+                if (kind == DesktopAudioKind.CellularUsb && IsReserved(slotId))
                     return false;
                 if (_desktopAudioCallId != null)
                     return false;
@@ -206,6 +214,7 @@ namespace VoWin.Services
 
         private void ReconcileRemovedCallSlot(string slotId)
         {
+            _autoAnswerMessages.RemoveSlot(slotId);
             Task audioCleanup = Task.CompletedTask;
             string? audioCallId;
             lock (_cellularSipReservationGate)
@@ -216,10 +225,7 @@ namespace VoWin.Services
                 var kind = ReleaseDesktopAudioClaim(audioCallId, slotId);
                 if (kind == DesktopAudioKind.CellularUsb)
                 {
-                    var audioCts = Interlocked.Exchange(ref _cellularCallAudioCts, null);
-                    audioCts?.Cancel();
-                    audioCts?.Dispose();
-                    audioCleanup = StopDesktopCellularAudioAsync();
+                    audioCleanup = StopDesktopCellularAudioAsync(slotId, audioCallId);
                 }
                 else if (kind == DesktopAudioKind.Microphone)
                     StopMicrophone();
@@ -265,15 +271,34 @@ namespace VoWin.Services
                 _ = ResumePromotedCallAudioAsync(audioCleanup, connected);
         }
 
-        public VoKernelService(IPreferenceDatabaseService? preferences = null)
+        private readonly string? _diagnosticLogPath;
+        private readonly Action<SmsMessageModel, string?> _smsNotificationPresenter;
+
+        public VoKernelService(IPreferenceDatabaseService? preferences = null, TelephonySettingsStore? telephonySettingsStore = null,
+            string? diagnosticLogPath = null, Action<SmsMessageModel, string?>? smsNotificationPresenter = null,
+            Dispatcher? uiDispatcher = null)
         {
-            _dispatcher = Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
+            _diagnosticLogPath = diagnosticLogPath;
+            _smsNotificationPresenter = smsNotificationPresenter ?? ((item, slotName) =>
+            {
+                try { SoundEffectService.Instance.PlaySmsChime(); }
+                catch (Exception ex) { AddLog("WARN", "SMS", $"Notification sound failed ({ex.GetType().Name})."); }
+                Views.Windows.IncomingSmsFloatingWindow.ShowNotification(item, slotName);
+            });
+            var diagnosticDirectory = string.IsNullOrWhiteSpace(diagnosticLogPath)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VoWin", "Logs", "Diagnostics")
+                : Path.Combine(Path.GetDirectoryName(Path.GetFullPath(diagnosticLogPath))!, "Diagnostics");
+            _diagnosticRecorder = new DiagnosticRecorder(diagnosticDirectory);
+            _dispatcher = uiDispatcher ?? Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
             Preferences = preferences ?? new PreferenceDatabaseService();
-            Kernel = new VoKernel();
+            if (telephonySettingsStore != null) _telephonySettingsStore = telephonySettingsStore;
+            var ikeRetry = new IkeRetryGate(Preferences as IIkeRetryJournalStore ?? new UnavailableIkeRetryJournalStore(), new WindowsIkeRetryClock());
+            Kernel = new VoKernel(ikeRetry: ikeRetry);
             Kernel.CellularSipMediaProvider = this;
             _logWriterTask = RunLogWriterAsync(_logWriterCts.Token);
 
             RegisterKernelEvents();
+            _diagnosticSampler = SampleDiagnosticsAsync(_diagnosticSamplerCts.Token);
         }
 
         private static readonly HashSet<string> LegacyBundledCountryCodes = new(StringComparer.OrdinalIgnoreCase)
@@ -346,6 +371,11 @@ namespace VoWin.Services
             try
             {
                 await Preferences.InitializeAsync();
+                _telephonySettings = await _telephonySettingsStore.LoadAsync();
+                Kernel.Pool.ControlPreference = _telephonySettings.ControlPreference;
+                _diagnosticRecorder.SetEnabled(_telephonySettings.DetailedDiagnosticsEnabled);
+                PropertyChanged?.Invoke(this, new(nameof(DetailedDiagnosticsEnabled)));
+                RecordDiagnosticState("Application initialization");
                 _callExperience = await _callExperienceStore.LoadAsync();
                 ApplyVolteAudioPrewarmPreference();
                 ApplyCallRecordingPreference();
@@ -473,6 +503,8 @@ namespace VoWin.Services
 
             await RunOnUiAsync(SyncSlots);
 
+            await RestoreSipGatewayOnStartupAsync().ConfigureAwait(false);
+
             AddLog("INFO", "VoKernelService", "Starting initial Modem scan...");
             InitialScanStatus = "正在并发扫描串口设备…";
             try
@@ -480,7 +512,8 @@ namespace VoWin.Services
                 var ports = SerialPort.GetPortNames();
                 AddLog("INFO", "VoKernelService", $"Ports: [{(ports.Length > 0 ? string.Join(", ", ports) : "None")}]");
 
-                var found = await DiscoverSlotsCoreAsync();
+                var found = _telephonySettings.AutoDiscoverModems
+                    ? await DiscoverSlotsCoreAsync() : Array.Empty<ModemSlot>();
                 await RunOnUiAsync(SyncSlots);
                 AddLog("INFO", "VoKernelService", $"Scan finished, found {found.Count} slots");
 
@@ -524,6 +557,20 @@ namespace VoWin.Services
 
         private void RegisterKernelEvents()
         {
+            Kernel.SipIncomingCallClaimed += (_, pickup) => PostToUi(() =>
+            {
+                if (!string.Equals(Kernel.ActiveCall?.CallId, pickup.CallId, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(Kernel.ActiveCallSlotId, pickup.SlotId, StringComparison.OrdinalIgnoreCase)) return;
+                StopIncomingAlerting();
+                if (!pickup.IsLocal)
+                {
+                    HasIncomingCall = false;
+                    Views.Windows.IncomingCallFloatingWindow.Dismiss();
+                }
+                AddLog("INFO", "SipGateway", pickup.IsLocal
+                    ? "Desktop accepted the incoming call; SIP ringing branches are being cancelled."
+                    : "A SIP endpoint accepted the incoming call; desktop ringing and automatic answer stopped.");
+            });
             // Call Events
             Kernel.CallStateChanged += (s, e) =>
             {
@@ -616,10 +663,7 @@ namespace VoWin.Services
                     var desktopAudioKind = ReleaseDesktopAudioClaim(e.CallId, e.SlotId);
                     if (desktopAudioKind == DesktopAudioKind.CellularUsb)
                     {
-                        var audioCts = Interlocked.Exchange(ref _cellularCallAudioCts, null);
-                        audioCts?.Cancel();
-                        audioCts?.Dispose();
-                        audioCleanup = StopDesktopCellularAudioAsync();
+                        audioCleanup = StopDesktopCellularAudioAsync(e.SlotId, e.CallId);
                     }
                     else if (desktopAudioKind == DesktopAudioKind.Microphone)
                     {
@@ -633,6 +677,7 @@ namespace VoWin.Services
                     }
 
                     var key = CallEventKey(e.SlotId, e.CallId);
+                    _autoAnswerMessages.Remove(e.CallId, e.SlotId);
                     _connectedCallEvents.TryRemove(key, out _);
                     var hasMetadata = _callEventMetadata.TryRemove(key, out var metadata);
                     var dur = e.Duration ?? (hasMetadata ? e.EndedAt - metadata.Started : TimeSpan.Zero);
@@ -686,7 +731,7 @@ namespace VoWin.Services
             // SMS Events
             Kernel.SmsReceived += (s, e) =>
             {
-                _ = AddIncomingSmsAsync(e.Message, e.SlotId);
+                _ = PersistIncomingSmsEventAsync(e.Message, e.SlotId, e.SimBinding);
                 AddLog("INFO", "SMS", $"Received SMS on slot {e.SlotId ?? "unknown"}; body omitted from diagnostics.");
             };
 
@@ -702,11 +747,30 @@ namespace VoWin.Services
             };
 
             // Slot & Pool Events
+            Kernel.SimStateChanged += (s, e) =>
+            {
+                if (string.IsNullOrWhiteSpace(e.SlotId) || !Kernel.Pool.Slots.TryGetValue(e.SlotId, out var slot)) return;
+                if (IsTelephonyTransitioning(slot.Id) || slot.IsHostImsPppTransitionOrActive) return;
+                if (e.Sim == null)
+                {
+                    slot.TelephonyEnabled = false;
+                    GetModuleInstance(slot.Id).CellularStatus = null;
+                    foreach (var key in _restoredTelephonyCards.Keys.Where(key => key.StartsWith(slot.Id + ":", StringComparison.Ordinal)))
+                        _restoredTelephonyCards.TryRemove(key, out _);
+                }
+                else if (e.State.Equals("READY", StringComparison.OrdinalIgnoreCase))
+                    _ = ApplyPreferencesToSlotAsync(slot);
+            };
             Kernel.SlotListChanged += (s, e) =>
             {
                 RequestSlotSync();
             };
-            Kernel.Pool.SlotRemoved += (s, slotId) => PostToUi(() => ReconcileRemovedCallSlot(slotId));
+            Kernel.Pool.SlotRemoved += (s, slotId) =>
+            {
+                if (_moduleInstances.TryRemove(slotId, out var instance)) instance.Dispose();
+                _ = DisposeRemovedCellularMediaAsync(slotId);
+                PostToUi(() => ReconcileRemovedCallSlot(slotId));
+            };
 
             Kernel.ActiveSlotChanged += (s, e) =>
             {
@@ -737,6 +801,7 @@ namespace VoWin.Services
             Kernel.VoWifiStateChanged += (s, e) =>
             {
                 AddLog("INFO", "VoWiFi", $"VoWiFi state: {e.NewState}");
+                RecordDiagnosticState($"VoWiFi transition: {e.NewState}");
             };
 
             Kernel.LogEmitted += (s, e) =>
@@ -748,6 +813,7 @@ namespace VoWin.Services
             Kernel.SystemErrorOccurred += (s, e) =>
             {
                 AddLog("ERROR", e.Source, e.ErrorMessage);
+                RecordDiagnosticState("System error");
             };
         }
 
@@ -825,6 +891,7 @@ namespace VoWin.Services
         {
             var now = DateTime.Now;
             message = DiagnosticLogRedactor.Redact(message);
+            _diagnosticRecorder.Record(level, source, message);
             _pendingUiLogs.Enqueue(new LogEntryModel
             {
                 Timestamp = now,
@@ -870,8 +937,14 @@ namespace VoWin.Services
             }
         }
 
-        private static string GetLogFilePath()
+        private string GetLogFilePath()
         {
+            if (!string.IsNullOrWhiteSpace(_diagnosticLogPath))
+            {
+                var path = Path.GetFullPath(_diagnosticLogPath);
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                return path;
+            }
             var logDirectory = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "VoWin",
@@ -969,7 +1042,41 @@ namespace VoWin.Services
 
         private void AddIncomingSms(SmsMessage msg, string? slotId) => _ = AddIncomingSmsAsync(msg, slotId);
 
-        private async Task AddIncomingSmsAsync(SmsMessage msg, string? slotId)
+        private async Task PersistIncomingSmsEventAsync(SmsMessage msg, string? slotId, string? simBinding)
+        {
+            // Capture synchronously, before any database or UI wait. Newly
+            // created accounts must never receive an older unscanned message.
+            IReadOnlyList<SipSmsForwardRecipient> recipients;
+            var replyNumber = "";
+            try
+            {
+                // Keep one runtime reference for both snapshots; a later
+                // gateway must not supply either recipient or country policy.
+                var gateway = Kernel.LocalSipGateway;
+                recipients = gateway?.CaptureSmsForwardRecipients(slotId) ?? [];
+                if (SmsSubscriptionIdentity.IsValid(simBinding))
+                    replyNumber = gateway?.CaptureSmsReplyNumber(slotId, msg.SenderOrRecipient) ?? "";
+            }
+            catch (Exception ex)
+            {
+                recipients = [];
+                AddLog("WARN", "SipGateway", $"Incoming SMS forwarding plan unavailable ({ex.GetType().Name}); keeping the local inbox path.");
+            }
+            try { await AddIncomingSmsWithForwardPlanAsync(msg, slotId, simBinding, recipients, replyNumber).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                AddLog("WARN", "SMS", $"Incoming SMS was not saved ({ex.GetType().Name}); source metadata and content omitted.");
+            }
+        }
+
+        private Task AddIncomingSmsAsync(SmsMessage msg, string? slotId) =>
+            AddIncomingSmsWithSourceAsync(msg, slotId, simBinding: null);
+
+        private Task AddIncomingSmsWithSourceAsync(SmsMessage msg, string? slotId, string? simBinding) =>
+            AddIncomingSmsWithForwardPlanAsync(msg, slotId, simBinding, []);
+
+        private async Task AddIncomingSmsWithForwardPlanAsync(SmsMessage msg, string? slotId, string? simBinding,
+            IReadOnlyList<SipSmsForwardRecipient> recipients, string? replyNumber = null)
         {
             var remote = !string.IsNullOrWhiteSpace(msg.SenderOrRecipient) ? msg.SenderOrRecipient : "Unknown";
             var receivedAtUtc = DateTime.UtcNow;
@@ -977,12 +1084,6 @@ namespace VoWin.Services
             if (normalizedTimestamp != TimestampDisplayHelper.ToUtcStorageTime(msg.Timestamp))
             {
                 AddLog("INFO", "SMS", $"Corrected network timestamp from {msg.Timestamp:o} to {normalizedTimestamp:o}");
-            }
-
-            var exists = await Preferences.HasSmsMessageAsync(remote, normalizedTimestamp, msg.Text, msg.RawPdu).ConfigureAwait(false);
-            if (exists)
-            {
-                return;
             }
 
             var item = new SmsMessageModel
@@ -996,16 +1097,25 @@ namespace VoWin.Services
                 DeliveryState = SmsDeliveryState.Received,
                 DeliveryStatus = msg.DeliveryStatus,
                 MessageReference = msg.MessageReference,
-                RawPdu = msg.RawPdu
+                RawPdu = msg.RawPdu,
+                SimBinding = SmsSubscriptionIdentity.IsValid(simBinding) ? simBinding : null,
+                SourceMessageId = msg.Id,
+                SipReplyNumberSnapshot = replyNumber
             };
 
-            await Preferences.SaveSmsMessageAsync(item).ConfigureAwait(false);
+            var committed = await Preferences.SaveIncomingSmsWithForwardsAsync(item, recipients).ConfigureAwait(false);
+            if (!committed.IsNew) return;
+            if (committed.ForwardingCapacityExceeded)
+                AddLog("WARN", "SipGateway", "Incoming SMS saved; forwarding storage capacity/protection window prevented a new recipient plan; no partial plan was queued.");
+            if (committed.ForwardingUnsupported)
+                AddLog("WARN", "SipGateway", "Incoming SMS saved; forwarding source or content is outside supported SIP bounds.");
+            if (committed.QueuedRecipients > 0) Kernel.LocalSipGateway?.NotifySmsInboxCommitted();
             try { IncomingSmsReceived?.Invoke(item); } catch { }
 
             await RunOnUiAsync(() =>
             {
                 var conv = GetOrCreateConversation(remote);
-                if (!conv.Messages.Any(m => m.Timestamp == item.Timestamp && m.Text == item.Text))
+                if (!conv.Messages.Any(m => m.Id == item.Id))
                 {
                     conv.Messages.Add(item);
                     conv.UnreadCount++;
@@ -1013,16 +1123,15 @@ namespace VoWin.Services
                     MoveConversationToTop(conv);
                 }
 
-                // If incoming SMS contains verification code (OTP): play alert chime and show floating notification window
-                if (item.HasOtpCode)
+                // All newly received SMS deserve a notification, not only OTPs.
+                var slotName = !string.IsNullOrEmpty(slotId)
+                    ? Slots.FirstOrDefault(s => s.Id.Equals(slotId, StringComparison.OrdinalIgnoreCase))?.Name ?? "SIM"
+                    : ActiveSlot?.Name ?? "SIM";
+                try
                 {
-                    var slotName = !string.IsNullOrEmpty(slotId)
-                        ? Slots.FirstOrDefault(s => s.Id.Equals(slotId, StringComparison.OrdinalIgnoreCase))?.Name
-                        : ActiveSlot?.Name ?? "SIM 1";
-
-                    SoundEffectService.Instance.PlaySmsChime();
-                    Views.Windows.IncomingSmsFloatingWindow.ShowNotification(item, slotName);
+                    _smsNotificationPresenter(item, slotName);
                 }
+                catch (Exception ex) { AddLog("WARN", "SMS", $"Notification failed ({ex.GetType().Name}); received SMS remains saved."); }
             }).ConfigureAwait(false);
         }
 
@@ -1086,11 +1195,15 @@ namespace VoWin.Services
             AddLog("INFO", "ModemPool", "Scanning system COM ports for modem hardware...");
             var slots = await DiscoverSlotsCoreAsync();
             await RunOnUiAsync(SyncSlots);
+            foreach (var slot in slots)
+                await ApplyPreferencesToSlotAsync(slot).ConfigureAwait(false);
             return slots;
         }
 
         private async Task<IReadOnlyList<ModemSlot>> DiscoverSlotsCoreAsync(CancellationToken cancellationToken = default)
         {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _discoveryShutdown.Token);
+            cancellationToken = linked.Token;
             await _slotDiscoveryGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
@@ -1130,7 +1243,7 @@ namespace VoWin.Services
         public async Task RefreshMetricsAsync(string? slotId = null)
         {
             var slot = !string.IsNullOrWhiteSpace(slotId)
-                ? Kernel.Pool.Slots.GetValueOrDefault(slotId) ?? Kernel.Pool.ActiveSlot
+                ? Kernel.Pool.Slots.GetValueOrDefault(slotId) ?? throw new KeyNotFoundException("所选模组已断开，未刷新其他线路。")
                 : Kernel.Pool.ActiveSlot;
             if (slot != null)
             {
@@ -1326,12 +1439,28 @@ namespace VoWin.Services
                 if (!string.IsNullOrEmpty(slotId))
                     Kernel.Pool.Slots.TryGetValue(slotId, out slot);
                 else
-                    slot = Kernel.Pool.ActiveSlot;
+                    slot = Kernel.Pool.FindSlotForTarget(number) ?? Kernel.Pool.ActiveSlot;
 
                 if ((!forceCellular && slot?.VoWifi?.State == VoWifiState.ImsRegistered) ||
+                    (!forceCellular && slot?.GetHostImsRegistrationStatus().IsRegistered == true) ||
                     slot?.Modem is { IsOpen: true })
                 {
-                    return await Kernel.DialAsync(number, slotId, forceCellular);
+                    var key = slot?.Id ?? "fallback";
+                    using var cancellation = new CancellationTokenSource();
+                    if (!_pendingDialCancellations.TryAdd(key, cancellation))
+                        throw new InvalidOperationException("此模组已有呼叫正在建立。");
+                    var gate = slot == null ? null : GetModuleInstance(slot.Id).ControlGate;
+                    var acquired = false;
+                    try
+                    {
+                        if (gate != null) { await gate.WaitAsync(cancellation.Token).ConfigureAwait(false); acquired = true; }
+                        return await Kernel.DialAsync(number, slot?.Id ?? slotId, forceCellular, cancellation.Token).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        if (acquired) gate!.Release();
+                        _pendingDialCancellations.TryRemove(new KeyValuePair<string, CancellationTokenSource>(key, cancellation));
+                    }
                 }
                 else
                 {
@@ -1342,7 +1471,9 @@ namespace VoWin.Services
             {
                 if (presentDial && Kernel.ActiveCall == null && _presentedCallId == null)
                     CurrentCallState = CallState.Ended;
-                AddLog("ERROR", "Calls", $"Dial failed ({ex.GetType().Name}); see call status for details.");
+                AddLog(ex is OperationCanceledException ? "INFO" : "ERROR", "Calls",
+                    ex is OperationCanceledException ? "Dial operation canceled; the INVITE reader has finished."
+                        : $"Dial failed ({ex.GetType().Name}); see call status for details.");
                 throw;
             }
         }
@@ -1350,26 +1481,77 @@ namespace VoWin.Services
         public async Task<CallInfo?> HangupAsync(string? slotId = null)
         {
             AddLog("INFO", "Calls", "Hanging up current call...");
-            var res = await Kernel.HangupAsync(slotId ?? Kernel.ActiveCallSlotId);
-            if (res == null && CurrentCallState is not (CallState.Idle or CallState.Ended))
+            var target = slotId ?? Kernel.ActiveCallSlotId ?? ActiveSlot?.Id;
+            var res = await Kernel.HangupAsync(target);
+            if (res == null && _pendingDialCancellations.TryGetValue(target ?? "fallback", out var pending))
+            {
+                // Before INVITE exists, cancel preparation/gate acquisition.
+                // Once an INVITE exists, the call manager owns CANCEL and the
+                // late-200 ACK/BYE race; do not abort that transaction's reader.
+                try { pending.Cancel(); } catch (ObjectDisposedException) { }
+                return null;
+            }
+            if (res == null && string.Equals(target, Kernel.ActiveCallSlotId, StringComparison.OrdinalIgnoreCase) &&
+                CurrentCallState is not (CallState.Idle or CallState.Ended))
                 throw new InvalidOperationException("Call hangup was not confirmed by the modem or IMS session.");
             // The matching CallEnded event owns UI/media cleanup and history.
             // A caller may hang up a background slot while another call remains.
             return res;
         }
 
-        public async Task<CallInfo?> AnswerAsync(string? slotId = null)
+        public Task<CallInfo?> AnswerAsync(string? slotId = null) => AnswerCoreAsync(slotId);
+
+        private async Task<CallInfo?> AnswerCoreAsync(string? slotId, string? expectedCallId = null,
+            string? messagePath = null, CancellationToken cancellationToken = default)
         {
-            AddLog("INFO", "Calls", "Answering incoming call...");
+            await _incomingAnswerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var effectiveSlotId = expectedCallId == null ? slotId ?? Kernel.ActiveCallSlotId : slotId;
+            VoSharp.Kernel.SipGateway.SipGateway? localPickupGateway = null;
+            string? localPickupCallId = null;
             try
             {
-                return await Kernel.AnswerAsync(slotId ?? Kernel.ActiveCallSlotId);
+                if (expectedCallId != null && (cancellationToken.IsCancellationRequested ||
+                    Kernel.ActiveCall?.State != CallState.Incoming ||
+                    !string.Equals(Kernel.ActiveCall?.CallId, expectedCallId, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(Kernel.ActiveCallSlotId, effectiveSlotId, StringComparison.OrdinalIgnoreCase))) return null;
+                if (Kernel.LocalSipGateway is { } gateway && gateway.RoutesIncomingCall(effectiveSlotId))
+                {
+                    var current = Kernel.ActiveCall;
+                    if (current?.State != CallState.Incoming ||
+                        !string.Equals(Kernel.ActiveCallSlotId, effectiveSlotId, StringComparison.OrdinalIgnoreCase) ||
+                        !gateway.TryClaimLocalIncomingCall(current.CallId, effectiveSlotId))
+                    {
+                        AddLog("INFO", "SipGateway", "Desktop pickup skipped: this incoming call was already claimed or ended.");
+                        return null;
+                    }
+                    localPickupGateway = gateway;
+                    localPickupCallId = current.CallId;
+                }
+                // Manual pickup and the countdown cannot answer the same call concurrently.
+                if (string.Equals(effectiveSlotId, Kernel.ActiveCallSlotId, StringComparison.OrdinalIgnoreCase))
+                    CancelIncomingAutoAnswer();
+                if (expectedCallId != null && messagePath != null)
+                    _autoAnswerMessages.Queue(expectedCallId, effectiveSlotId, messagePath);
+                AddLog("INFO", "Calls", "Answering incoming call...");
+                try
+                {
+                    var result = await Kernel.AnswerAsync(effectiveSlotId);
+                    if (result == null && localPickupCallId != null)
+                        localPickupGateway?.ReleaseLocalIncomingCallClaim(localPickupCallId, effectiveSlotId);
+                    if (result == null && expectedCallId != null)
+                        _autoAnswerMessages.Remove(expectedCallId, effectiveSlotId);
+                    return result;
+                }
+                catch (Exception ex)
+                {
+                    if (localPickupCallId != null)
+                        localPickupGateway?.ReleaseLocalIncomingCallClaim(localPickupCallId, effectiveSlotId);
+                    if (expectedCallId != null) _autoAnswerMessages.Remove(expectedCallId, effectiveSlotId);
+                    AddLog("ERROR", "Calls", $"Answer failed ({ex.GetType().Name}).");
+                    throw;
+                }
             }
-            catch (Exception ex)
-            {
-                AddLog("ERROR", "Calls", $"Answer failed ({ex.GetType().Name}).");
-                return null;
-            }
+            finally { _incomingAnswerGate.Release(); }
         }
 
         public async Task<CallInfo?> RejectAsync(string? slotId = null)
@@ -1377,7 +1559,8 @@ namespace VoWin.Services
             AddLog("INFO", "Calls", "Rejecting incoming call...");
             var effectiveSlotId = slotId ?? Kernel.ActiveCallSlotId;
             var current = Kernel.ActiveCall;
-            if (current?.State == CallState.Incoming)
+            if (current?.State == CallState.Incoming &&
+                string.Equals(effectiveSlotId, Kernel.ActiveCallSlotId, StringComparison.OrdinalIgnoreCase))
             {
                 var key = CallEventKey(effectiveSlotId, current.CallId);
                 _callEventMetadata.AddOrUpdate(key,
@@ -1387,11 +1570,20 @@ namespace VoWin.Services
 
             try
             {
+                if (Kernel.LocalSipGateway is { } gateway && gateway.RoutesIncomingCall(effectiveSlotId))
+                {
+                    if (current != null && string.Equals(effectiveSlotId, Kernel.ActiveCallSlotId, StringComparison.OrdinalIgnoreCase))
+                        gateway.CancelIncomingCallRinging(current.CallId, effectiveSlotId);
+                    // Hangup also covers a simultaneous SIP pickup that has
+                    // already sent carrier 200 and is waiting for its ACK.
+                    return await Kernel.HangupAsync(effectiveSlotId);
+                }
                 return await Kernel.RejectAsync(effectiveSlotId);
             }
-            catch
+            catch (Exception ex)
             {
-                return null;
+                AddLog("ERROR", "Calls", $"Reject failed ({ex.GetType().Name}).");
+                throw;
             }
         }
 
@@ -1403,7 +1595,11 @@ namespace VoWin.Services
 
         public async Task<SmsSubmitResult> SendSmsAsync(string recipient, string text, bool requestStatusReport = true, string? slotId = null, bool forceVowifi = false, bool forceCellular = false)
         {
-            AddLog("INFO", "SMS", $"Sending SMS on slot {slotId ?? "selected"}; recipient and body omitted from diagnostics.");
+            var smsSlot = !string.IsNullOrEmpty(slotId) ? Kernel.Pool.Slots.GetValueOrDefault(slotId)
+                : Kernel.Pool.FindSlotForTarget(recipient) ?? ActiveSlot;
+            if (smsSlot == null) throw new InvalidOperationException("所选通信模组已断开，请重新选择模组 / SIM。");
+            slotId = smsSlot.Id;
+            AddLog("INFO", "SMS", $"Sending SMS on slot {slotId}; preferred={smsSlot.PreferredTelephonyMode}; cellularOwner={smsSlot.CellularImsMode}; forceVoWiFi={forceVowifi}; forceCellular={forceCellular}; recipient and body omitted from diagnostics.");
 
             SmsConversationModel conv = null!;
             SmsMessageModel model = null!;
@@ -1412,6 +1608,7 @@ namespace VoWin.Services
                 conv = GetOrCreateConversation(recipient);
                 model = new SmsMessageModel
                 {
+                    SlotId = slotId,
                     SenderOrRecipient = recipient,
                     Text = text,
                     Timestamp = DateTime.UtcNow,
@@ -1427,10 +1624,15 @@ namespace VoWin.Services
 
             try
             {
+                // Host IMS currently confirms submission with RP-ACK; delivery
+                // reports are not yet part of the validated desktop path.
+                if (!forceVowifi && !forceCellular && smsSlot?.PreferredTelephonyMode == TelephonyMode.HostIms)
+                    requestStatusReport = false;
                 var result = await Kernel.SendSmsAsync(recipient, text, requestStatusReport, slotId, forceVowifi, forceCellular);
                 await RunOnUiAsync(() =>
                 {
-                    model.DeliveryState = result.AllPartsAccepted ? SmsDeliveryState.Sent : SmsDeliveryState.Failed;
+                    model.DeliveryState = result.AllPartsAccepted ? SmsDeliveryState.Sent
+                        : result.PartsAccepted > 0 ? SmsDeliveryState.PartiallySent : SmsDeliveryState.Failed;
                     model.DeliveryStatus = result.SubmissionStatus;
                     model.MessageReference = result.ConcatReference;
                     conv.UpdateLastMessage();
@@ -1506,36 +1708,81 @@ namespace VoWin.Services
             AddLog("INFO", "Calls", "Call history cleared.");
         }
 
-        public async Task<bool> StartVoWifiAsync(string? slotId = null)
+        public Task<bool> StartVoWifiAsync(string? slotId = null) => StartVoWifiWithIntentAsync(slotId);
+
+        private async Task<bool> StartVoWifiWithIntentAsync(string? slotId, long? expectedIntent = null)
         {
-            var targetSlot = (!string.IsNullOrEmpty(slotId) ? Slots.FirstOrDefault(s => s.Id == slotId) : ActiveSlot) ?? Slots.FirstOrDefault();
+            var targetSlot = !string.IsNullOrEmpty(slotId) ? Kernel.Pool.Slots.GetValueOrDefault(slotId) : ActiveSlot;
             if (targetSlot == null) return false;
-            _voWifiDesiredStates[GetVoWifiPreferenceKey(targetSlot)] = true;
-            var intentVersion = AdvanceVoWifiIntent(targetSlot.Id);
-            await PersistRuntimeIntentAsync(targetSlot, voWifi: true).ConfigureAwait(false);
-            return await StartVoWifiCoreAsync(targetSlot, intentVersion).ConfigureAwait(false);
+            var instance = GetModuleInstance(targetSlot.Id);
+            await instance.WifiGate.WaitAsync().ConfigureAwait(false);
+            using var cancellation = new CancellationTokenSource();
+            instance.WifiCancellation = cancellation;
+            instance.WifiBusy = true;
+            instance.WifiError = null;
+            instance.Refresh();
+            var acquired = false;
+            try
+            {
+                await instance.ControlGate.WaitAsync(cancellation.Token).ConfigureAwait(false);
+                acquired = true;
+                if (expectedIntent is { } expected && GetVoWifiIntentVersion(targetSlot.Id) != expected) return false;
+                if (targetSlot.VoWifi.State == VoWifiState.ImsRegistered) return true;
+                if (targetSlot.Sim == null) throw new InvalidOperationException("请先插入并解锁 SIM。");
+                var version = AdvanceVoWifiIntent(targetSlot.Id);
+                _voWifiDesiredStates[GetVoWifiPreferenceKey(targetSlot)] = true;
+                var started = await StartVoWifiCoreAsync(targetSlot, version, cancellation.Token).ConfigureAwait(false);
+                if (!started) instance.WifiError = "VoWiFi 连接未完成，请查看日志。";
+                return started;
+            }
+            catch (Exception ex)
+            {
+                instance.WifiError = ex is OperationCanceledException ? null : ex.Message;
+                throw;
+            }
+            finally
+            {
+                if (acquired) instance.ControlGate.Release();
+                instance.WifiCancellation = null;
+                instance.WifiBusy = false;
+                instance.WifiGate.Release();
+                instance.Refresh();
+            }
         }
 
         public async Task<bool> StopVoWifiAsync(string? slotId = null)
         {
-            var targetSlot = (!string.IsNullOrEmpty(slotId) ? Slots.FirstOrDefault(s => s.Id == slotId) : ActiveSlot) ?? Slots.FirstOrDefault();
+            var targetSlot = !string.IsNullOrEmpty(slotId) ? Kernel.Pool.Slots.GetValueOrDefault(slotId) : ActiveSlot;
             if (targetSlot == null) return false;
-            _voWifiDesiredStates[GetVoWifiPreferenceKey(targetSlot)] = false;
+            var instance = GetModuleInstance(targetSlot.Id);
+            try { instance.WifiCancellation?.Cancel(); } catch (ObjectDisposedException) { }
             AdvanceVoWifiIntent(targetSlot.Id);
-            _autoVoWifiStarts.TryRemove(targetSlot.Id, out _);
-            await PersistRuntimeIntentAsync(targetSlot, voWifi: false).ConfigureAwait(false);
-            AddLog("INFO", "VoWiFi", $"Stopping VoWiFi on slot {targetSlot.Id}...");
-            return await Kernel.StopVoWifiAsync(targetSlot.Id).ConfigureAwait(false);
+            _voWifiDesiredStates[GetVoWifiPreferenceKey(targetSlot)] = false;
+            await instance.WifiGate.WaitAsync().ConfigureAwait(false);
+            await instance.ControlGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (targetSlot.Calls.ActiveCall != null && !targetSlot.Calls.IsHostImsCall)
+                    throw new InvalidOperationException("请先挂断此模组的 VoWiFi 通话。");
+                instance.WifiError = null;
+                return await Kernel.StopVoWifiAsync(targetSlot.Id).ConfigureAwait(false);
+            }
+            finally
+            {
+                instance.ControlGate.Release(); instance.WifiGate.Release(); instance.Refresh();
+            }
         }
 
-        private async Task<bool> StartVoWifiCoreAsync(ModemSlot targetSlot, long expectedIntentVersion)
+        private async Task<bool> StartVoWifiCoreAsync(ModemSlot targetSlot, long expectedIntentVersion, CancellationToken ct = default)
         {
             // Starting VoWiFi must apply identity/routing only. It must never
             // restore an old CFUN/CGATT preference as a side effect of Connect.
             await ApplyPreferencesToSlotAsync(targetSlot, restoreAutoVoWifi: false, restoreRadioPreferences: false)
                 .ConfigureAwait(false);
             if (GetVoWifiIntentVersion(targetSlot.Id) != expectedIntentVersion) return false;
+            ct.ThrowIfCancellationRequested();
 
+            await ApplyVoWifiDiscoveryPreferencesAsync(targetSlot).ConfigureAwait(false);
             var effectiveProxy = ResolveEgressProxyForSlot(targetSlot.Id);
             if (!Kernel.SetSlotProxy(targetSlot.Id, effectiveProxy))
             {
@@ -1548,7 +1795,7 @@ namespace VoWin.Services
                 ? $"VoWiFi 代理路由已应用至核心: {DescribeProxyEndpoint(effectiveProxy)} -> 卡槽 [{targetSlot.Name}]"
                 : $"VoWiFi 使用直连 UDP -> 卡槽 [{targetSlot.Name}]");
             AddLog("INFO", "VoWiFi", $"Starting VoWiFi on slot {targetSlot.Id}...");
-            var started = await Kernel.StartVoWifiAsync(targetSlot.Id).ConfigureAwait(false);
+            var started = await Kernel.StartVoWifiAsync(targetSlot.Id, ct).ConfigureAwait(false);
 
             // A manual OFF may race a start already inside the kernel lifecycle
             // gate. OFF wins deterministically and performs a second idempotent
@@ -1602,16 +1849,83 @@ namespace VoWin.Services
             return result;
         }
 
+        public HostImsPppBearerStatus GetHostImsPppBearerStatus(string? slotId = null) =>
+            Kernel.GetHostImsPppBearerStatus(slotId);
+
+        public async Task<HostImsPppBearerStatus> StartHostImsPppBearerAsync(
+            string handoffScript, string rasProbeExecutable, bool handoffApproved = false,
+            string? slotId = null, CancellationToken cancellationToken = default)
+        {
+            if (!handoffApproved)
+                throw new InvalidOperationException("启动前须确认本次会暂时移交模组 IMS 并重启模组。");
+            var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            if (!principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator))
+                throw new InvalidOperationException("Windows IMS PPP 需要以管理员身份启动 VoWin；尚未修改模组配置。");
+            if (string.IsNullOrWhiteSpace(handoffScript) || !Path.IsPathFullyQualified(handoffScript) ||
+                !File.Exists(handoffScript) ||
+                !Path.GetFileName(handoffScript).Equals("VoSharp.HostIms.exe", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("请选择完整路径的 VoSharp.HostIms.exe。");
+            AddLog("WARN", "IMS", "正在暂时移交模组 IMS 到 Windows PPP；会重启模组，租约结束时恢复模组内部 IMS，不发送 SIP REGISTER。");
+            var status = await Kernel.StartHostImsPppBearerAsync(
+                handoffScript, rasProbeExecutable, slotId, ct: cancellationToken).ConfigureAwait(false);
+            if (status.IsActive)
+            {
+                var slot = slotId == null ? ActiveSlot : Kernel.Pool.Slots.GetValueOrDefault(slotId);
+                if (slot != null)
+                {
+                    slot.CellularImsMode = TelephonyMode.HostIms;
+                    slot.PreferredTelephonyMode ??= TelephonyMode.HostIms;
+                    slot.TelephonyEnabled = false;
+                }
+            }
+            AddLog(status.IsActive ? "INFO" : "WARN", "IMS",
+                status.IsActive ? "Windows 已持有隔离的 IMS PPP bearer；尚未注册 SIP。" :
+                    $"IMS PPP bearer 未激活：{status.LastError ?? "租约已结束"}");
+            return status;
+        }
+
+        public async Task StopHostImsPppBearerAsync(string? slotId = null)
+        {
+            await Kernel.StopHostImsPppBearerAsync(slotId).ConfigureAwait(false);
+            var slot = slotId == null ? ActiveSlot : Kernel.Pool.Slots.GetValueOrDefault(slotId);
+            if (slot?.CellularImsMode == TelephonyMode.HostIms) slot.TelephonyEnabled = false;
+            AddLog("INFO", "IMS", "已停止 Windows IMS PPP，并请求恢复模组内部 IMS。");
+        }
+
         public HostImsRegistrationStatus GetHostImsRegistrationStatus(string? slotId = null) =>
             Kernel.GetHostImsRegistrationStatus(slotId);
 
         public async Task<HostImsRegistrationStatus> StartHostImsRegistrationAsync(
             string? slotId = null,
             HostImsEndpointCandidate? endpoint = null,
-            CancellationToken cancellationToken = default)
+            bool subscriberEgressApproved = false,
+            bool useUserspaceEsp = true,
+            string? winDivertDll = null,
+            CancellationToken cancellationToken = default,
+            bool enableSmsReceiver = false)
         {
-            AddLog("WARN", "IMS", "正在尝试实验性蜂窝 Host IMS 注册；仅支持 Windows 已持有的 IMS bearer，尚无蜂窝 ipsec-3gpp 数据面。");
-            var status = await Kernel.StartHostImsRegistrationAsync(slotId, endpoint, cancellationToken).ConfigureAwait(false);
+            if (!subscriberEgressApproved)
+                throw new InvalidOperationException("发送当前 SIM 的 IMS 身份前，须明确确认本次运营商注册。");
+            VoSharp.Telephony.IHostImsSecurityBackend? securityBackend = null;
+            if (useUserspaceEsp && !VoKernel.TryCreateHostImsUserspaceBackend(
+                    "1", winDivertDll, out securityBackend, out var error))
+                throw new InvalidOperationException(error);
+            AddLog("WARN", "IMS", useUserspaceEsp
+                ? "正在尝试实验性蜂窝 Host IMS 注册；使用 C# ESP 与 WinDivert 原始包 I/O。已有单一模组/SIM/运营商组合的 CLI 双向语音实证，当前界面及其他网络仍需逐项验收。"
+                : "正在尝试无 ESP 的实验性蜂窝 Host IMS 注册；仅适用于不要求 ipsec-3gpp 的网络。");
+            var status = await Kernel.StartHostImsRegistrationAsync(slotId, endpoint, cancellationToken,
+                securityBackend, enableSmsReceiver).ConfigureAwait(false);
+            if (status.IsRegistered)
+            {
+                var slot = slotId == null ? ActiveSlot : Kernel.Pool.Slots.GetValueOrDefault(slotId);
+                if (slot != null)
+                {
+                    slot.CellularImsMode = TelephonyMode.HostIms;
+                    slot.PreferredTelephonyMode ??= TelephonyMode.HostIms;
+                    slot.TelephonyEnabled = true;
+                }
+            }
             AddLog(status.IsRegistered ? "INFO" : "WARN", "IMS", $"Host IMS 注册状态：{status.State}；{status.Endpoint ?? "无端点"}");
             return status;
         }
@@ -1619,6 +1933,8 @@ namespace VoWin.Services
         public async Task StopHostImsRegistrationAsync(string? slotId = null)
         {
             await Kernel.StopHostImsRegistrationAsync(slotId).ConfigureAwait(false);
+            var slot = slotId == null ? ActiveSlot : Kernel.Pool.Slots.GetValueOrDefault(slotId);
+            if (slot?.CellularImsMode == TelephonyMode.HostIms) slot.TelephonyEnabled = false;
             AddLog("INFO", "IMS", "已停止实验性蜂窝 Host IMS 注册。");
         }
 
@@ -1902,6 +2218,19 @@ namespace VoWin.Services
                 }
             }
             else report.AppendLine("Unavailable: no open physical modem.");
+            report.AppendLine();
+            report.AppendLine("=== Cellular USB PCM fallback ===");
+            try
+            {
+                var audio = CellularAudioWorker.ProbeModemEndpoints(slot?.PortName ?? throw new InvalidOperationException("No physical modem selected."));
+                report.AppendLine($"WinMM modem capture endpoint: {(audio.Capture ? "present" : "not currently enumerated")}");
+                report.AppendLine($"WinMM modem playback endpoint: {(audio.Playback ? "present" : "not currently enumerated")}");
+                report.AppendLine("Endpoint enumeration does not prove live call PCM or a working QDC507 D4 route.");
+            }
+            catch (Exception ex)
+            {
+                report.AppendLine($"WinMM endpoint enumeration failed: {DiagnosticLogRedactor.Redact(ex.Message)}");
+            }
             report.AppendLine();
             report.AppendLine("=== VoWiFi / IMS snapshot ===");
             report.AppendLine($"State: {diag?.State.ToString() ?? "unavailable"}");
@@ -2351,19 +2680,39 @@ namespace VoWin.Services
 
         public void OnUsbDeviceInserted()
         {
+            if (BeginUsbDebounce() is not { } token) return;
             AddLog("INFO", "USB Monitor", "检测到 USB 设备插入事件，等待串口驱动完成初始化...");
-
-            _usbDebounceCts?.Cancel();
-            _usbDebounceCts = new CancellationTokenSource();
-            _ = HandleUsbDeviceInsertedAsync(_usbDebounceCts.Token);
+            _ = HandleUsbDeviceInsertedAsync(token);
         }
 
         public void OnUsbDeviceRemoved()
         {
+            if (BeginUsbDebounce() is not { } token) return;
             AddLog("INFO", "USB Monitor", "检测到 USB 设备拔出事件，正在保留 VoWiFi 会话并释放硬件句柄...");
-            _usbDebounceCts?.Cancel();
-            _usbDebounceCts = new CancellationTokenSource();
-            _ = HandleUsbDeviceRemovedAsync(_usbDebounceCts.Token);
+            _ = HandleUsbDeviceRemovedAsync(token);
+        }
+
+        private CancellationToken? BeginUsbDebounce()
+        {
+            lock (_usbDebounceGate)
+            {
+                if (Volatile.Read(ref _serviceDisposed) != 0) return null;
+                try { _usbDebounceCts?.Cancel(); } catch (ObjectDisposedException) { }
+                _usbDebounceCts?.Dispose();
+                _usbDebounceCts = new CancellationTokenSource();
+                return _usbDebounceCts.Token;
+            }
+        }
+
+        private void StopUsbDebounce()
+        {
+            lock (_usbDebounceGate)
+            {
+                var source = _usbDebounceCts;
+                _usbDebounceCts = null;
+                try { source?.Cancel(); } catch (ObjectDisposedException) { }
+                source?.Dispose();
+            }
         }
 
         private async Task HandleUsbDeviceRemovedAsync(CancellationToken token)
@@ -2371,14 +2720,22 @@ namespace VoWin.Services
             try
             {
                 await Task.Delay(300, token).ConfigureAwait(false);
-                var availablePorts = SerialPort.GetPortNames().ToHashSet(StringComparer.OrdinalIgnoreCase);
-                foreach (var slot in Kernel.GetSlots().Where(slot => !availablePorts.Contains(slot.PortName)))
+                if (Volatile.Read(ref _serviceDisposed) != 0) return;
+                bool retryBusyDevices;
+                do
                 {
-                    await slot.DetachHardwareAsync(token).ConfigureAwait(false);
-                    AddLog("INFO", "USB Monitor",
-                        $"模块 [{slot.Name}] 已拔出；现有 VoWiFi 隧道将继续保活，重新插入后会自动重新注册。");
-                }
-                await RunOnUiAsync(SyncSlots, DispatcherPriority.DataBind).ConfigureAwait(false);
+                    if (Volatile.Read(ref _serviceDisposed) != 0) return;
+                    var availablePorts = SerialPort.GetPortNames().ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    retryBusyDevices = await DetachMissingModemsAsync(availablePorts, token,
+                        () => SerialPort.GetPortNames().ToHashSet(StringComparer.OrdinalIgnoreCase)).ConfigureAwait(false);
+                    if (Volatile.Read(ref _serviceDisposed) != 0) return;
+                    token.ThrowIfCancellationRequested();
+                    await RunOnUiAsync(SyncSlots, DispatcherPriority.DataBind).ConfigureAwait(false);
+                    // An insertion or shutdown cancels this removal intent. Do
+                    // not wait behind an operation and then replay its old port
+                    // snapshot; every retry observes the current USB inventory.
+                    if (retryBusyDevices) await Task.Delay(300, token).ConfigureAwait(false);
+                } while (retryBusyDevices);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
             catch (Exception ex)
@@ -2387,11 +2744,64 @@ namespace VoWin.Services
             }
         }
 
+        internal async Task<bool> DetachMissingModemsAsync(IReadOnlySet<string> availablePorts, CancellationToken token,
+            Func<IReadOnlySet<string>>? readCurrentPorts = null)
+        {
+            token.ThrowIfCancellationRequested();
+            var retryBusyDevices = false;
+            foreach (var slot in Kernel.GetSlots().Where(slot => !slot.IsPcscReader &&
+                !slot.IsHostImsPppTransitionOrActive && !IsTelephonyTransitioning(slot.Id) &&
+                !availablePorts.Contains(slot.PortName)))
+            {
+                if (Volatile.Read(ref _serviceDisposed) != 0) return false;
+                token.ThrowIfCancellationRequested();
+                IAsyncDisposable? lease;
+                try { lease = await Kernel.Pool.AcquireSlotLeaseAsync(slot.Id, timeoutMs: 0, ct: token).ConfigureAwait(false); }
+                catch (ObjectDisposedException) when (Volatile.Read(ref _serviceDisposed) != 0) { return false; }
+                if (lease is null)
+                {
+                    if (Kernel.Pool.Slots.ContainsKey(slot.Id)) retryBusyDevices = true;
+                    continue;
+                }
+                await using (lease)
+                {
+                    if (!Kernel.Pool.Slots.TryGetValue(slot.Id, out var current) || !ReferenceEquals(current, slot)) continue;
+                    var instance = GetModuleInstance(slot.Id);
+                    if (!await instance.ControlGate.WaitAsync(0, token).ConfigureAwait(false))
+                    {
+                        retryBusyDevices = true;
+                        continue;
+                    }
+                    try
+                    {
+                        if (Volatile.Read(ref _serviceDisposed) != 0) return false;
+                        token.ThrowIfCancellationRequested();
+                        if (slot.IsHostImsPppTransitionOrActive || IsTelephonyTransitioning(slot.Id)) continue;
+                        var currentPorts = readCurrentPorts?.Invoke() ?? availablePorts;
+                        token.ThrowIfCancellationRequested();
+                        if (currentPorts.Contains(slot.PortName)) continue;
+                        await slot.DetachHardwareAsync(token).ConfigureAwait(false);
+                        if (Volatile.Read(ref _serviceDisposed) != 0) return false;
+                        token.ThrowIfCancellationRequested();
+                        if (slot.Modem is null && slot.State == SlotState.Offline)
+                            AddLog("INFO", "USB Monitor",
+                                $"模块 [{slot.Name}] 已拔出；现有 VoWiFi 隧道将继续保活，重新插入后会自动重新注册。");
+                        else if (!slot.IsHostImsPppTransitionOrActive && !IsTelephonyTransitioning(slot.Id))
+                            retryBusyDevices = true; // A direct profile operation may own the slot's hardware gate.
+                    }
+                    finally { instance.ControlGate.Release(); }
+                }
+            }
+            return retryBusyDevices;
+        }
+
         private async Task HandleUsbDeviceInsertedAsync(CancellationToken token)
         {
             try
             {
+                if (!_telephonySettings.AutoDiscoverModems) return;
                 await Task.Delay(800, token).ConfigureAwait(false);
+                if (Volatile.Read(ref _serviceDisposed) != 0) return;
                 AddLog("INFO", "USB Monitor", "开始扫描新插入设备提供的串口...");
 
                 var discovered = await DiscoverSlotsCoreAsync(token).ConfigureAwait(false);
@@ -2464,6 +2874,18 @@ namespace VoWin.Services
 
                 ApplyVoWifiHomeIdentity(slot, simPref);
 
+                var managedMode = await GetTelephonyPreferencesAsync(slot.Id).ConfigureAwait(false);
+                var hostRecoveryOwned = GetModuleInstance(slot.Id).HostRecoveryStatus?.KeepOnlineRequested == true;
+                if (!IsTelephonyTransitioning(slot.Id) && !hostRecoveryOwned)
+                {
+                    slot.PreferredTelephonyMode = managedMode.DefaultRoute;
+                    slot.CellularImsMode ??= managedMode.CellularMode;
+                }
+                // Host handoff deliberately reopens the modem and re-reads the
+                // SIM. Those READY events must not restore CGATT/CFUN mid-lease.
+                if (slot.IsHostImsPppTransitionOrActive || IsTelephonyTransitioning(slot.Id) || hostRecoveryOwned)
+                    restoreRadioPreferences = false;
+
                 // A SIM preference follows the card and overrides the module
                 // default. Restore RF state before starting any background work
                 // that could report cellular registration or signal state.
@@ -2511,7 +2933,7 @@ namespace VoWin.Services
                         }
                     }
 
-                    bool? preferredCellularData = simPref?.DefaultCellularData ?? false;
+                    bool? preferredCellularData = ResolveCellularDataStartupPreference(simPref, managedMode);
                     if (preferredCellularData.HasValue)
                     {
                         try
@@ -2533,25 +2955,11 @@ namespace VoWin.Services
 
                 if (restoreAutoVoWifi)
                 {
-                    var autoVoWifi = simPref?.DefaultVoWifi ?? false;
-                    if (autoVoWifi)
-                    {
-                        QueueAutoVoWifiStart(slot);
-                    }
-                    else
-                    {
-                        _voWifiDesiredStates[GetVoWifiPreferenceKey(slot)] = false;
-                        AdvanceVoWifiIntent(slot.Id);
-                        _autoVoWifiStarts.TryRemove(slot.Id, out _);
-                        if (slot.VoWifi.State != VoWifiState.Disconnected)
-                        {
-                            await slot.StopVoWifiAsync().ConfigureAwait(false);
-                            AddLog("INFO", "VoWiFi", $"已按卡槽 [{slot.Name}] 的关闭偏好停止自动 VoWiFi。");
-                        }
-                    }
+                    QueueRestoreTelephonyMode(slot, managedMode);
                 }
 
-                _ = SyncModemSmsAsync(slot);
+                if (!slot.IsHostImsPppTransitionOrActive && !IsTelephonyTransitioning(slot.Id) && !hostRecoveryOwned)
+                    _ = SyncModemSmsAsync(slot);
             }
             catch (Exception ex)
             {
@@ -2565,6 +2973,9 @@ namespace VoWin.Services
                 return $"{uri.Scheme}://{uri.Host}:{uri.Port}";
             return proxyUrl;
         }
+
+        internal static bool ResolveCellularDataStartupPreference(SimPreferenceModel? saved, SimTelephonyPreferences managed) =>
+            saved?.DefaultCellularData ?? managed.AutoConnectCellular;
 
         private void ApplyVoWifiHomeIdentity(ModemSlot slot, SimPreferenceModel? simPref)
         {
@@ -2586,10 +2997,10 @@ namespace VoWin.Services
                 reported.Iccid,
                 reported.OperatorName,
                 reported.PhoneNumber,
-                reported.IsHomePlmnAuthoritative ? reported.Mnc.Length : null,
+                null, // Another IMSI's EF_AD length is not proof for this learned identity.
                 reported.HomePlmns);
             slot.RememberVoWifiIdentity(learnedIdentity);
-            AddLog("INFO", "VoWiFi", $"检测到临时 IMSI，已为卡槽 [{slot.Name}] 恢复已验证的归属网络 EAP-AKA 身份。");
+            AddLog("INFO", "VoWiFi", $"卡槽 [{slot.Name}] 发现同一 ICCID 的另一条历史 IMSI，已加入回退候选；认证结果尚待验证。");
         }
 
         private void QueueAutoVoWifiStart(ModemSlot slot)
@@ -2653,9 +3064,11 @@ namespace VoWin.Services
                     var normalizedTimestamp = isOutgoing
                         ? TimestampDisplayHelper.ToUtcStorageTime(msg.Timestamp)
                         : TimestampDisplayHelper.NormalizeIncomingNetworkTime(msg.Timestamp);
+                    if (isOutgoing && await Preferences.HasSmsMessageAsync(remote, normalizedTimestamp, msg.Text, msg.RawPdu).ConfigureAwait(false))
+                        continue; // Keep the existing sent-history import behavior.
 
-                    bool exists = await Preferences.HasSmsMessageAsync(remote, normalizedTimestamp, msg.Text, msg.RawPdu).ConfigureAwait(false);
-                    if (!exists)
+                    // Historical modem storage has no receive-session card proof.
+                    // It must remain unbound even if a different SIM is now inserted.
                     {
                         var model = new SmsMessageModel
                         {
@@ -2668,15 +3081,18 @@ namespace VoWin.Services
                             DeliveryState = isOutgoing ? SmsDeliveryState.Sent : SmsDeliveryState.Received,
                             DeliveryStatus = msg.DeliveryStatus,
                             MessageReference = msg.MessageReference,
-                            RawPdu = msg.RawPdu
+                            RawPdu = msg.RawPdu,
+                            SourceMessageId = msg.Id,
+                            SimBinding = null
                         };
 
-                        await Preferences.SaveSmsMessageAsync(model).ConfigureAwait(false);
+                        if (isOutgoing) await Preferences.SaveSmsMessageAsync(model).ConfigureAwait(false);
+                        else if (!await Preferences.SaveIncomingSmsIfNewAsync(model, cancellationToken).ConfigureAwait(false)) continue;
 
                         await RunOnUiAsync(() =>
                         {
                             var conv = GetOrCreateConversation(remote);
-                            if (!conv.Messages.Any(m => m.Timestamp == model.Timestamp && m.Text == model.Text))
+                            if (!conv.Messages.Any(m => m.Id == model.Id))
                             {
                                 conv.Messages.Add(model);
                                 if (!model.IsOutgoing)
@@ -2833,103 +3249,140 @@ namespace VoWin.Services
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _serviceDisposed, 1) != 0) return;
+            Kernel.Pool.PrepareForApplicationExit();
+            _discoveryShutdown.Cancel();
+            StopUsbDebounce(); // Ignore USB re-enumeration generated by releasing the IMS owner below.
+            CancelIncomingAutoAnswer();
+            _autoAnswerMessages.Clear();
+            // Cancel foreground starts before awaiting recovery/pool gates.
+            foreach (var instance in _moduleInstances.Values)
+            {
+                try { instance.WifiCancellation?.Cancel(); } catch (ObjectDisposedException) { }
+                try { instance.CellularCancellation?.Cancel(); } catch (ObjectDisposedException) { }
+                instance.HostRecovery?.Cancel();
+            }
+            foreach (var cancellation in _pendingDialCancellations.Values)
+                try { cancellation.Cancel(); } catch (ObjectDisposedException) { }
+            foreach (var instance in _moduleInstances.Values)
+                await StopHostImsRecoveryAsync(instance).ConfigureAwait(false);
+            foreach (var instance in _moduleInstances.Values) instance.Dispose();
 
-            var audioCts = Interlocked.Exchange(ref _cellularCallAudioCts, null);
-            audioCts?.Cancel();
-            audioCts?.Dispose();
+            foreach (var media in _cellularMedia.Values) media.Cancel();
             await _desktopAudioTransition.WaitAsync().ConfigureAwait(false);
             try
             {
                 StopMicrophone();
-                await StopCellularAudioBridgeAsync().ConfigureAwait(false);
-                await StopQdc507VoiceRouteAsync().ConfigureAwait(false);
+                if (_autoAnswerPlaybackTask is { } playback)
+                {
+                    try { await playback.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); }
+                    catch (Exception ex) { AddLog("WARN", "AutoAnswerAudio", $"Recording shutdown incomplete ({ex.GetType().Name})."); }
+                }
+                foreach (var media in _cellularMedia.Values)
+                    await StopCellularModuleAudioAsync(media.SlotId).ConfigureAwait(false);
             }
             finally { _desktopAudioTransition.Release(); }
-            await _cellularAudioBridge.DisposeAsync();
-
-            try
+            foreach (var media in _cellularMedia.Values)
             {
-                _usbDebounceCts?.Cancel();
+                try { await media.DisposeAsync().ConfigureAwait(false); }
+                catch (Exception ex) { AddLog("WARN", "CellularAudio", $"{media.AtPort}: Shutdown cleanup failed: {ex.Message}"); }
             }
-            catch { }
-            try
-            {
-                _usbDebounceCts?.Dispose();
-            }
-            catch { }
-
-            _logLines.Writer.TryComplete();
-            try
-            {
-                await _logWriterTask.WaitAsync(TimeSpan.FromSeconds(2));
-            }
-            catch
-            {
-                _logWriterCts.Cancel();
-            }
-            _logWriterCts.Dispose();
+            _cellularMedia.Clear();
 
             try
             {
                 await Kernel.DisposeAsync();
             }
-            catch { }
-        }
-        private VoSharp.Telephony.Calls.RtpSession? GetActiveRtpSession()
-        {
-            if (Kernel is VoKernel k)
+            catch (Exception ex)
             {
-                if (k.VoWifi?.ActiveRtpSession != null) return k.VoWifi.ActiveRtpSession;
-                foreach (var slot in k.Pool.Slots.Values)
-                {
-                    if (slot.VoWifi?.ActiveRtpSession != null)
-                        return slot.VoWifi.ActiveRtpSession;
-                }
+                AddLog("ERROR", "Shutdown", $"Kernel cleanup incomplete ({ex.GetType().Name}); ownership will not be released as if shutdown succeeded.");
+                throw;
             }
-            return null;
+            // Keep shutdown/deregistration evidence until the kernel has released
+            // its modem leases; completing the writer first lost these events.
+            _logLines.Writer.TryComplete();
+            try { await _logWriterTask.WaitAsync(TimeSpan.FromSeconds(2)); }
+            catch { _logWriterCts.Cancel(); }
+            _logWriterCts.Dispose();
+            _diagnosticSamplerCts.Cancel();
+            await _diagnosticSampler.ConfigureAwait(false);
+            _diagnosticSamplerCts.Dispose();
+            await _diagnosticRecorder.DisposeAsync().ConfigureAwait(false);
+            _discoveryShutdown.Dispose();
         }
-
         private void StartMicrophone()
         {
+            string? callId, slotId;
+            lock (_cellularSipReservationGate)
+            {
+                if (_desktopAudioKind != DesktopAudioKind.Microphone) return;
+                callId = _desktopAudioCallId; slotId = _desktopAudioSlotId;
+            }
+            if (callId == null) return;
+            StopMicrophone();
+            DesktopMicrophoneSession? session = null;
             try
             {
-                if (_waveIn != null) StopMicrophone();
+                var hostInput = CellularAudioWorker.FindHostInputDevice();
+                if (hostInput < 0)
+                    throw new InvalidOperationException("No host microphone is available for IMS audio.");
+                var deviceName = NAudio.Wave.WaveIn.GetCapabilities(hostInput).ProductName;
+                session = new DesktopMicrophoneSession(callId, slotId, deviceName,
+                    pcm => Kernel is VoKernel kernel && kernel.TrySendPresentedImsPcm(callId, slotId, pcm));
+                var calls = slotId == null ? null : Kernel.Pool.Slots.GetValueOrDefault(slotId)?.Calls;
+                if (calls?.ActiveCall?.CallId == callId && calls.GetMediaStats() is { } stats)
+                    session.SetTransportBaseline(stats);
+                Volatile.Write(ref _microphoneSession, session);
                 _waveIn = new NAudio.Wave.WaveIn
                 {
+                    DeviceNumber = hostInput,
                     WaveFormat = new NAudio.Wave.WaveFormat(8000, 16, 1),
                     BufferMilliseconds = 20
                 };
-                _waveIn.DataAvailable += (s, a) =>
+                var owner = session;
+                _waveIn.DataAvailable += (s, a) => owner.Process(a.Buffer, a.BytesRecorded);
+                _waveIn.RecordingStopped += (s, e) =>
                 {
-                    var rtp = GetActiveRtpSession();
-                    if (rtp != null && a.BytesRecorded > 0)
-                    {
-                        int sampleCount = a.BytesRecorded / 2;
-                        short[] samples = new short[sampleCount];
-                        Buffer.BlockCopy(a.Buffer, 0, samples, 0, a.BytesRecorded);
-                        rtp.SendAudioPcm(samples);
-                    }
+                    owner.CaptureStopped(e.Exception);
+                    if (owner.Snapshot().Error is { } error)
+                        AddLog("WARN", "AudioUplink", $"Microphone capture stopped unexpectedly ({error}); no audio samples logged.");
                 };
                 _waveIn.StartRecording();
-                AddLog("INFO", "Audio", "Microphone capture started for active call.");
+                session.Started();
+                AddLog("INFO", "Audio", $"Microphone capture started: {deviceName}; WinMM input={hostInput}; 8000Hz/16bit/mono.");
             }
             catch (Exception ex)
             {
-                AddLog("WARN", "Audio", $"Failed to start microphone: {ex.Message}");
+                session ??= new DesktopMicrophoneSession(callId, slotId, "麦克风不可用", _ => false);
+                session.CaptureStopped(ex);
+                Volatile.Write(ref _microphoneSession, session);
+                var failedCapture = _waveIn; _waveIn = null;
+                try { failedCapture?.Dispose(); } catch { }
+                AddLog("WARN", "Audio", $"Failed to start microphone ({ex.GetType().Name}).");
             }
         }
 
         private void StopMicrophone()
         {
+            var session = Volatile.Read(ref _microphoneSession);
+            if (session != null)
+            {
+                var status = GetMicrophoneUplinkStatus();
+                session.Close(); // Before native Stop: late callbacks must be ignored.
+                AddLog("INFO", "AudioUplink", $"Desktop audio source ended: recording={status.IsMessagePlayback}; {status.DetailText}; peak={status.InputPeak}; {status.StatusText}; no audio samples logged.");
+                Volatile.Write(ref _microphoneSession, null);
+            }
+            var playbackCts = Interlocked.Exchange(ref _autoAnswerPlaybackCts, null);
+            try { playbackCts?.Cancel(); } catch (ObjectDisposedException) { }
             if (_waveIn != null)
             {
+                var capture = _waveIn;
+                _waveIn = null;
                 try
                 {
-                    _waveIn.StopRecording();
-                    _waveIn.Dispose();
+                    capture.StopRecording();
                 }
                 catch { }
-                _waveIn = null;
+                finally { try { capture.Dispose(); } catch { } }
                 AddLog("INFO", "Audio", "Microphone capture stopped.");
             }
         }
@@ -2957,7 +3410,20 @@ namespace VoWin.Services
 
         public async Task StartSipGatewayAsync(SipGatewayOptions options, CancellationToken cancellationToken = default)
         {
-            await Kernel.StartSipGatewayAsync(options, cancellationToken).ConfigureAwait(false);
+            if (Kernel.ActiveCall?.State is CallState.Incoming or CallState.Ringing or CallState.Dialing or CallState.Active or CallState.Held)
+                throw new InvalidOperationException("请在当前通话结束后启用 SIP 对接。");
+            // Persist paid SIP SMS admission in the same durable database as
+            // the desktop inbox. Never silently fall back to process memory.
+            var smsStore = Preferences as ISipSmsOperationStore;
+            if (options.AllowOutgoingSms && smsStore is null)
+                throw new InvalidOperationException("短信防重存储不可用，未启用收费短信发送。");
+            var forwardStore = Preferences as ISipSmsForwardStore;
+            if (options.MessagesEnabled && options.ForwardIncomingSms && forwardStore is null)
+                throw new InvalidOperationException("短信持久转发存储不可用，未启用收件转发。");
+            await Kernel.StartSipGatewayAsync(options with { LocalIncomingEnabled = true, SmsOperationStore = smsStore,
+                SmsForwardStore = forwardStore }, cancellationToken).ConfigureAwait(false);
+            if (Kernel.LocalSipGateway is { } gateway)
+                gateway.SmsSubmitted += (_, submission) => _ = RecordSipSmsSubmissionAsync(submission);
             var endpoint = Kernel.LocalSipGateway?.Status.LocalEndPoint;
             AddLog("INFO", "SipGateway", $"Private SIP bridge started on {endpoint}.");
         }
@@ -2996,27 +3462,39 @@ namespace VoWin.Services
             var cts = new CancellationTokenSource();
             if (Interlocked.CompareExchange(ref _incomingAutoAnswerCts, cts, null) != null) { cts.Dispose(); return; }
             if (!_callExperience.AutoAnswerEnabled) return;
+            var callId = Kernel.ActiveCall?.CallId;
+            if (callId == null) return;
+            var token = cts.Token;
+            var delaySeconds = _callExperience.AutoAnswerDelaySeconds;
+            var message = _callExperience.AutoAnswerMessagePath;
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(_callExperience.AutoAnswerDelaySeconds), cts.Token);
-                    if (cts.IsCancellationRequested || !HasIncomingCall || CurrentCallState != CallState.Incoming) return;
-                    var message = _callExperience.AutoAnswerMessagePath;
-                    _pendingAutoAnswerMessagePath = !string.IsNullOrWhiteSpace(message) && File.Exists(message) ? message : null;
+                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token);
+                    if (token.IsCancellationRequested || !HasIncomingCall || CurrentCallState != CallState.Incoming ||
+                        !string.Equals(Kernel.ActiveCall?.CallId, callId, StringComparison.OrdinalIgnoreCase) ||
+                        !string.Equals(Kernel.ActiveCallSlotId, slotId, StringComparison.OrdinalIgnoreCase)) return;
+                    if (string.IsNullOrWhiteSpace(message)) throw new InvalidOperationException("Auto-answer recording is not configured.");
+                    CallMessagePlayback.Validate(message); // Fail before pickup, not a silently connected call.
                     AddLog("INFO", "Calls", "Incoming call timed out; answering automatically.");
-                    await AnswerAsync(slotId);
+                    await AnswerCoreAsync(slotId, callId, message, token);
                 }
                 catch (OperationCanceledException) { }
                 catch (Exception ex) { AddLog("WARN", "Calls", $"Auto-answer failed ({ex.GetType().Name})."); }
             });
         }
 
-        private void StopIncomingAlerting()
+        private void CancelIncomingAutoAnswer()
         {
             var cts = Interlocked.Exchange(ref _incomingAutoAnswerCts, null);
             cts?.Cancel();
             cts?.Dispose();
+        }
+
+        private void StopIncomingAlerting()
+        {
+            CancelIncomingAutoAnswer();
             _callAlerting.StopRinging();
         }
 
@@ -3037,16 +3515,13 @@ namespace VoWin.Services
                     }
                     if (!TryClaimDesktopAudio(call.CallId, call.SlotId, DesktopAudioKind.CellularUsb)) return;
                     _callAlerting.ReleaseHostAudio();
-                    var audioCts = new CancellationTokenSource();
-                    var previous = Interlocked.Exchange(ref _cellularCallAudioCts, audioCts);
-                    previous?.Cancel();
-                    previous?.Dispose();
                     var keepAudio = false;
                     try
                     {
                         var started = await StartCellularCallAudioAsync(
                             call.Codec.Contains("Cellular/UAC", StringComparison.OrdinalIgnoreCase),
-                            Interlocked.Exchange(ref _pendingAutoAnswerMessagePath, null), audioCts.Token).ConfigureAwait(false);
+                            _autoAnswerMessages.Take(call.CallId, call.SlotId), CancellationToken.None,
+                            call.SlotId ?? throw new InvalidOperationException("USB 通话缺少所属模组。"), call.CallId).ConfigureAwait(false);
                         keepAudio = started && string.Equals(Kernel.ActiveCall?.CallId, call.CallId, StringComparison.OrdinalIgnoreCase);
                     }
                     catch (OperationCanceledException) { }
@@ -3059,23 +3534,17 @@ namespace VoWin.Services
                         if (!keepAudio)
                         {
                             ReleaseDesktopAudioClaim(call.CallId, call.SlotId);
-                            if (ReferenceEquals(Interlocked.CompareExchange(ref _cellularCallAudioCts, null, audioCts), audioCts))
-                            {
-                                try { audioCts.Cancel(); } catch (ObjectDisposedException) { }
-                                audioCts.Dispose();
-                            }
-                            await StopCellularAudioBridgeAsync().ConfigureAwait(false);
-                            await StopQdc507VoiceRouteAsync().ConfigureAwait(false);
+                            await StopCellularModuleAudioAsync(call.SlotId, call.CallId).ConfigureAwait(false);
                         }
                     }
                 }
                 else
                 {
-                    var slot = !string.IsNullOrWhiteSpace(call.SlotId)
-                        ? Slots.FirstOrDefault(candidate => candidate.Id.Equals(call.SlotId, StringComparison.OrdinalIgnoreCase))
-                        : null;
-                    if (slot?.Calls.ExternalMediaBridgeEnabled == true) return;
+                    var calls = call.SlotId is null ? Kernel.Calls
+                        : Kernel.Pool.Slots.TryGetValue(call.SlotId, out var owner) ? owner.Calls : null;
+                    if (calls?.ExternalMediaBridgeEnabled == true) return;
                     if (!TryClaimDesktopAudio(call.CallId, call.SlotId, DesktopAudioKind.Microphone)) return;
+                    var autoAnswerMessage = _autoAnswerMessages.Take(call.CallId, call.SlotId);
                     PostToUi(() =>
                     {
                         if (!string.Equals(Kernel.ActiveCall?.CallId, call.CallId, StringComparison.OrdinalIgnoreCase))
@@ -3084,7 +3553,8 @@ namespace VoWin.Services
                             return;
                         }
                         _callAlerting.ReleaseHostAudio();
-                        StartMicrophone();
+                        if (autoAnswerMessage != null) StartAutomaticAnswerMessage(autoAnswerMessage);
+                        else StartMicrophone();
                     });
                 }
             }
@@ -3094,13 +3564,14 @@ namespace VoWin.Services
             }
         }
 
-        private async Task StopDesktopCellularAudioAsync()
+        private async Task StopDesktopCellularAudioAsync(string? slotId, string callId)
         {
+            // Cancel startup before waiting for the desktop transition gate.
+            if (slotId != null && _cellularMedia.TryGetValue(slotId, out var media)) media.Cancel(callId);
             await _desktopAudioTransition.WaitAsync().ConfigureAwait(false);
             try
             {
-                await StopCellularAudioBridgeAsync().ConfigureAwait(false);
-                await StopQdc507VoiceRouteAsync().ConfigureAwait(false);
+                await StopCellularModuleAudioAsync(slotId, callId).ConfigureAwait(false);
             }
             finally
             {
@@ -3121,188 +3592,6 @@ namespace VoWin.Services
             }
         }
 
-        private async Task<bool> StartCellularAudioBridgeAsync(
-            string? messagePath,
-            CancellationToken cancellationToken,
-            bool externalPcm = false)
-        {
-            try
-            {
-                await _cellularAudioBridge.StartAsync(messagePath, cancellationToken, externalPcm);
-                AddLog("INFO", "CellularAudio", externalPcm
-                    ? "SIP RTP PCM connected directly to modem USB Audio Class endpoints."
-                    : "PC microphone/speaker connected to modem USB Audio Class endpoints.");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                AddLog("ERROR", "CellularAudio", $"Failed to start cellular audio bridge: {ex.Message}");
-                return false;
-            }
-        }
-
-        private async Task StopCellularAudioBridgeAsync()
-        {
-            try
-            {
-                var wasRunning = _cellularAudioBridge.IsRunning;
-                await _cellularAudioBridge.StopAsync();
-                if (wasRunning)
-                    AddLog("INFO", "CellularAudio", "Cellular USB audio bridge stopped.");
-            }
-            catch (Exception ex)
-            {
-                AddLog("WARN", "CellularAudio", $"Failed to stop cellular audio bridge: {ex.Message}");
-            }
-        }
-
-        private async Task PrepareQdc507VoiceRuntimeAsync()
-        {
-            try
-            {
-                await _qdc507VoiceRuntime.PrepareAsync();
-                AddLog("INFO", "CellularAudio", "QDC507 module voice drivers and VoLTE calibration are ready.");
-            }
-            catch (Exception ex)
-            {
-                AddLog("INFO", "CellularAudio", $"QDC507 runtime is not available: {ex.Message}");
-            }
-        }
-
-        private async Task<bool> StartCellularCallAudioAsync(
-            bool standardUacReady,
-            string? messagePath,
-            CancellationToken cancellationToken,
-            bool externalPcm = false)
-        {
-            PostToUi(StopMicrophone);
-            if (!standardUacReady)
-            {
-                try
-                {
-                    AddLog("INFO", "CellularAudio", "Starting QDC507 D4/UAC VoLTE route...");
-                    Interlocked.Exchange(ref _qdc507VoiceRouteActive, 1);
-                    await _qdc507VoiceRuntime.StartRouteAsync(cancellationToken);
-                    AddLog("INFO", "CellularAudio", "QDC507 D4/UAC VoLTE route is RUNNING.");
-                    // QDC507 briefly republishes its UAC stream after audio_enable=1.
-                    // Opening the old endpoint immediately succeeds but remains a zero stream.
-                    // On QDC507 the D4 endpoint accepts an early open but then
-                    // remains a zero stream for the whole call. The module needs
-                    // roughly six seconds after audio_enable before MME opens it.
-                    await Task.Delay(TimeSpan.FromSeconds(7), cancellationToken);
-                }
-                catch (OperationCanceledException) { return false; }
-                catch (Exception ex)
-                {
-                    await StopQdc507VoiceRouteAsync().ConfigureAwait(false);
-                    AddLog("ERROR", "CellularAudio",
-                        $"The modem rejected AT+QPCMV and the QDC507 runtime route could not start: {ex.Message}");
-                    CallMediaStatusChanged?.Invoke("Cellular/Audio unavailable");
-                    return false;
-                }
-            }
-
-            // audio_enable=1 can briefly re-enumerate the Windows UAC endpoints.
-            for (var attempt = 0; attempt < 20; attempt++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var started = await StartCellularAudioBridgeAsync(messagePath, cancellationToken, externalPcm);
-                if (started)
-                {
-                    AddLog("INFO", "CellularAudio", $"Audio devices: {_cellularAudioBridge.DeviceSummary}");
-                    CallMediaStatusChanged?.Invoke(standardUacReady
-                        ? "Cellular/UAC 8 kHz"
-                        : "Cellular/QDC507 UAC 8 kHz");
-                    _ = MonitorCellularAudioLevelsAsync(cancellationToken, externalPcm);
-                    return true;
-                }
-                await Task.Delay(250, cancellationToken);
-            }
-            AddLog("ERROR", "CellularAudio", "QDC507 voice route is active, but Windows UAC endpoints did not become ready.");
-            CallMediaStatusChanged?.Invoke("Cellular/Windows audio unavailable");
-            return false;
-        }
-
-        private async Task MonitorCellularAudioLevelsAsync(CancellationToken cancellationToken, bool externalPcm = false)
-        {
-            var reopenedZeroStream = false;
-            try
-            {
-                for (var sample = 0; sample < 4; sample++)
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
-                    var levels = _cellularAudioBridge.ReadAndResetPeaks();
-                    AddLog("INFO", "CellularAudio",
-                        externalPcm
-                            ? $"Live PCM peaks: SIP RTP -> modem {levels.HostMicrophonePeak}, modem -> SIP RTP {levels.ModemDownlinkPeak}."
-                            : $"Live PCM peaks: PC microphone -> modem {levels.HostMicrophonePeak}, modem -> PC speaker {levels.ModemDownlinkPeak}.");
-
-                    if (!reopenedZeroStream && sample == 0 && levels.ModemDownlinkPeak <= 1)
-                    {
-                        reopenedZeroStream = true;
-                        AddLog("WARN", "CellularAudio", "Modem UAC is still a zero stream; reopening endpoints after enumeration settled.");
-                        await StartCellularAudioBridgeAsync(null, cancellationToken, externalPcm);
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-        }
-
-        private async Task StopQdc507VoiceRouteAsync()
-        {
-            if (Interlocked.Exchange(ref _qdc507VoiceRouteActive, 0) == 0) return;
-            try { await _qdc507VoiceRuntime.StopRouteAsync(); }
-            catch (Exception ex) { AddLog("WARN", "CellularAudio", $"Failed to stop QDC507 voice route: {ex.Message}"); }
-        }
-
-        public void Reserve(string slotId)
-        {
-            ArgumentException.ThrowIfNullOrWhiteSpace(slotId);
-            lock (_cellularSipReservationGate)
-            {
-                // Windows UAC selection and the PCM bridge are process-wide.
-                // Refuse a second carrier leg until each modem has its own
-                // independently mapped audio endpoint.
-                if (!_cellularSipReservations.IsEmpty)
-                    throw new InvalidOperationException("Cellular USB audio is already reserved by another SIP call.");
-                if (_cellularAudioBridge.IsRunning || _desktopAudioKind == DesktopAudioKind.CellularUsb)
-                    throw new InvalidOperationException("Cellular USB audio is already in use by a local call.");
-                _cellularSipReservations[slotId] = 0;
-            }
-        }
-
-        public bool IsReserved(string? slotId) =>
-            !string.IsNullOrWhiteSpace(slotId) && _cellularSipReservations.ContainsKey(slotId);
-
-        public async Task<ICallPcmMedia> OpenAsync(string slotId, CancellationToken ct)
-        {
-            var slot = Slots.FirstOrDefault(candidate => candidate.Id.Equals(slotId, StringComparison.OrdinalIgnoreCase))
-                ?? throw new InvalidOperationException($"Cellular SIP media slot '{slotId}' is unavailable.");
-            if (!IsReserved(slotId)) throw new InvalidOperationException("Cellular UAC was not reserved for SIP media.");
-
-            var audioCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            var previous = Interlocked.Exchange(ref _cellularCallAudioCts, audioCts);
-            previous?.Cancel();
-            previous?.Dispose();
-            var started = await StartCellularCallAudioAsync(
-                slot.CellularUsbAudioAvailable,
-                messagePath: null,
-                audioCts.Token,
-                externalPcm: true).ConfigureAwait(false);
-            if (!started) throw new InvalidOperationException("The modem USB Audio PCM endpoint did not become ready for SIP.");
-            return _cellularAudioBridge;
-        }
-
-        public async Task ReleaseAsync(string? slotId)
-        {
-            if (string.IsNullOrWhiteSpace(slotId)) return;
-            if (!_cellularSipReservations.TryRemove(slotId, out _)) return;
-            var audioCts = Interlocked.Exchange(ref _cellularCallAudioCts, null);
-            audioCts?.Cancel();
-            audioCts?.Dispose();
-            await StopCellularAudioBridgeAsync().ConfigureAwait(false);
-            await StopQdc507VoiceRouteAsync().ConfigureAwait(false);
-        }
     }
 }
 

@@ -107,25 +107,16 @@
 
     <!-- Header -->
     <Grid Grid.Row="0" Margin="0,0,0,20">
-      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+      <StackPanel VerticalAlignment="Center">
         <TextBlock
           Style="{DynamicResource AppPageTitleStyle}"
           Text="电话"
           VerticalAlignment="Center"
         />
-        <Border
-          Margin="12,0,0,0"
-          Padding="8,3"
-          CornerRadius="6"
-          Background="{DynamicResource SubtleFillColorSecondaryBrush}"
-          VerticalAlignment="Center"
-        >
-          <TextBlock
-            Text="{Binding VoWifiStateText}"
-            FontSize="12"
-            Foreground="{DynamicResource AppTextSecondaryBrush}"
-          />
-        </Border>
+        <controls:GatewayStatusPanel x:Name="GatewayStatus" Margin="0,8,0,0" IsDense="True"
+            Service="{Binding GatewayService}" Slot="{Binding SelectedSlot}" />
+        <TextBlock Text="{Binding CurrentCallLine}" Margin="0,6,0,0" TextWrapping="Wrap" FontSize="12"
+            Foreground="{DynamicResource AppAccentBrush}" Visibility="{Binding IsInCall, Converter={StaticResource BoolToVis}}" />
       </StackPanel>
     </Grid>
 
@@ -201,7 +192,8 @@
             </Grid>
 
             <!-- Center Dialing Area: Vintage Rotary Dial OR Modern 3x4 Keypad -->
-            <Grid Grid.Row="1" VerticalAlignment="Center" HorizontalAlignment="Center">
+            <Viewbox Grid.Row="1" Stretch="Uniform" StretchDirection="DownOnly">
+            <Grid VerticalAlignment="Center" HorizontalAlignment="Center">
               <!-- Mode A: Vintage Skeuomorphic Rotary Dial Control -->
               <controls:RotaryDialControl
                 x:Name="RotaryDial"
@@ -305,6 +297,7 @@
               </Grid>
             </Grid>
 
+            </Viewbox>
             <!-- Bottom Call Action & Card Selector -->
             <StackPanel Grid.Row="2" Margin="0,10,0,0" HorizontalAlignment="Center">
               <!-- Primary Green Call Button -->
@@ -403,11 +396,13 @@
             </Grid.RowDefinitions>
 
             <!-- Caller Information & Call State Header Card -->
-            <StackPanel Grid.Row="0" VerticalAlignment="Center" HorizontalAlignment="Center" Margin="0,16,0,16">
+            <ScrollViewer x:Name="CallInformationScroll" Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel VerticalAlignment="Top" HorizontalAlignment="Center" Margin="0,12,0,12">
               <!-- Caller Avatar with semantic state color ring -->
               <Border
                 Width="108"
                 Height="108"
+                Visibility="{Binding IsCallTimerVisible, Converter={StaticResource InvertBoolToVis}}"
                 Background="{DynamicResource AppInputBrush}"
                 BorderBrush="{Binding CurrentCallState, Converter={StaticResource CallStateColor}}"
                 BorderThickness="3"
@@ -431,11 +426,12 @@
                 FontWeight="SemiBold"
                 Foreground="{DynamicResource AppTextPrimaryBrush}"
                 HorizontalAlignment="Center"
-                Text="{Binding ActiveCallNumber, FallbackValue='未知号码'}"
+                Text="{Binding ActiveCallNumber, FallbackValue='未知号码', TargetNullValue='未知号码'}"
               />
 
               <!-- Call State Title -->
               <TextBlock
+                x:Name="CallStatusTitleText"
                 Margin="0,8,0,0"
                 FontSize="15"
                 Foreground="{Binding CurrentCallState, Converter={StaticResource CallStateColor}}"
@@ -460,6 +456,7 @@
               <TextBlock
                 Margin="0,6,0,0"
                 FontSize="13"
+                MaxWidth="320" TextWrapping="Wrap" TextAlignment="Center"
                 Foreground="{DynamicResource AppTextSecondaryBrush}"
                 HorizontalAlignment="Center"
                 Text="{Binding CallStatusSubtitle}"
@@ -485,12 +482,36 @@
                   />
                 </StackPanel>
               </Border>
+              <Border x:Name="MicrophoneUplinkPanel"
+                      Margin="0,12,0,0" Padding="12,10" Width="300"
+                      Background="{DynamicResource AppInputBrush}"
+                      BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1" CornerRadius="8"
+                      Visibility="{Binding ShowMicrophoneStatus, Converter={StaticResource BoolToVis}}">
+                <StackPanel>
+                  <TextBlock Text="{Binding MicrophoneStatus.DeviceName}" FontSize="12"
+                             TextTrimming="CharacterEllipsis" ToolTip="{Binding MicrophoneStatus.DeviceName}"
+                             Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                  <ProgressBar x:Name="MicrophoneInputLevel" Minimum="0" Maximum="100" Height="5" Margin="0,7,0,7"
+                               Value="{Binding MicrophoneStatus.InputLevel, Mode=OneWay}"
+                               Foreground="{DynamicResource AppAccentBrush}"
+                               AutomationProperties.Name="通话上行输入电平" />
+                  <TextBlock x:Name="MicrophoneUplinkStatusText" Text="{Binding MicrophoneStatus.StatusText}"
+                             TextWrapping="Wrap" FontSize="12" Foreground="{DynamicResource AppTextPrimaryBrush}" />
+                  <TextBlock Text="{Binding MicrophoneStatus.DetailText}" TextWrapping="Wrap" FontSize="10"
+                             Margin="0,5,0,0" Foreground="{DynamicResource AppTextTertiaryBrush}"
+                             ToolTip="音频包仅统计采集 PCM 产生并由本机成功发送的 RTP，不包含保活静音；不代表对端已播放。" />
+                  <ui:Button Content="{Binding MicrophoneRestartText}" Command="{Binding RestartMicrophoneCommand}"
+                             IsEnabled="{Binding CanRestartMicrophone}" HorizontalAlignment="Left"
+                             Padding="8,4" Margin="0,8,0,0" FontSize="11" />
+                </StackPanel>
+              </Border>
             </StackPanel>
 
+            </ScrollViewer>
             <!-- Middle Section: Normal Controls vs Ended Summary vs Incoming Dialog -->
             <Grid Grid.Row="1" Margin="0,0,0,24">
               <!-- A. Normal In-Call Actions (When not ended and not incoming) -->
-              <StackPanel Visibility="{Binding IsEndedVisible, Converter={StaticResource InvertBoolToVis}}">
+              <StackPanel Visibility="{Binding ShowRegularCallActions, Converter={StaticResource BoolToVis}}">
                 <!-- Control Buttons Row: Mute, Keypad, Hold -->
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,16">
                   <!-- Mute Button -->
@@ -498,6 +519,7 @@
                     <Button
                       Style="{StaticResource InCallActionButtonStyle}"
                       Command="{Binding ToggleMuteCommand}"
+                      IsEnabled="{Binding CanControlMicrophone}"
                       ToolTip="切换麦克风静音"
                     >
                       <Grid>
@@ -699,8 +721,20 @@
 
             <!-- Bottom Call Control (Hangup or Answer/Reject) -->
             <Grid Grid.Row="2" HorizontalAlignment="Center">
+              <StackPanel Orientation="Horizontal" Visibility="{Binding ShowIncomingControls, Converter={StaticResource BoolToVis}}">
+                <ui:Button x:Name="AnswerIncomingButton" Content="在本机接听" Appearance="Primary"
+                           Background="{DynamicResource AppSuccessBrush}" Foreground="{DynamicResource AppTextOnAccentBrush}"
+                           Width="160" Height="48" Margin="0,0,12,0" FontSize="16"
+                           Command="{Binding AnswerCommand}" IsEnabled="{Binding CanAcceptIncoming}"
+                           ToolTip="在电脑上接听，其他 SIP 分机停止振铃" />
+                <ui:Button Content="拒接" Width="100" Height="48" FontSize="16"
+                           Background="{DynamicResource AppDangerSoftBrush}" Foreground="{DynamicResource AppDangerBrush}"
+                           Command="{Binding RejectCommand}" IsEnabled="{Binding CanAcceptIncoming}"
+                           ToolTip="结束整通来电，所有分机停止振铃" />
+              </StackPanel>
               <!-- Regular Red Hangup Button (When not incoming and not ended) -->
               <Button
+                x:Name="HangupButton"
                 Width="200"
                 Height="48"
                 Background="{DynamicResource AppDangerBrush}"
@@ -708,7 +742,7 @@
                 Cursor="Hand"
                 Command="{Binding HangupCommand}"
                 ToolTip="结束本次通话"
-                Visibility="{Binding IsEndedVisible, Converter={StaticResource InvertBoolToVis}}"
+                Visibility="{Binding ShowHangupControl, Converter={StaticResource BoolToVis}}"
               >
                 <Button.Template>
                   <ControlTemplate TargetType="Button">

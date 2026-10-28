@@ -19,6 +19,15 @@ public record SipRegistrationResult(
     bool SmsCapabilityConfirmed = false
 );
 
+/// <summary>The registrar invalidated this flow; its owner must create a new initial registration flow.</summary>
+public sealed class SipRegistrationRestartRequiredException(string message, int? statusCode = null,
+    SipRegistrationFailureInfo? failure = null)
+    : InvalidOperationException(message)
+{
+    public int? StatusCode { get; } = statusCode;
+    public SipRegistrationFailureInfo? Failure { get; } = failure;
+}
+
 /// <summary>
 /// Manages the full 3GPP IMS SIP registration flow:
 ///   1. Send initial REGISTER (no credentials)
@@ -37,26 +46,107 @@ public class SipRegisterSession : IDisposable
     private readonly string _fromTag;
     private uint _cseq = 1;
     private int _requestedExpiresSeconds = ImsRegisterBuilder.DefaultExpiresSeconds;
-    private readonly SecurityProposal? _securityProposal;
+    // TS 24.229 5.1.1.4.2: re-REGISTER carries the last nonce and calculated
+    // response, not the empty identity-only Authorization from initial attach.
+    // Keep only the wire header; the raw AKA vector is still zeroed immediately.
+    private string? _lastRegisterAuthorization;
+    private int _requiresNewRegistrationFlow;
+    private int _registrationResponseObserved;
+    internal bool HasObservedRegistrationResponse => Volatile.Read(ref _registrationResponseObserved) != 0;
+    private readonly SipRegistrationRetryGate _retryGate;
+    private readonly string _retryScope;
+    public SipRegistrationFailureInfo? LastFailure { get; private set; }
+    public bool RequiresNewRegistrationFlow => Volatile.Read(ref _requiresNewRegistrationFlow) != 0;
+    private SecurityProposal? _securityProposal;
+    private SecurityAgreement? _successfulAgreement;
+    private readonly Func<SecurityProposal>? _createRenewalSecurityProposal;
+    private readonly Action<SipRegistrationResult>? _registrationAccepted;
     private readonly Action<SecurityAgreement, byte[], byte[]>? _activateSecurity;
     private readonly IReadOnlyList<string>? _securityIntegrityAlgorithms;
     private readonly IReadOnlyList<string>? _securityEncryptionAlgorithms;
     private readonly Action<string>? _diagnosticLog;
+    private readonly Func<CancellationToken, Task<string?>>? _readAccessNetworkInfo;
     private CancellationTokenSource? _refreshCts;
     private Task? _refreshTask;
     public SecurityAgreement? Agreement { get; private set; }
     public event EventHandler<SipRegistrationResult>? RegistrationRefreshed;
     public event EventHandler<string>? RegistrationFailed;
 
-    public SipRegistrationResult? LastResult { get; private set; }
-    public ImsProfile CurrentProfile => _profile;
+    private sealed record Grant(SipRegistrationResult Result, long AcceptedTimestamp);
+    private Grant? _lastGrant;
+    /// <summary>Last accepted grant, retained as history; use CurrentResult for live status.</summary>
+    public SipRegistrationResult? LastResult
+    {
+        get => Volatile.Read(ref _lastGrant)?.Result;
+        private set => Volatile.Write(ref _lastGrant, value is null ? null : new Grant(value, Stopwatch.GetTimestamp()));
+    }
+    public SipRegistrationResult? CurrentResult
+    {
+        get
+        {
+            var grant = Volatile.Read(ref _lastGrant);
+            return !_transport.IsDisposed && !RequiresNewRegistrationFlow && grant is not null &&
+                IsGrantCurrent(grant.Result, grant.AcceptedTimestamp, DateTime.UtcNow, Stopwatch.GetTimestamp())
+                    ? grant.Result : null;
+        }
+    }
+    internal static bool IsGrantCurrent(SipRegistrationResult result, long acceptedTimestamp,
+        DateTime utcNow, long nowTimestamp)
+    {
+        if (result.ExpiresSeconds <= 0 || result.RegisteredAt.Kind != DateTimeKind.Utc || nowTimestamp < acceptedTimestamp)
+            return false;
+        var lifetime = TimeSpan.FromSeconds(result.ExpiresSeconds);
+        var wallElapsed = utcNow - result.RegisteredAt;
+        // A stalled refresh must not extend validity. The monotonic clock also
+        // bounds it if the wall clock moves backwards within the granted age.
+        return wallElapsed >= TimeSpan.Zero && wallElapsed < lifetime &&
+            Stopwatch.GetElapsedTime(acceptedTimestamp, nowTimestamp) < lifetime;
+    }
+    public ImsProfile CurrentProfile => Volatile.Read(ref _profile);
+
+    /// <summary>Refreshes optional cellular PANI before a new IMS transaction.</summary>
+    public async Task<string?> RefreshAccessNetworkInfoAsync(CancellationToken ct = default, TimeSpan? budget = null)
+    {
+        if (_readAccessNetworkInfo is null) return CurrentProfile.PAccessNetworkInfo;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        if (budget.HasValue) deadline.CancelAfter(budget.Value);
+        string? current;
+        try { current = await _readAccessNetworkInfo(deadline.Token).WaitAsync(deadline.Token).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested && deadline.IsCancellationRequested)
+        {
+            // Optional cell metadata must not stall call setup behind an AT
+            // queue. Never fall back to a potentially stale previous cell.
+            current = null;
+            TraceCallSetup("Host IMS access metadata deadline exceeded; omitted stale PANI.");
+        }
+        ct.ThrowIfCancellationRequested();
+        UpdateProfile(profile => profile with { PAccessNetworkInfo = current });
+        return current;
+    }
+
+    public void TraceCallSetup(string message) => _diagnosticLog?.Invoke(message);
+
+    private void UpdateProfile(Func<ImsProfile, ImsProfile> update)
+    {
+        while (true)
+        {
+            var old = CurrentProfile;
+            var replacement = update(old);
+            if (ReferenceEquals(Interlocked.CompareExchange(ref _profile, replacement, old), old))
+                return;
+        }
+    }
 
     public SipRegisterSession(SipTransport transport, ImsProfile profile,
         SecurityProposal? securityProposal = null,
         Action<SecurityAgreement, byte[], byte[]>? activateSecurity = null,
         IReadOnlyList<string>? securityIntegrityAlgorithms = null,
         IReadOnlyList<string>? securityEncryptionAlgorithms = null,
-        Action<string>? diagnosticLog = null)
+        Action<string>? diagnosticLog = null,
+        Func<CancellationToken, Task<string?>>? readAccessNetworkInfo = null,
+        SipRegistrationRetryGate? retryGate = null, string? retryScope = null,
+        Func<SecurityProposal>? createRenewalSecurityProposal = null,
+        Action<SipRegistrationResult>? registrationAccepted = null)
     {
         if ((securityProposal is null) != (activateSecurity is null))
             throw new ArgumentException("IMS Security-Client requires an SA activation callback, and vice versa.");
@@ -64,9 +154,16 @@ public class SipRegisterSession : IDisposable
         _profile = profile;
         _securityProposal = securityProposal;
         _activateSecurity = activateSecurity;
+        if (createRenewalSecurityProposal is not null && securityProposal is null)
+            throw new ArgumentException("Renewal security reservation requires an initial proposal.");
+        _createRenewalSecurityProposal = createRenewalSecurityProposal;
+        _registrationAccepted = registrationAccepted;
         _securityIntegrityAlgorithms = securityIntegrityAlgorithms;
         _securityEncryptionAlgorithms = securityEncryptionAlgorithms;
         _diagnosticLog = diagnosticLog;
+        _readAccessNetworkInfo = readAccessNetworkInfo;
+        _retryGate = retryGate ?? new();
+        _retryScope = retryScope ?? profile.PrivateIdentity;
         _transport.PreparingOutgoingRequest += AddSecurityHeaders;
         // Call-ID and From tag are generated once and reused for the entire registration dialog
         _callId = Guid.NewGuid().ToString("N") + "@" + profile.LocalIp;
@@ -85,6 +182,10 @@ public class SipRegisterSession : IDisposable
         Func<byte[], byte[], CancellationToken, Task<(byte[] Res, byte[] Ck, byte[] Ik)>> akaProvider,
         CancellationToken ct = default)
     {
+        if (RequiresNewRegistrationFlow)
+            throw new SipRegistrationRestartRequiredException("IMS registration flow is invalid; create a new initial registration flow before retrying.");
+        _retryGate.ThrowIfBlocked(_retryScope);
+        LastFailure = null;
         for (var attempt = 0; attempt < 2; attempt++)
         {
             try { return await RegisterCoreAsync(akaProvider, ct).ConfigureAwait(false); }
@@ -123,18 +224,23 @@ public class SipRegisterSession : IDisposable
         Func<byte[], byte[], CancellationToken, Task<(byte[] Res, byte[] Ck, byte[] Ik)>> akaProvider,
         CancellationToken ct)
     {
+        var isReregistration = LastResult is not null;
+        if (isReregistration) PrepareRenewalSecurityProposal();
         var totalTimer = Stopwatch.StartNew();
+        // Obtain the current access cell before every initial or refresh REGISTER.
+        // A cached PANI from an earlier cell can identify the wrong location.
+        await RefreshAccessNetworkInfoAsync(ct).ConfigureAwait(false);
         // ── Step 1: Send initial REGISTER ────────────────────────────────────
         var initReq = ImsRegisterBuilder.BuildInitialRegister(_profile, _callId, _cseq++, _fromTag, _requestedExpiresSeconds);
         AddSecurityHeaders(initReq);
-        WriteDiagnostic($"REGISTER step=1/5 send initial request; local={ImsRegisterBuilder.FormatHost(_profile.LocalIp)}:{_profile.LocalPort}; security-client={_securityProposal is not null}.");
+        WriteDiagnostic($"REGISTER step=1/5 send request; local-port={_profile.LocalPort}; security-client={_securityProposal is not null}; authorization={(_lastRegisterAuthorization is null ? "initial" : "previous-aka")}.");
         if (_securityProposal is not null)
             WriteDiagnostic($"REGISTER step=1/5 Security-Client offer: {DescribeSecurityClientOffer()}.");
         var requestTimer = Stopwatch.StartNew();
-        var resp1 = await _transport.SendAndReceiveAsync(initReq, ct).ConfigureAwait(false)
-                      ?? throw new InvalidOperationException("SIP REGISTER: no response from P-CSCF.");
+        var resp1 = await ExchangeRegisterAsync(initReq, ct).ConfigureAwait(false);
+        ThrowIfRegistrationFlowLost(resp1, isReregistration);
         ThrowIfIntervalTooBrief(resp1);
-        WriteDiagnostic($"REGISTER step=1/5 response={resp1.StatusCode} {resp1.ReasonPhrase}; elapsed={requestTimer.ElapsedMilliseconds}ms; www-authenticate={HeaderCount(resp1, "WWW-Authenticate")}; security-server={HasHeader(resp1, "Security-Server")}.");
+        WriteDiagnostic($"REGISTER step=1/5 status={resp1.StatusCode}; elapsed={requestTimer.ElapsedMilliseconds}ms; www-authenticate={HeaderCount(resp1, "WWW-Authenticate")}; security-server={HasHeader(resp1, "Security-Server")}.");
 
         // A 200 OK on the first REGISTER (no auth required) is allowed by some operators
         if (resp1.StatusCode == 200)
@@ -143,8 +249,9 @@ public class SipRegisterSession : IDisposable
                 HasHeader(resp1, "Security-Server") || RequiresSecAgree(resp1)))
                 throw new InvalidOperationException(
                     "SIP REGISTER received 200 OK requiring IMS security, but no IMS security association was established.");
+            var accepted = AcceptRegistration(resp1);
             WriteDiagnostic($"REGISTER completed without challenge; total={totalTimer.ElapsedMilliseconds}ms.");
-            return LastResult = ExtractRegistrationResult(resp1);
+            return accepted;
         }
 
         // ── Step 2: Handle 401 Unauthorized ──────────────────────────────────
@@ -184,32 +291,47 @@ public class SipRegisterSession : IDisposable
             !HasHeader(resp1, "Security-Server"))
             throw new InvalidOperationException("IMS sec-agree was requested, but the 401 response omitted Security-Server.");
 
+        // Reject incompatible P-CSCF security offers before invoking the SIM.
+        // A real AKA challenge can consume card state; there is no reason to
+        // authenticate it if the selected protection cannot be installed.
+        SecurityAgreement? selectedSecurity = null;
+        if (resp1.Headers.TryGetValue("Security-Server", out var offeredSecurity))
+        {
+            if (_securityProposal == null || _activateSecurity == null)
+                throw new InvalidOperationException("P-CSCF requires IMS IPsec, but this transport has no IMS security data plane.");
+            var evaluation = SecurityAgreementBuilder.EvaluateSecurityServer(
+                string.Join(", ", offeredSecurity), _securityProposal,
+                _securityIntegrityAlgorithms, _securityEncryptionAlgorithms);
+            WriteDiagnostic($"REGISTER step=4/5 Security-Server compatibility: {string.Join(" | ", evaluation.CandidateDiagnostics)}");
+            selectedSecurity = evaluation.Agreement
+                ?? throw new InvalidOperationException("P-CSCF offered no IMS security mechanism that was present in Security-Client.");
+        }
+
         // ── Step 3: Decode RAND + AUTN from nonce (3GPP TS 24.228 §5.1.1.2) ─
         var (rand, autn) = DecodeAkaNonce(challenge.Nonce);
 
         // ── Step 4: Perform AKA authentication ───────────────────────────────
         var akaTimer = Stopwatch.StartNew();
-        WriteDiagnostic("REGISTER step=3/5 invoking USIM AKA; RAND/AUTN are intentionally not logged.");
-        var (res, ck, ik) = await akaProvider(rand, autn, ct).ConfigureAwait(false);
+        byte[]? res = null;
+        byte[]? ck = null;
+        byte[]? ik = null;
         try
         {
+            WriteDiagnostic("REGISTER step=3/5 invoking USIM AKA; RAND/AUTN are intentionally not logged.");
+            (res, ck, ik) = await akaProvider(rand, autn, ct).ConfigureAwait(false);
             if (res is null || ck is null || ik is null)
                 throw new InvalidOperationException("USIM AKA returned an incomplete authentication vector.");
             WriteDiagnostic($"REGISTER step=3/5 USIM AKA completed; elapsed={akaTimer.ElapsedMilliseconds}ms; result-lengths=res:{res.Length},ck:{ck.Length},ik:{ik.Length}.");
-            if (resp1.Headers.TryGetValue("Security-Server", out var offered))
+            if (selectedSecurity is not null)
             {
-                if (_securityProposal == null || _activateSecurity == null)
-                    throw new InvalidOperationException("P-CSCF requires IMS IPsec, but this transport has no IMS security data plane.");
-                var evaluation = SecurityAgreementBuilder.EvaluateSecurityServer(
-                    string.Join(", ", offered), _securityProposal,
-                    _securityIntegrityAlgorithms, _securityEncryptionAlgorithms);
-                WriteDiagnostic($"REGISTER step=4/5 Security-Server compatibility: {string.Join(" | ", evaluation.CandidateDiagnostics)}");
-                var agreement = evaluation.Agreement
-                    ?? throw new InvalidOperationException("P-CSCF offered no IMS security mechanism that was present in Security-Client.");
-                _activateSecurity(agreement, ck, ik);
-                Agreement = agreement;
-                _profile = _profile with { LocalPort = _securityProposal.PortClient, ContactPort = _securityProposal.PortServer };
-                WriteDiagnostic($"REGISTER step=4/5 IMS IPsec selected; integrity={agreement.Selected.IntegrityAlgorithm}; encryption={agreement.Selected.EncryptionAlgorithm}; ue-ports={agreement.Selected.PortClient}/{agreement.Selected.PortServer}; pcscf-ports={agreement.PcscfClientPort}/{agreement.PcscfServerPort}.");
+                _activateSecurity!(selectedSecurity, ck, ik);
+                Agreement = selectedSecurity;
+                UpdateProfile(profile => profile with
+                {
+                    LocalPort = _securityProposal!.PortClient,
+                    ContactPort = _securityProposal.PortServer
+                });
+                WriteDiagnostic($"REGISTER step=4/5 IMS IPsec selected; integrity={selectedSecurity.Selected.IntegrityAlgorithm}; encryption={selectedSecurity.Selected.EncryptionAlgorithm}; ue-ports={selectedSecurity.Selected.PortClient}/{selectedSecurity.Selected.PortServer}; pcscf-ports={selectedSecurity.PcscfClientPort}/{selectedSecurity.PcscfServerPort}.");
             }
             else
             {
@@ -219,32 +341,126 @@ public class SipRegisterSession : IDisposable
             var authReq = ImsRegisterBuilder.BuildAuthenticatedRegister(
                 _profile, _callId, _cseq++, challenge, res, _fromTag, Agreement != null, _requestedExpiresSeconds);
             AddSecurityHeaders(authReq);
+            // A fresh 401 replaces the previous challenge, including when the
+            // registrar next asks for a longer Contact lifetime with 423.
+            _lastRegisterAuthorization = authReq.GetHeader("Authorization");
 
             requestTimer.Restart();
             WriteDiagnostic($"REGISTER step=5/5 send authenticated request; local-port={_profile.LocalPort}; integrity-protected={Agreement is not null}.");
-            var resp2 = await _transport.SendAndReceiveAsync(authReq, ct).ConfigureAwait(false)
-                        ?? throw new InvalidOperationException("SIP authenticated REGISTER: no response.");
+            var resp2 = await ExchangeRegisterAsync(authReq, ct).ConfigureAwait(false);
+            ThrowIfRegistrationFlowLost(resp2, isReregistration);
             ThrowIfIntervalTooBrief(resp2);
-            WriteDiagnostic($"REGISTER step=5/5 response={resp2.StatusCode} {resp2.ReasonPhrase}; elapsed={requestTimer.ElapsedMilliseconds}ms; service-route={HasHeader(resp2, "Service-Route")}; associated-uri={HasHeader(resp2, "P-Associated-URI")}; expires={GetHeaderValue(resp2, "Expires") ?? "contact/default"}.");
+            WriteDiagnostic($"REGISTER step=5/5 status={resp2.StatusCode}; elapsed={requestTimer.ElapsedMilliseconds}ms; service-route={HasHeader(resp2, "Service-Route")}; associated-uri={HasHeader(resp2, "P-Associated-URI")}; expires-header={HasHeader(resp2, "Expires")}.");
 
             if (resp2.StatusCode != 200)
                 throw new InvalidOperationException(
                     $"SIP REGISTER auth failed: {resp2.StatusCode} {resp2.ReasonPhrase}");
 
+            var accepted = AcceptRegistration(resp2);
             Console.WriteLine("[SipRegisterSession] IMS registration accepted (200 OK).");
-            LastResult = ExtractRegistrationResult(resp2);
-            WriteDiagnostic($"REGISTER completed successfully; total={totalTimer.ElapsedMilliseconds}ms; refresh={LastResult.ExpiresSeconds}s; sms-capability={LastResult.SmsCapabilityConfirmed}.");
-            return LastResult;
+            WriteDiagnostic($"REGISTER completed successfully; total={totalTimer.ElapsedMilliseconds}ms; refresh={accepted.ExpiresSeconds}s; sms-capability={accepted.SmsCapabilityConfirmed}.");
+            return accepted;
         }
         finally
         {
             if (res is not null) CryptographicOperations.ZeroMemory(res);
             if (ck is not null) CryptographicOperations.ZeroMemory(ck);
             if (ik is not null) CryptographicOperations.ZeroMemory(ik);
+            CryptographicOperations.ZeroMemory(rand);
+            CryptographicOperations.ZeroMemory(autn);
         }
     }
 
+    private async Task<SipMessage> ExchangeRegisterAsync(SipMessage request, CancellationToken ct)
+    {
+        void Observe(SipMessage _) => Interlocked.Exchange(ref _registrationResponseObserved, 1);
+        var response = await _transport.SendRegistrationAsync(request, Observe,
+            () => HasObservedRegistrationResponse, ct).ConfigureAwait(false);
+        Observe(response);
+        return response;
+    }
+
     private void WriteDiagnostic(string message) => _diagnosticLog?.Invoke(message);
+
+    private void ThrowIfRegistrationFlowLost(SipMessage response, bool isReregistration)
+    {
+        // TS 24.229 5.1.1.4.1: these responses require INITIAL registration.
+        // In particular, a 500/504 can delete the P-CSCF's IP association. Retrying
+        // the same protected flow/Authorization cannot re-establish that association.
+        var newFlow = isReregistration && response.StatusCode is 403 or 408 or 500 or 503 or 504;
+        if (response.StatusCode >= 400 && response.StatusCode is not (401 or 423))
+        {
+            LastFailure = SipRegistrationFailureInfo.FromResponse(response, newFlow);
+            _retryGate.Observe(_retryScope, LastFailure);
+        }
+        if (newFlow)
+            throw InvalidateRegistrationFlow($"IMS re-registration received SIP {response.StatusCode}; a new initial registration flow is required.", response.StatusCode);
+    }
+
+    private SipRegistrationRestartRequiredException InvalidateRegistrationFlow(string reason, int? statusCode = null)
+    {
+        LastResult = null;
+        _lastRegisterAuthorization = null;
+        Volatile.Write(ref _requiresNewRegistrationFlow, 1);
+        WriteDiagnostic(reason);
+        return new(reason, statusCode, LastFailure);
+    }
+
+    private SipRegistrationResult AcceptRegistration(SipMessage response)
+    {
+        var result = ExtractRegistrationResult(response);
+        if (response.Headers.TryGetValue("Authentication-Info", out var headers))
+        {
+            string? nextNonce = null;
+            foreach (var header in headers)
+            {
+                if (!ImsRegisterBuilder.TryParseAuthenticationInfo(header, out var parameters))
+                    throw InvalidateRegistrationFlow("IMS REGISTER returned malformed Authentication-Info; credentials were discarded and a new registration flow is required.");
+                if (!parameters.TryGetValue("nextnonce", out var candidate)) continue;
+                if (nextNonce is not null || string.IsNullOrEmpty(candidate) || candidate.Any(char.IsControl))
+                    throw InvalidateRegistrationFlow("IMS REGISTER returned ambiguous or invalid nextnonce; credentials were discarded and a new registration flow is required.");
+                nextNonce = candidate;
+            }
+            if (nextNonce is not null)
+            {
+                if (_lastRegisterAuthorization is not { } authorization)
+                    throw InvalidateRegistrationFlow("IMS REGISTER returned nextnonce without an established AKA context; a new registration flow is required.");
+                // TS 24.229 5.1.1.4.1(f), 5.1.1.4.2(a): store the latest nonce,
+                // retain the LAST CALCULATED response. Do not retain/reuse RES or
+                // silently run another AKA merely because a successful 200 supplied a nonce.
+                // A subsequent 401 still drives a fresh USIM authentication normally.
+                var nonceField = Regex.Match(authorization, @"(?:^|,\s*)nonce\s*=\s*""(?<value>(?:\\.|[^""\\])*)""", RegexOptions.IgnoreCase);
+                if (!nonceField.Success)
+                    throw InvalidateRegistrationFlow("IMS AKA authorization has no replaceable nonce; a new registration flow is required.");
+                var field = nonceField.Groups["value"];
+                var escaped = nextNonce.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+                _lastRegisterAuthorization = authorization[..field.Index] + escaped + authorization[(field.Index + field.Length)..];
+                WriteDiagnostic("REGISTER accepted Authentication-Info nextnonce; previous nonce replaced, last AKA response retained; nonce value redacted.");
+            }
+        }
+        LastFailure = null;
+        _retryGate.ClearFailure(_retryScope);
+        _registrationAccepted?.Invoke(result);
+        _successfulAgreement = Agreement;
+        return LastResult = result;
+    }
+
+    private void PrepareRenewalSecurityProposal()
+    {
+        if (_createRenewalSecurityProposal is null) return;
+        var next = _createRenewalSecurityProposal();
+        if (_securityProposal is not { } previous ||
+            next.SpiClient == previous.SpiClient || next.SpiServer == previous.SpiServer ||
+            next.SpiClient == previous.SpiServer || next.SpiServer == previous.SpiClient ||
+            next.SpiClient < 256 || next.SpiServer < 256 ||
+            next.SpiClient == next.SpiServer || next.PortClient == previous.PortClient ||
+            next.PortServer != previous.PortServer || next.PortClient == next.PortServer ||
+            !SecurityAgreementBuilder.IsValidProtectedPort(next.PortClient) ||
+            !SecurityAgreementBuilder.IsValidProtectedPort(next.PortServer))
+            throw new InvalidOperationException("Renewal reservation must provide fresh SPIs/client port while retaining the Contact server port.");
+        _securityProposal = next;
+        WriteDiagnostic("REGISTER prepared fresh renewal security parameters; existing protected flow remains active until reauthentication succeeds.");
+    }
 
     private static bool HasHeader(SipMessage message, string name) =>
         message.Headers.TryGetValue(name, out var values) && values.Count > 0;
@@ -257,9 +473,6 @@ public class SipRegisterSession : IDisposable
 
     private static int HeaderCount(SipMessage message, string name) =>
         message.Headers.TryGetValue(name, out var values) ? values.Count : 0;
-
-    private static string? GetHeaderValue(SipMessage message, string name) =>
-        message.Headers.TryGetValue(name, out var values) ? values.FirstOrDefault() : null;
 
     private string DescribeSecurityClientOffer()
     {
@@ -292,13 +505,22 @@ public class SipRegisterSession : IDisposable
             catch (FormatException ex) { throw new InvalidOperationException("IMS AKA nonce is neither valid Base64 nor hexadecimal RAND/AUTN.", ex); }
         }
 
-        if (decoded.Length < 32)
-            throw new InvalidOperationException($"IMS AKA nonce decoded to {decoded.Length} bytes; RAND/AUTN requires at least 32.");
-        return (decoded[..16], decoded[16..32]);
+        try
+        {
+            if (decoded.Length < 32)
+                throw new InvalidOperationException($"IMS AKA nonce decoded to {decoded.Length} bytes; RAND/AUTN requires at least 32.");
+            return (decoded[..16], decoded[16..32]);
+        }
+        finally { CryptographicOperations.ZeroMemory(decoded); }
     }
 
     public void AddSecurityHeaders(SipMessage request)
     {
+        if (request.Method == "REGISTER" && RequiresNewRegistrationFlow)
+            throw new SipRegistrationRestartRequiredException("Refusing REGISTER on an invalid IMS flow; its owner must create a new initial registration flow.");
+        if (request.Method == "REGISTER" && request.GetHeader("Authorization") is null &&
+            _lastRegisterAuthorization is { } cachedAuthorization)
+            request.SetHeader("Authorization", cachedAuthorization);
         if (_securityProposal == null) return;
         if (request.Method == "REGISTER")
         {
@@ -321,12 +543,13 @@ public class SipRegisterSession : IDisposable
                     $"uri=\"sip:{_profile.HomeDomain}\", response=\"\", algorithm=AKAv1-MD5, integrity-protected=no");
             }
         }
-        if (Agreement != null)
+        var agreement = request.Method == "REGISTER" ? Agreement : _successfulAgreement ?? Agreement;
+        if (agreement != null)
         {
             var authorization = request.GetHeader("Authorization");
             if (authorization != null)
                 request.SetHeader("Authorization", authorization.Replace("integrity-protected=no", "integrity-protected=yes"));
-            request.SetHeader("Security-Verify", Agreement.VerifyValue);
+            request.SetHeader("Security-Verify", agreement.VerifyValue);
             // Subsequent IMS transactions, including RP-ACK, remain covered by
             // the negotiated security agreement rather than silently downgrading.
             request.SetHeader("Require", "sec-agree");
@@ -347,7 +570,10 @@ public class SipRegisterSession : IDisposable
                 {
                     var granted = LastResult;
                     var expiresAt = granted.RegisteredAt.AddSeconds(granted.ExpiresSeconds);
-                    var refreshAt = granted.RegisteredAt.AddSeconds(granted.ExpiresSeconds * 0.8);
+                    // TS 24.229 5.1.1.4.1: 600 s before long grants expire;
+                    // half-life for grants of 1200 s or less.
+                    var refreshAt = granted.RegisteredAt.AddSeconds(granted.ExpiresSeconds > 1200
+                        ? granted.ExpiresSeconds - 600 : granted.ExpiresSeconds / 2.0);
                     // Task.Delay cannot represent arbitrary SIP expiry values.
                     // Sleep in bounded chunks, then recalculate against the
                     // registration timestamp so long grants remain cancellable.
@@ -372,9 +598,15 @@ public class SipRegisterSession : IDisposable
                         {
                             throw;
                         }
+                        catch (Exception ex) when (ex is SipRegistrationRestartRequiredException or SipRegistrationRetryBlockedException)
+                        {
+                            WriteDiagnostic("REGISTER refresh stopped retries on an invalid flow; handing off to initial-registration recovery.");
+                            throw;
+                        }
                         catch (Exception ex)
                         {
                             lastError = ex;
+                            WriteDiagnostic($"REGISTER refresh attempt={attempt + 1}/3 failed: {ex.Message}");
                             var retryWindow = expiresAt - DateTime.UtcNow;
                             if (attempt == 2 || retryWindow <= TimeSpan.Zero)
                                 break;
@@ -387,13 +619,14 @@ public class SipRegisterSession : IDisposable
                     }
 
                     if (lastError != null)
-                        throw new InvalidOperationException("IMS REGISTER refresh retries were exhausted.", lastError);
+                        throw new InvalidOperationException($"IMS REGISTER refresh retries were exhausted: {lastError.Message}", lastError);
                 }
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
             catch (Exception ex)
             {
                 LastResult = null;
+                _lastRegisterAuthorization = null;
                 RegistrationFailed?.Invoke(this, ex.Message);
             }
         });
@@ -424,18 +657,34 @@ public class SipRegisterSession : IDisposable
         CancellationToken ct)
     {
         if (LastResult == null) return;
+        PrepareRenewalSecurityProposal();
         var req = BuildDeregisterRequest();
+        WriteDiagnostic($"REGISTER removal send; local-port={_profile.LocalPort}; integrity-protected={Agreement is not null}; expires=0.");
         var response = await _transport.SendAndReceiveAsync(req, ct).ConfigureAwait(false)
             ?? throw new InvalidOperationException("SIP de-registration received no response.");
+        WriteDiagnostic($"REGISTER removal status={response.StatusCode}; aka-rechallenge={response.StatusCode == 401}; provider-available={akaProvider is not null}.");
         if (response.StatusCode == 401 && akaProvider is not null)
         {
-            if (response.GetHeader("Security-Server") is not null && Agreement is null)
-                throw new InvalidOperationException("SIP de-registration requires an unavailable IMS IPsec security agreement.");
             var challenges = response.Headers.TryGetValue("WWW-Authenticate", out var offered)
                 ? offered : [];
             var challenge = challenges.Select(ImsRegisterBuilder.ParseWwwAuthenticate)
                 .FirstOrDefault(item => item is not null)
                 ?? throw new InvalidOperationException("SIP de-registration received no supported IMS-AKA challenge.");
+            SecurityAgreement? selectedSecurity = null;
+            if (response.Headers.TryGetValue("Security-Server", out var securityHeaders) &&
+                securityHeaders.Count > 0)
+            {
+                if (_securityProposal is null || _activateSecurity is null)
+                    throw new InvalidOperationException("SIP de-registration requires an unavailable IMS IPsec security agreement.");
+                selectedSecurity = SecurityAgreementBuilder.EvaluateSecurityServer(
+                    string.Join(", ", securityHeaders), _securityProposal,
+                    _securityIntegrityAlgorithms, _securityEncryptionAlgorithms).Agreement
+                    ?? throw new InvalidOperationException(
+                        "SIP de-registration offered no installable IMS security mechanism.");
+            }
+            else if (Agreement is null && RequiresSecAgree(response))
+                throw new InvalidOperationException(
+                    "SIP de-registration requires sec-agree but omitted Security-Server.");
             var (rand, autn) = DecodeAkaNonce(challenge.Nonce);
             byte[]? res = null;
             byte[]? ck = null;
@@ -445,11 +694,22 @@ public class SipRegisterSession : IDisposable
                 (res, ck, ik) = await akaProvider(rand, autn, ct).ConfigureAwait(false);
                 if (res is null || ck is null || ik is null)
                     throw new InvalidOperationException("IMS AKA returned an incomplete de-registration vector.");
+                if (selectedSecurity is not null)
+                {
+                    _activateSecurity!(selectedSecurity, ck, ik);
+                    Agreement = selectedSecurity;
+                    UpdateProfile(profile => profile with
+                    {
+                        LocalPort = _securityProposal!.PortClient,
+                        ContactPort = _securityProposal.PortServer
+                    });
+                }
                 req = ImsRegisterBuilder.BuildAuthenticatedRegister(
                     _profile, _callId, _cseq++, challenge, res, _fromTag, Agreement is not null);
                 SetDeregisterExpiration(req);
                 response = await _transport.SendAndReceiveAsync(req, ct).ConfigureAwait(false)
                     ?? throw new InvalidOperationException("Authenticated SIP de-registration received no response.");
+                WriteDiagnostic($"REGISTER authenticated removal status={response.StatusCode}.");
             }
             finally
             {
@@ -467,9 +727,20 @@ public class SipRegisterSession : IDisposable
             throw new InvalidOperationException("SIP de-registration Contact is malformed.");
         if (response.Headers.TryGetValue("Contact", out var remaining) &&
             remaining.SelectMany(SecurityAgreementBuilder.SplitHeaderValues)
-                .Any(value => IsSameContactBinding(contact, value)))
+                .Any(value => IsSameContactBinding(contact, value) &&
+                    !HasZeroContactExpiry(value, response.GetHeader("Expires"))))
             throw new InvalidOperationException("SIP de-registration returned 200 OK but still listed this Contact binding.");
         LastResult = null;
+        _lastRegisterAuthorization = null;
+        WriteDiagnostic("REGISTER removal confirmed by registrar; local binding cleared.");
+    }
+
+    private static bool HasZeroContactExpiry(string contact, string? expiresHeader)
+    {
+        var match = Regex.Match(contact, @"(?:^|;)\s*expires\s*=\s*(\d+)", RegexOptions.IgnoreCase);
+        if (match.Success)
+            return int.TryParse(match.Groups[1].Value, out var seconds) && seconds == 0;
+        return int.TryParse(expiresHeader, out var headerSeconds) && headerSeconds == 0;
     }
 
     private SipMessage BuildDeregisterRequest()
@@ -601,6 +872,7 @@ public class SipRegisterSession : IDisposable
     public void Dispose()
     {
         _refreshCts?.Cancel();
+        _lastRegisterAuthorization = null;
         _transport.PreparingOutgoingRequest -= AddSecurityHeaders;
         _transport.Dispose();
     }

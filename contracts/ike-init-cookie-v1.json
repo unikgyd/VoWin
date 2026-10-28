@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "description": "Independent IKE_SA_INIT COOKIE receipt vectors. Protocol ID is ignored only with an empty SPI. No keys or subscriber data.",
+  "cases": [
+    { "name": "one-byte", "length": 1, "protocol": 0, "spi_size": 0, "extra": "", "valid": true },
+    { "name": "max-length", "length": 64, "protocol": 0, "spi_size": 0, "extra": "", "valid": true },
+    { "name": "ignored-protocol", "length": 8, "protocol": 255, "spi_size": 0, "extra": "", "valid": true },
+    { "name": "empty", "length": 0, "protocol": 0, "spi_size": 0, "extra": "", "valid": false },
+    { "name": "too-long", "length": 65, "protocol": 0, "spi_size": 0, "extra": "", "valid": false },
+    { "name": "nonempty-spi", "length": 8, "protocol": 3, "spi_size": 1, "extra": "", "valid": false },
+    { "name": "duplicate", "length": 8, "protocol": 0, "spi_size": 0, "extra": "duplicate", "valid": false },
+    { "name": "mixed-sa", "length": 8, "protocol": 0, "spi_size": 0, "extra": "sa", "valid": false },
+    { "name": "mixed-ke", "length": 8, "protocol": 0, "spi_size": 0, "extra": "ke", "valid": false },
+    { "name": "mixed-nonce", "length": 8, "protocol": 0, "spi_size": 0, "extra": "nonce", "valid": false },
+    { "name": "mixed-auth-reject", "length": 8, "protocol": 0, "spi_size": 0, "extra": "fatal", "valid": false },
+    { "name": "malformed-notify", "length": 8, "protocol": 0, "spi_size": 0, "extra": "malformed", "valid": false }
+  ]
+}

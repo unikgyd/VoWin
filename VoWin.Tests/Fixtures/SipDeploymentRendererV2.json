@@ -1,0 +1,875 @@
+{
+  "syntheticOnly": true,
+  "fixtures": {
+    "vowin-windows": [
+      {
+        "localEnabled": true,
+        "peerEnabled": true,
+        "profile": {
+          "Version": 2,
+          "Settings": {
+            "CredentialVersion": 2,
+            "UseTrunk": true,
+            "LocalRegistrarEnabled": true,
+            "BindAddress": "127.70.0.3",
+            "Port": 5092,
+            "Realm": "gateway.realm.invalid",
+            "IdentityDomain": "messages.example.invalid",
+            "TrustedNetworks": [
+              "127.70.0.2/32"
+            ],
+            "LocalRegistrarAlgorithm": "SHA-256",
+            "Extension": "desk-main",
+            "PrimaryPolicy": {
+              "AllowCalls": false,
+              "AllowSms": true,
+              "AllowInternalCalls": false,
+              "AllowMessages": true,
+              "OutgoingLines": [
+                "synthetic-a"
+              ],
+              "SmsSendLines": [
+                "synthetic-b"
+              ]
+            },
+            "Extensions": [
+              {
+                "Username": "desk-extra",
+                "Policy": {
+                  "AllowCalls": true,
+                  "AllowSms": false,
+                  "AllowInternalCalls": true,
+                  "AllowMessages": false,
+                  "OutgoingLines": [
+                    "synthetic-b"
+                  ],
+                  "SmsSendLines": []
+                }
+              }
+            ],
+            "ServerAddress": "127.70.0.2",
+            "ServerPort": 5090,
+            "TrunkUsername": "pbx-to-gateway",
+            "PeerInboundAlgorithm": "SHA-256",
+            "PeerOutboundUsername": "gateway-to-pbx",
+            "PeerExpectedRealm": "pbx.realm.invalid",
+            "PeerAllowedAlgorithms": [
+              "SHA-256"
+            ],
+            "PeerAllowOutboundCalls": true,
+            "PeerAllowOutboundMessages": false,
+            "PeerAllowIncomingCalls": false,
+            "PeerAllowIncomingMessages": true,
+            "PeerOutgoingLines": [
+              "synthetic-a"
+            ],
+            "PeerSmsSendLines": [
+              "synthetic-b"
+            ],
+            "IncomingTarget": "vowin-unused",
+            "AllowOutboundCalls": true,
+            "MessagesEnabled": true,
+            "ForwardIncomingSms": true,
+            "AllowOutgoingSms": true,
+            "DefaultOutboundLineId": "synthetic-a",
+            "DialRules": [],
+            "LineRoutes": {
+              "synthetic-a": {
+                "Enabled": true,
+                "AllowIncomingCalls": true,
+                "AllowOutgoingCalls": true,
+                "ForwardIncomingSms": true,
+                "AllowOutgoingSms": false,
+                "IncomingTarget": "ring-a",
+                "SmsTarget": "sms-a",
+                "LocalIncomingExtensions": [],
+                "LocalSmsRecipients": [
+                  "desk-extra"
+                ],
+                "ForwardCallsToPeer": false,
+                "ForwardSmsToPeer": true,
+                "Prefix": "81",
+                "CountryCode": "86",
+                "NationalNumberLength": 11,
+                "NormalizeE164": true
+              },
+              "synthetic-b": {
+                "Enabled": true,
+                "AllowIncomingCalls": false,
+                "AllowOutgoingCalls": false,
+                "ForwardIncomingSms": false,
+                "AllowOutgoingSms": true,
+                "IncomingTarget": "ring-b",
+                "SmsTarget": "sms-b",
+                "LocalIncomingExtensions": [
+                  "desk-extra"
+                ],
+                "LocalSmsRecipients": [
+                  "desk-main"
+                ],
+                "ForwardCallsToPeer": false,
+                "ForwardSmsToPeer": true,
+                "Prefix": "82",
+                "CountryCode": "63",
+                "NationalNumberLength": 10,
+                "NormalizeE164": true
+              }
+            },
+            "WasEnabled": false,
+            "RestoreOnStartup": false
+          },
+          "Credentials": {
+            "MainPassword": "synthetic-local-main-password",
+            "Extensions": {
+              "desk-extra": "synthetic-local-extra-password"
+            },
+            "PeerInboundPassword": "synthetic-peer-in-password",
+            "PeerOutboundPassword": "synthetic-peer-out-password"
+          }
+        }
+      },
+      {
+        "localEnabled": false,
+        "peerEnabled": true,
+        "profile": {
+          "Version": 2,
+          "Settings": {
+            "CredentialVersion": 2,
+            "UseTrunk": true,
+            "LocalRegistrarEnabled": false,
+            "BindAddress": "127.70.0.3",
+            "Port": 5092,
+            "Realm": "gateway.realm.invalid",
+            "IdentityDomain": "messages.example.invalid",
+            "TrustedNetworks": [
+              "127.70.0.2/32"
+            ],
+            "LocalRegistrarAlgorithm": "SHA-256",
+            "Extension": "",
+            "PrimaryPolicy": {
+              "AllowCalls": false,
+              "AllowSms": false,
+              "AllowInternalCalls": false,
+              "AllowMessages": false,
+              "OutgoingLines": [],
+              "SmsSendLines": []
+            },
+            "Extensions": [],
+            "ServerAddress": "127.70.0.2",
+            "ServerPort": 5090,
+            "TrunkUsername": "pbx-to-gateway",
+            "PeerInboundAlgorithm": "SHA-256",
+            "PeerOutboundUsername": "gateway-to-pbx",
+            "PeerExpectedRealm": "pbx.realm.invalid",
+            "PeerAllowedAlgorithms": [
+              "SHA-256"
+            ],
+            "PeerAllowOutboundCalls": true,
+            "PeerAllowOutboundMessages": false,
+            "PeerAllowIncomingCalls": false,
+            "PeerAllowIncomingMessages": true,
+            "PeerOutgoingLines": [
+              "synthetic-a"
+            ],
+            "PeerSmsSendLines": [
+              "synthetic-b"
+            ],
+            "IncomingTarget": "vowin-unused",
+            "AllowOutboundCalls": true,
+            "MessagesEnabled": true,
+            "ForwardIncomingSms": true,
+            "AllowOutgoingSms": true,
+            "DefaultOutboundLineId": "synthetic-a",
+            "DialRules": [],
+            "LineRoutes": {
+              "synthetic-a": {
+                "Enabled": true,
+                "AllowIncomingCalls": true,
+                "AllowOutgoingCalls": true,
+                "ForwardIncomingSms": true,
+                "AllowOutgoingSms": false,
+                "IncomingTarget": "ring-a",
+                "SmsTarget": "sms-a",
+                "LocalIncomingExtensions": [],
+                "LocalSmsRecipients": [],
+                "ForwardCallsToPeer": false,
+                "ForwardSmsToPeer": true,
+                "Prefix": "81",
+                "CountryCode": "86",
+                "NationalNumberLength": 11,
+                "NormalizeE164": true
+              },
+              "synthetic-b": {
+                "Enabled": true,
+                "AllowIncomingCalls": false,
+                "AllowOutgoingCalls": false,
+                "ForwardIncomingSms": false,
+                "AllowOutgoingSms": true,
+                "IncomingTarget": "ring-b",
+                "SmsTarget": "sms-b",
+                "LocalIncomingExtensions": [],
+                "LocalSmsRecipients": [],
+                "ForwardCallsToPeer": false,
+                "ForwardSmsToPeer": true,
+                "Prefix": "82",
+                "CountryCode": "63",
+                "NationalNumberLength": 10,
+                "NormalizeE164": true
+              }
+            },
+            "WasEnabled": false,
+            "RestoreOnStartup": false
+          },
+          "Credentials": {
+            "MainPassword": "",
+            "Extensions": {},
+            "PeerInboundPassword": "synthetic-peer-in-password",
+            "PeerOutboundPassword": "synthetic-peer-out-password"
+          }
+        }
+      },
+      {
+        "localEnabled": true,
+        "peerEnabled": false,
+        "profile": {
+          "Version": 2,
+          "Settings": {
+            "CredentialVersion": 2,
+            "UseTrunk": false,
+            "LocalRegistrarEnabled": true,
+            "BindAddress": "127.70.0.3",
+            "Port": 5092,
+            "Realm": "gateway.realm.invalid",
+            "IdentityDomain": "messages.example.invalid",
+            "TrustedNetworks": [
+              "127.70.0.2/32"
+            ],
+            "LocalRegistrarAlgorithm": "SHA-256",
+            "Extension": "desk-main",
+            "PrimaryPolicy": {
+              "AllowCalls": false,
+              "AllowSms": true,
+              "AllowInternalCalls": false,
+              "AllowMessages": true,
+              "OutgoingLines": [
+                "synthetic-a"
+              ],
+              "SmsSendLines": [
+                "synthetic-b"
+              ]
+            },
+            "Extensions": [
+              {
+                "Username": "desk-extra",
+                "Policy": {
+                  "AllowCalls": true,
+                  "AllowSms": false,
+                  "AllowInternalCalls": true,
+                  "AllowMessages": false,
+                  "OutgoingLines": [
+                    "synthetic-b"
+                  ],
+                  "SmsSendLines": []
+                }
+              }
+            ],
+            "ServerAddress": "127.70.0.2",
+            "ServerPort": 5090,
+            "TrunkUsername": "pbx-to-gateway",
+            "PeerInboundAlgorithm": "SHA-256",
+            "PeerOutboundUsername": "gateway-to-pbx",
+            "PeerExpectedRealm": "pbx.realm.invalid",
+            "PeerAllowedAlgorithms": [
+              "SHA-256"
+            ],
+            "PeerAllowOutboundCalls": true,
+            "PeerAllowOutboundMessages": false,
+            "PeerAllowIncomingCalls": false,
+            "PeerAllowIncomingMessages": true,
+            "PeerOutgoingLines": [
+              "synthetic-a"
+            ],
+            "PeerSmsSendLines": [
+              "synthetic-b"
+            ],
+            "IncomingTarget": "vowin-unused",
+            "AllowOutboundCalls": true,
+            "MessagesEnabled": true,
+            "ForwardIncomingSms": true,
+            "AllowOutgoingSms": true,
+            "DefaultOutboundLineId": "synthetic-a",
+            "DialRules": [],
+            "LineRoutes": {
+              "synthetic-a": {
+                "Enabled": true,
+                "AllowIncomingCalls": true,
+                "AllowOutgoingCalls": true,
+                "ForwardIncomingSms": true,
+                "AllowOutgoingSms": false,
+                "IncomingTarget": "ring-a",
+                "SmsTarget": "sms-a",
+                "LocalIncomingExtensions": [],
+                "LocalSmsRecipients": [
+                  "desk-extra"
+                ],
+                "ForwardCallsToPeer": false,
+                "ForwardSmsToPeer": false,
+                "Prefix": "81",
+                "CountryCode": "86",
+                "NationalNumberLength": 11,
+                "NormalizeE164": true
+              },
+              "synthetic-b": {
+                "Enabled": true,
+                "AllowIncomingCalls": false,
+                "AllowOutgoingCalls": false,
+                "ForwardIncomingSms": false,
+                "AllowOutgoingSms": true,
+                "IncomingTarget": "ring-b",
+                "SmsTarget": "sms-b",
+                "LocalIncomingExtensions": [
+                  "desk-extra"
+                ],
+                "LocalSmsRecipients": [
+                  "desk-main"
+                ],
+                "ForwardCallsToPeer": false,
+                "ForwardSmsToPeer": false,
+                "Prefix": "82",
+                "CountryCode": "63",
+                "NationalNumberLength": 10,
+                "NormalizeE164": true
+              }
+            },
+            "WasEnabled": false,
+            "RestoreOnStartup": false
+          },
+          "Credentials": {
+            "MainPassword": "synthetic-local-main-password",
+            "Extensions": {
+              "desk-extra": "synthetic-local-extra-password"
+            },
+            "PeerInboundPassword": "",
+            "PeerOutboundPassword": ""
+          }
+        }
+      },
+      {
+        "localEnabled": false,
+        "peerEnabled": false,
+        "profile": {
+          "Version": 2,
+          "Settings": {
+            "CredentialVersion": 2,
+            "UseTrunk": false,
+            "LocalRegistrarEnabled": false,
+            "BindAddress": "127.70.0.3",
+            "Port": 5092,
+            "Realm": "gateway.realm.invalid",
+            "IdentityDomain": "messages.example.invalid",
+            "TrustedNetworks": [
+              "127.70.0.2/32"
+            ],
+            "LocalRegistrarAlgorithm": "SHA-256",
+            "Extension": "",
+            "PrimaryPolicy": {
+              "AllowCalls": false,
+              "AllowSms": false,
+              "AllowInternalCalls": false,
+              "AllowMessages": false,
+              "OutgoingLines": [],
+              "SmsSendLines": []
+            },
+            "Extensions": [],
+            "ServerAddress": "127.70.0.2",
+            "ServerPort": 5090,
+            "TrunkUsername": "pbx-to-gateway",
+            "PeerInboundAlgorithm": "SHA-256",
+            "PeerOutboundUsername": "gateway-to-pbx",
+            "PeerExpectedRealm": "pbx.realm.invalid",
+            "PeerAllowedAlgorithms": [
+              "SHA-256"
+            ],
+            "PeerAllowOutboundCalls": true,
+            "PeerAllowOutboundMessages": false,
+            "PeerAllowIncomingCalls": false,
+            "PeerAllowIncomingMessages": true,
+            "PeerOutgoingLines": [
+              "synthetic-a"
+            ],
+            "PeerSmsSendLines": [
+              "synthetic-b"
+            ],
+            "IncomingTarget": "vowin-unused",
+            "AllowOutboundCalls": true,
+            "MessagesEnabled": true,
+            "ForwardIncomingSms": true,
+            "AllowOutgoingSms": true,
+            "DefaultOutboundLineId": "synthetic-a",
+            "DialRules": [],
+            "LineRoutes": {
+              "synthetic-a": {
+                "Enabled": true,
+                "AllowIncomingCalls": true,
+                "AllowOutgoingCalls": true,
+                "ForwardIncomingSms": true,
+                "AllowOutgoingSms": false,
+                "IncomingTarget": "ring-a",
+                "SmsTarget": "sms-a",
+                "LocalIncomingExtensions": [],
+                "LocalSmsRecipients": [],
+                "ForwardCallsToPeer": false,
+                "ForwardSmsToPeer": false,
+                "Prefix": "81",
+                "CountryCode": "86",
+                "NationalNumberLength": 11,
+                "NormalizeE164": true
+              },
+              "synthetic-b": {
+                "Enabled": true,
+                "AllowIncomingCalls": false,
+                "AllowOutgoingCalls": false,
+                "ForwardIncomingSms": false,
+                "AllowOutgoingSms": true,
+                "IncomingTarget": "ring-b",
+                "SmsTarget": "sms-b",
+                "LocalIncomingExtensions": [],
+                "LocalSmsRecipients": [],
+                "ForwardCallsToPeer": false,
+                "ForwardSmsToPeer": false,
+                "Prefix": "82",
+                "CountryCode": "63",
+                "NationalNumberLength": 10,
+                "NormalizeE164": true
+              }
+            },
+            "WasEnabled": false,
+            "RestoreOnStartup": false
+          },
+          "Credentials": {
+            "MainPassword": "",
+            "Extensions": {},
+            "PeerInboundPassword": "",
+            "PeerOutboundPassword": ""
+          }
+        }
+      }
+    ],
+    "vocat-go": [
+      {
+        "localEnabled": true,
+        "peerEnabled": true,
+        "profile": {
+          "enabled": false,
+          "listen": "127.70.0.3:5092",
+          "realm": "gateway.realm.invalid",
+          "identity_domain": "messages.example.invalid",
+          "messages_enabled": true,
+          "calls_enabled": true,
+          "algorithm": "SHA-256",
+          "allowed_cidrs": [
+            "127.70.0.2/32"
+          ],
+          "accounts": [
+            {
+              "username": "3101",
+              "display_name": "",
+              "password": "synthetic-local-main-password",
+              "allow_calls": false,
+              "allow_messages": true,
+              "outgoing_lines": [
+                "synthetic-a"
+              ],
+              "sms_send_lines": [
+                "synthetic-b"
+              ]
+            },
+            {
+              "username": "3102",
+              "display_name": "",
+              "password": "synthetic-local-extra-password",
+              "allow_calls": true,
+              "allow_messages": false,
+              "outgoing_lines": [
+                "synthetic-b"
+              ],
+              "sms_send_lines": []
+            }
+          ],
+          "carrier_enabled": true,
+          "carrier_lines": [
+            {
+              "device_id": "synthetic-a",
+              "label": "Synthetic first line",
+              "prefix": "81",
+              "default": true,
+              "allow_outgoing": true,
+              "allow_incoming": true,
+              "incoming_extensions": [
+                "3101"
+              ],
+              "country_code": "86",
+              "national_number_length": 11,
+              "allow_sms_send": false,
+              "allow_sms_receive": true,
+              "sms_recipients": [
+                "3102"
+              ]
+            },
+            {
+              "device_id": "synthetic-b",
+              "label": "Synthetic second line",
+              "prefix": "82",
+              "default": false,
+              "allow_outgoing": false,
+              "allow_incoming": false,
+              "incoming_extensions": [
+                "3102"
+              ],
+              "country_code": "63",
+              "national_number_length": 10,
+              "allow_sms_send": true,
+              "allow_sms_receive": false,
+              "sms_recipients": [
+                "3101"
+              ]
+            }
+          ],
+          "sms_enabled": true,
+          "peer": {
+            "enabled": true,
+            "endpoint": "127.70.0.2:5090",
+            "inbound_auth": {
+              "username": "pbx-to-gateway",
+              "password": "synthetic-peer-in-password"
+            },
+            "outbound_auth": {
+              "username": "gateway-to-pbx",
+              "password": "synthetic-peer-out-password",
+              "realm": "pbx.realm.invalid",
+              "algorithms": [
+                "SHA-256"
+              ]
+            },
+            "allow_calls_from_peer": true,
+            "allow_sms_from_peer": false,
+            "allow_calls_to_peer": false,
+            "allow_sms_to_peer": true,
+            "outgoing_lines": [
+              "synthetic-a"
+            ],
+            "sms_send_lines": [
+              "synthetic-b"
+            ],
+            "incoming_routes": [
+              {
+                "device_id": "synthetic-a",
+                "call_target": "ring-a",
+                "sms_target": "sms-a"
+              },
+              {
+                "device_id": "synthetic-b",
+                "call_target": "ring-b",
+                "sms_target": "sms-b"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "localEnabled": false,
+        "peerEnabled": true,
+        "profile": {
+          "enabled": false,
+          "listen": "127.70.0.3:5092",
+          "realm": "gateway.realm.invalid",
+          "identity_domain": "messages.example.invalid",
+          "messages_enabled": true,
+          "calls_enabled": true,
+          "algorithm": "SHA-256",
+          "allowed_cidrs": [
+            "127.70.0.2/32"
+          ],
+          "accounts": [],
+          "carrier_enabled": true,
+          "carrier_lines": [
+            {
+              "device_id": "synthetic-a",
+              "label": "Synthetic first line",
+              "prefix": "81",
+              "default": true,
+              "allow_outgoing": true,
+              "allow_incoming": true,
+              "incoming_extensions": [],
+              "country_code": "86",
+              "national_number_length": 11,
+              "allow_sms_send": false,
+              "allow_sms_receive": true,
+              "sms_recipients": []
+            },
+            {
+              "device_id": "synthetic-b",
+              "label": "Synthetic second line",
+              "prefix": "82",
+              "default": false,
+              "allow_outgoing": false,
+              "allow_incoming": false,
+              "incoming_extensions": [],
+              "country_code": "63",
+              "national_number_length": 10,
+              "allow_sms_send": true,
+              "allow_sms_receive": false,
+              "sms_recipients": []
+            }
+          ],
+          "sms_enabled": true,
+          "peer": {
+            "enabled": true,
+            "endpoint": "127.70.0.2:5090",
+            "inbound_auth": {
+              "username": "pbx-to-gateway",
+              "password": "synthetic-peer-in-password"
+            },
+            "outbound_auth": {
+              "username": "gateway-to-pbx",
+              "password": "synthetic-peer-out-password",
+              "realm": "pbx.realm.invalid",
+              "algorithms": [
+                "SHA-256"
+              ]
+            },
+            "allow_calls_from_peer": true,
+            "allow_sms_from_peer": false,
+            "allow_calls_to_peer": false,
+            "allow_sms_to_peer": true,
+            "outgoing_lines": [
+              "synthetic-a"
+            ],
+            "sms_send_lines": [
+              "synthetic-b"
+            ],
+            "incoming_routes": [
+              {
+                "device_id": "synthetic-a",
+                "call_target": "ring-a",
+                "sms_target": "sms-a"
+              },
+              {
+                "device_id": "synthetic-b",
+                "call_target": "ring-b",
+                "sms_target": "sms-b"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "localEnabled": true,
+        "peerEnabled": false,
+        "profile": {
+          "enabled": false,
+          "listen": "127.70.0.3:5092",
+          "realm": "gateway.realm.invalid",
+          "identity_domain": "messages.example.invalid",
+          "messages_enabled": true,
+          "calls_enabled": true,
+          "algorithm": "SHA-256",
+          "allowed_cidrs": [
+            "127.70.0.2/32"
+          ],
+          "accounts": [
+            {
+              "username": "3101",
+              "display_name": "",
+              "password": "synthetic-local-main-password",
+              "allow_calls": false,
+              "allow_messages": true,
+              "outgoing_lines": [
+                "synthetic-a"
+              ],
+              "sms_send_lines": [
+                "synthetic-b"
+              ]
+            },
+            {
+              "username": "3102",
+              "display_name": "",
+              "password": "synthetic-local-extra-password",
+              "allow_calls": true,
+              "allow_messages": false,
+              "outgoing_lines": [
+                "synthetic-b"
+              ],
+              "sms_send_lines": []
+            }
+          ],
+          "carrier_enabled": true,
+          "carrier_lines": [
+            {
+              "device_id": "synthetic-a",
+              "label": "Synthetic first line",
+              "prefix": "81",
+              "default": true,
+              "allow_outgoing": true,
+              "allow_incoming": true,
+              "incoming_extensions": [
+                "3101"
+              ],
+              "country_code": "86",
+              "national_number_length": 11,
+              "allow_sms_send": false,
+              "allow_sms_receive": true,
+              "sms_recipients": [
+                "3102"
+              ]
+            },
+            {
+              "device_id": "synthetic-b",
+              "label": "Synthetic second line",
+              "prefix": "82",
+              "default": false,
+              "allow_outgoing": false,
+              "allow_incoming": false,
+              "incoming_extensions": [
+                "3102"
+              ],
+              "country_code": "63",
+              "national_number_length": 10,
+              "allow_sms_send": true,
+              "allow_sms_receive": false,
+              "sms_recipients": [
+                "3101"
+              ]
+            }
+          ],
+          "sms_enabled": true,
+          "peer": {
+            "enabled": false,
+            "endpoint": "127.70.0.2:5090",
+            "inbound_auth": {
+              "username": "pbx-to-gateway",
+              "password": "synthetic-peer-in-password"
+            },
+            "outbound_auth": {
+              "username": "gateway-to-pbx",
+              "password": "synthetic-peer-out-password",
+              "realm": "pbx.realm.invalid",
+              "algorithms": [
+                "SHA-256"
+              ]
+            },
+            "allow_calls_from_peer": true,
+            "allow_sms_from_peer": false,
+            "allow_calls_to_peer": false,
+            "allow_sms_to_peer": true,
+            "outgoing_lines": [
+              "synthetic-a"
+            ],
+            "sms_send_lines": [
+              "synthetic-b"
+            ],
+            "incoming_routes": [
+              {
+                "device_id": "synthetic-a",
+                "call_target": "ring-a",
+                "sms_target": "sms-a"
+              },
+              {
+                "device_id": "synthetic-b",
+                "call_target": "ring-b",
+                "sms_target": "sms-b"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "localEnabled": false,
+        "peerEnabled": false,
+        "profile": {
+          "enabled": false,
+          "listen": "127.70.0.3:5092",
+          "realm": "gateway.realm.invalid",
+          "identity_domain": "messages.example.invalid",
+          "messages_enabled": true,
+          "calls_enabled": true,
+          "algorithm": "SHA-256",
+          "allowed_cidrs": [
+            "127.70.0.2/32"
+          ],
+          "accounts": [],
+          "carrier_enabled": true,
+          "carrier_lines": [
+            {
+              "device_id": "synthetic-a",
+              "label": "Synthetic first line",
+              "prefix": "81",
+              "default": true,
+              "allow_outgoing": true,
+              "allow_incoming": true,
+              "incoming_extensions": [],
+              "country_code": "86",
+              "national_number_length": 11,
+              "allow_sms_send": false,
+              "allow_sms_receive": true,
+              "sms_recipients": []
+            },
+            {
+              "device_id": "synthetic-b",
+              "label": "Synthetic second line",
+              "prefix": "82",
+              "default": false,
+              "allow_outgoing": false,
+              "allow_incoming": false,
+              "incoming_extensions": [],
+              "country_code": "63",
+              "national_number_length": 10,
+              "allow_sms_send": true,
+              "allow_sms_receive": false,
+              "sms_recipients": []
+            }
+          ],
+          "sms_enabled": true,
+          "peer": {
+            "enabled": false,
+            "endpoint": "127.70.0.2:5090",
+            "inbound_auth": {
+              "username": "pbx-to-gateway",
+              "password": "synthetic-peer-in-password"
+            },
+            "outbound_auth": {
+              "username": "gateway-to-pbx",
+              "password": "synthetic-peer-out-password",
+              "realm": "pbx.realm.invalid",
+              "algorithms": [
+                "SHA-256"
+              ]
+            },
+            "allow_calls_from_peer": true,
+            "allow_sms_from_peer": false,
+            "allow_calls_to_peer": false,
+            "allow_sms_to_peer": true,
+            "outgoing_lines": [
+              "synthetic-a"
+            ],
+            "sms_send_lines": [
+              "synthetic-b"
+            ],
+            "incoming_routes": [
+              {
+                "device_id": "synthetic-a",
+                "call_target": "ring-a",
+                "sms_target": "sms-a"
+              },
+              {
+                "device_id": "synthetic-b",
+                "call_target": "ring-b",
+                "sms_target": "sms-b"
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

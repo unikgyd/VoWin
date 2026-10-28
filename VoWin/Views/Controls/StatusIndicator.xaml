@@ -1,0 +1,38 @@
+<UserControl x:Class="VoWin.Views.Controls.StatusIndicator"
+  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+  xmlns:models="clr-namespace:VoWin.Models" x:Name="Root"
+  AutomationProperties.Name="{Binding Item.AccessibleText, ElementName=Root}">
+  <UserControl.ToolTip>
+    <ToolTip MaxWidth="420" DataContext="{Binding PlacementTarget.Item, RelativeSource={RelativeSource Self}}">
+      <TextBlock Text="{Binding AccessibleText}" TextWrapping="Wrap" />
+    </ToolTip>
+  </UserControl.ToolTip>
+  <Grid DataContext="{Binding Item, ElementName=Root}" VerticalAlignment="Center">
+    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+    <Ellipse x:Name="Lamp" Width="8" Height="8" Margin="0,0,7,0" VerticalAlignment="Center">
+      <Ellipse.Style>
+        <Style TargetType="Ellipse">
+          <Setter Property="Fill" Value="{DynamicResource AppTextTertiaryBrush}" />
+          <Style.Triggers>
+            <DataTrigger Binding="{Binding Light}" Value="{x:Static models:StatusLight.Ready}"><Setter Property="Fill" Value="{DynamicResource AppSuccessBrush}" /></DataTrigger>
+            <DataTrigger Binding="{Binding Light}" Value="{x:Static models:StatusLight.Busy}"><Setter Property="Fill" Value="{DynamicResource AppWarningBrush}" /></DataTrigger>
+            <DataTrigger Binding="{Binding Light}" Value="{x:Static models:StatusLight.Error}"><Setter Property="Fill" Value="{DynamicResource AppDangerBrush}" /></DataTrigger>
+          </Style.Triggers>
+        </Style>
+      </Ellipse.Style>
+    </Ellipse>
+    <TextBlock Grid.Column="1" Text="{Binding ShortLabel}" Foreground="{DynamicResource AppTextPrimaryBrush}" VerticalAlignment="Center" />
+    <TextBlock x:Name="StateText" Grid.Column="2" Text="{Binding StatusText}" Margin="6,0,0,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis">
+      <TextBlock.Style>
+        <Style TargetType="TextBlock">
+          <Setter Property="Foreground" Value="{DynamicResource AppTextSecondaryBrush}" />
+          <Style.Triggers>
+            <DataTrigger Binding="{Binding Light}" Value="{x:Static models:StatusLight.Ready}"><Setter Property="Visibility" Value="Collapsed" /></DataTrigger>
+            <DataTrigger Binding="{Binding Light}" Value="{x:Static models:StatusLight.Error}"><Setter Property="Foreground" Value="{DynamicResource AppDangerBrush}" /></DataTrigger>
+          </Style.Triggers>
+        </Style>
+      </TextBlock.Style>
+    </TextBlock>
+  </Grid>
+</UserControl>

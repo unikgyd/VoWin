@@ -27,6 +27,26 @@ public partial class RemoteControlViewModel : ObservableObject, INavigationAware
     [ObservableProperty] private string _qqClientSecret = string.Empty;
     [ObservableProperty] private string _qqAllowedUsers = string.Empty;
     [ObservableProperty] private string _qqStatus = "未配置";
+    [ObservableProperty] private bool _telegramEnabled;
+    [ObservableProperty] private string _telegramApiBaseUrl = "https://api.telegram.org";
+    [ObservableProperty] private string _telegramBotToken = string.Empty;
+    [ObservableProperty] private string _telegramAllowedUsers = string.Empty;
+    [ObservableProperty] private string _telegramStatus = "未启用";
+    [ObservableProperty] private bool _barkEnabled;
+    [ObservableProperty] private string _barkServerUrl = "https://api.day.app";
+    [ObservableProperty] private string _barkDeviceKey = string.Empty;
+    [ObservableProperty] private bool _barkIncludeSmsContent;
+    [ObservableProperty] private string _barkStatus = "未启用";
+    [ObservableProperty] private bool _allowRemoteCalls;
+    [ObservableProperty] private bool _allowRemoteSms;
+    [ObservableProperty] private bool _allowRemoteLineChanges;
+    [ObservableProperty] private bool _allowRemoteReadSms;
+    public GatewayStatusItem TelegramIndicator => _remote.TelegramIndicator;
+    public GatewayStatusItem BarkIndicator => _remote.BarkIndicator;
+    public GatewayStatusItem WeixinIndicator => _remote.WeixinIndicator;
+    public GatewayStatusItem QqIndicator => _remote.QqIndicator;
+    public string CommandHelp => VoWin.Services.RemoteControl.RemoteCommandProcessor.HelpText;
+    private RemoteControlSettings? _lastLoadedSettings;
 
     [ObservableProperty] private bool _notifyIncomingSms = true;
     [ObservableProperty] private bool _notifyOtpOnly;
@@ -35,6 +55,8 @@ public partial class RemoteControlViewModel : ObservableObject, INavigationAware
     [ObservableProperty] private string _pairingStatus = "未开启配对";
     [ObservableProperty] private string _operationStatus = string.Empty;
     [ObservableProperty] private bool _isBusy;
+    public bool CanEdit => !IsBusy;
+    partial void OnIsBusyChanged(bool value) => OnPropertyChanged(nameof(CanEdit));
 
     public RemoteControlViewModel(IRemoteControlService remote)
     {
@@ -81,6 +103,25 @@ public partial class RemoteControlViewModel : ObservableObject, INavigationAware
             OperationStatus = "QQ AppID/AppSecret 验证成功。";
         }
         catch (Exception ex) { OperationStatus = $"QQ 验证失败：{ex.Message}"; }
+        finally { IsBusy = false; RefreshStatus(); }
+    }
+
+    [RelayCommand]
+    private async Task TestTelegramAsync()
+    {
+        if (IsBusy) return;
+        IsBusy = true;
+        try { await _remote.TestTelegramAsync(BuildSettings()); OperationStatus = "Telegram 凭据验证通过；保存后按开关连接。"; }
+        catch (Exception ex) { OperationStatus = $"Telegram 验证失败：{ex.Message}"; }
+        finally { IsBusy = false; RefreshStatus(); }
+    }
+    [RelayCommand]
+    private async Task TestBarkAsync()
+    {
+        if (IsBusy) return;
+        IsBusy = true;
+        try { await _remote.TestBarkAsync(BuildSettings()); OperationStatus = "测试推送已提交，请在手机确认收到。"; }
+        catch (Exception ex) { OperationStatus = $"Bark 推送失败：{ex.Message}"; }
         finally { IsBusy = false; RefreshStatus(); }
     }
 
@@ -134,10 +175,10 @@ public partial class RemoteControlViewModel : ObservableObject, INavigationAware
     {
         _remote.CreatePairingCode();
         RefreshStatus();
-        OperationStatus = "让待授权的 QQ/微信用户发送：绑定 <配对码>。配对码仅可使用一次。";
+        OperationStatus = "先启用对应通道，再让用户私聊发送：绑定 <配对码>。一次有效，最多尝试 10 次。Bark 无需配对。";
     }
 
-    private RemoteControlSettings BuildSettings() => new()
+    internal RemoteControlSettings BuildSettings() => new()
     {
         WeixinEnabled = WeixinEnabled,
         WeixinBaseUrl = WeixinBaseUrl,
@@ -149,6 +190,18 @@ public partial class RemoteControlViewModel : ObservableObject, INavigationAware
         QqAppId = QqAppId,
         QqClientSecret = QqClientSecret,
         QqAllowedUsers = QqAllowedUsers,
+        TelegramEnabled = TelegramEnabled,
+        TelegramApiBaseUrl = TelegramApiBaseUrl,
+        TelegramBotToken = TelegramBotToken,
+        TelegramAllowedUsers = TelegramAllowedUsers,
+        BarkEnabled = BarkEnabled,
+        BarkServerUrl = BarkServerUrl,
+        BarkDeviceKey = BarkDeviceKey,
+        BarkIncludeSmsContent = BarkIncludeSmsContent,
+        AllowRemoteCalls = AllowRemoteCalls,
+        AllowRemoteSms = AllowRemoteSms,
+        AllowRemoteLineChanges = AllowRemoteLineChanges,
+        AllowRemoteReadSms = AllowRemoteReadSms,
         NotifyIncomingSms = NotifyIncomingSms,
         NotifyOtpOnly = NotifyOtpOnly,
         NotifyIncomingCalls = NotifyIncomingCalls
@@ -164,9 +217,22 @@ public partial class RemoteControlViewModel : ObservableObject, INavigationAware
         QqAppId = value.QqAppId;
         QqClientSecret = value.QqClientSecret;
         QqAllowedUsers = value.QqAllowedUsers;
+        TelegramEnabled = value.TelegramEnabled;
+        TelegramApiBaseUrl = value.TelegramApiBaseUrl;
+        TelegramBotToken = value.TelegramBotToken;
+        TelegramAllowedUsers = value.TelegramAllowedUsers;
+        BarkEnabled = value.BarkEnabled;
+        BarkServerUrl = value.BarkServerUrl;
+        BarkDeviceKey = value.BarkDeviceKey;
+        BarkIncludeSmsContent = value.BarkIncludeSmsContent;
+        AllowRemoteCalls = value.AllowRemoteCalls;
+        AllowRemoteSms = value.AllowRemoteSms;
+        AllowRemoteLineChanges = value.AllowRemoteLineChanges;
+        AllowRemoteReadSms = value.AllowRemoteReadSms;
         NotifyIncomingSms = value.NotifyIncomingSms;
         NotifyOtpOnly = value.NotifyOtpOnly;
         NotifyIncomingCalls = value.NotifyIncomingCalls;
+        _lastLoadedSettings = value.Clone();
     }
 
     private void OnRemoteStatusChanged()
@@ -180,6 +246,19 @@ public partial class RemoteControlViewModel : ObservableObject, INavigationAware
     {
         WeixinStatus = _remote.WeixinStatus;
         QqStatus = _remote.QqStatus;
+        TelegramStatus = _remote.TelegramStatus;
+        BarkStatus = _remote.BarkStatus;
+        OnPropertyChanged(nameof(TelegramIndicator)); OnPropertyChanged(nameof(BarkIndicator));
+        OnPropertyChanged(nameof(WeixinIndicator)); OnPropertyChanged(nameof(QqIndicator));
+        var current = _remote.Settings;
+        if (_lastLoadedSettings is { } previous)
+        {
+            // A pairing updates the saved allowlist, but never overwrites a user's unsaved form edits.
+            if (WeixinAllowedUsers == previous.WeixinAllowedUsers) WeixinAllowedUsers = current.WeixinAllowedUsers;
+            if (QqAllowedUsers == previous.QqAllowedUsers) QqAllowedUsers = current.QqAllowedUsers;
+            if (TelegramAllowedUsers == previous.TelegramAllowedUsers) TelegramAllowedUsers = current.TelegramAllowedUsers;
+            _lastLoadedSettings = current.Clone();
+        }
         LastActivity = _remote.LastActivity;
         PairingStatus = _remote.PairingCodeStatus;
     }

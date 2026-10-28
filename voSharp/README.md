@@ -5,12 +5,97 @@
 
 [![.NET](https://img.shields.io/badge/.NET-10.0-512BD4?logo=dotnet)](https://dotnet.microsoft.com/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2B-0078D6?logo=windows)](https://microsoft.com/windows)
-[![Tests](https://img.shields.io/badge/Tests-315%20passed-success)](#51-编译与测试)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/Kernel_tests-1684%20passed-success)](../publish/asterisk-render-v2-20261024/README.md)
+[![License](https://img.shields.io/badge/License-See_repository-lightgrey)](../LICENSE)
 
 ---
 
+2026-10-26：[Windows 桌面与 CLI 的 IKE 持久记录](../publish/windows-ike-owners-20261026/README.md)
+已共用当前用户的 `%LOCALAPPDATA%/VoWin/preferences.db` 和同一 SQLite 适配。
+独立 CLI 默认启用此 owner，`--client` 使用已有服务；没有新增清空／改库命令。
+核心 1,798／桌面 685／IKE 274、关键三轮、真实独立进程和构建／发布核对通过，原跳过保留。
+仅依赖系统 .NET；x64 CLI 验证文件夹约 6.76 MiB，不代表 VoWin 安装包体积或实卡验收。
+
+2026-10-24：[双平台部署 v2 生成器与新配置能力](../publish/asterisk-render-v2-20261024/README.md)
+接入来源 CIDR、本地 SHA-256、独立身份域及逐线路选线／国家号码，导入保持关闭。
+Windows 全量核心 1684／桌面 651、关键集三轮及 Release 构建通过；Linux 实际 Config 消费与
+Asterisk 隔离加载通过。未替换现用程序、操作实卡；新版管理网页和联合实网验收仍待完成。
+
+2026-10-24：[Windows 部署 v2 与独立 SIP 权限](../publish/windows-deployment-v2-20261024/README.md)
+已连接配置导入、保存和运行时：本地／peer 分离、逐线路付费名单、独立来电／短信接收，
+并修复原卡回复号码与分机同名时的路由绕过。核心 1,574／桌面 626 通过，原 5／17 实机
+跳过，169／224 项关键各三轮，Release 零警告／错误。尚未替换现用程序或做新实网验收；
+生成器和管理网页的 v2 接线仍待完成。设置与私密导入格式见 [SIP 配置](docs/SIP_GATEWAY.md)。
+
 ## 📖 目录
+
+2026-10-21 双向鉴权对齐：从 Linux Rust UIM 实现补入单层 `80` 响应封装和 `6Cxx` Le 修正，
+同时向 Rust 回补严格字段长度、总长度兼容与 `9Fxx` 续读。两端共用 42 条合成响应，拒绝
+截断、错误状态和异常 Kc 尾部；格式回退只重解析已有响应，不触发新的 AKA 请求。Linux 协议保持纯 Rust，
+Windows 保持 C#，完整迁移范围见[双端对齐记录](../docs/CROSS_PLATFORM_PARITY.md)。
+
+2026-10-21 Asterisk 互通对齐：真实 Asterisk 测试发现 Rust 未接受没有用户名的 Contact，
+已修复其误挂断。VoSharp 的现有解析支持该形式，固定中继回归新增同类 401／407、完整
+ACK／BYE 目标和双向 G.711 场景，24 项通过；本轮未改变 Windows 运行配置或生产中继。
+
+固定中继进一步对齐：与 Rust 共用 21 条摘要挑战样例，严格拒绝重复／损坏字段，优先 SHA-256。
+正常和迟到会话的 BYE 支持一次鉴权重试，仍共用原有 4 秒清理预算。ACK 超时及运营商已结束
+时先回收本地会话和媒体，再做远端清理；阻塞挂断回调的回归验证本地状态不再滞留。
+最新 SIP／G.711 相关 97 项通过、1 项真实 LAN 测试显式跳过，未替换桌面程序。
+
+IMS 注册进一步对齐：Rust 新增原生 REGISTER 状态机，两端共用 5 组二进制 RES 摘要和
+20 组挑战解析样例。VoSharp 增加 4096 字节／32 字段上限及严格控制字符／参数语法校验，
+摘要计算在 finally 清理自己的 RES 副本、HA1 和计算缓冲区，不修改调用方的 RES。
+Rust 的生产承载、安全数据面及运营商媒体仍未接入，详见
+[Linux 注册核心范围](../SimAdmin-sip/docs/IMS_REGISTRATION.md)；这不是 Windows 会话已新增 rspauth 验证的声明。
+
+ESP 数据面继续双向对齐：Rust 原生传输模式 ESP 与 Linux raw socket 已通过隔离注册链路，
+两端共用 32 组独立 Node／OpenSSL 报文向量。VoSharp 在提交重放窗口前检查完整 UDP 长度、
+校验和及外层 IP，拒绝损坏的已鉴权高序号报文而不影响后续正常包。Linux 的真实承载、
+IKE／ePDG 和运营商媒体仍待接入，范围见[IMS ESP 说明](../SimAdmin-sip/docs/IMS_ESP.md)。
+
+承载前置继续双向对齐：Linux 新增显式选卡的 ModemManager IMS 租约与不重叠清理保护，
+两端共用 31 组地址和 CGCONTRDP 样例。VoSharp 不再把 `/64` 当成 IPv4，带前导零字节
+按十进制解析，并拒绝损坏 CSV；AKA 续传限制为 8 次／4096 字节，畸形 6C 不重试。
+相关 Windows 回归 439 项通过、0 跳过；真实 Linux 线路与后台集成仍待完成，见
+[IMS 承载说明](../SimAdmin-sip/docs/IMS_BEARER.md)。
+
+网络接入继续对齐：Rust 新增原生地址、独立路由表、按源地址和绑定接口的策略，以及
+网络失效时关闭 ESP 的生命周期连接。VoSharp 的 QMI IMS 租约及正式 Windows 路由核验
+同步拒绝环回、多播、link-local、mapped、自身等无效 P-CSCF；诊断候选仍可供注入的回环
+协议测试使用，不作为真实路由授权。详见[Linux IMS 网络范围](../SimAdmin-sip/docs/IMS_NETWORK.md)。
+
+选卡鉴权继续对齐：Rust 新增原生 QMI 端点与卡身份绑定、ISIM 优先和 USIM 明确回退。
+VoSharp 修复 EF.ICCID 中间 F 被跳过、导致损坏身份被折叠为正常号码的边界；AKA 解析先
+完成全部长度检查，再分配 RES／CK／IK，失败兼容分支不残留部分密钥数组。两端共用
+12 条身份解码样例，相关 Windows 回归 493 项通过。Linux 后台注册与媒体仍待接入，
+见[原生 AKA 范围](../SimAdmin-sip/docs/IMS_AKA.md)；本轮不替换现用 Windows 程序。
+
+逐模组生命周期继续对齐：Linux 把承载、网络、卡鉴权、ESP 注册与续期接入独立任务，
+并提供明确标注的实验注册界面。VoSharp 增加 `SipRegisterSession.CurrentResult`，在授权
+过期或传输关闭后不返回在线；同时使用 UTC 与单调计时限制寿命，不让阻塞续期或墙钟
+回拨延长状态。`LastResult` 保持历史语义，Windows Host IMS 改查实时值。相关回归 512 项
+通过，范围见[线路管理说明](../SimAdmin-sip/docs/IMS_HOST_LIFECYCLE.md)，没有部署或替换桌面程序。
+
+2026-10-19 ePDG 发现配置：新增 `EpdgUserConfiguration`，支持优先地址、补充发现 PLMN
+与仅手动候选。VoWin 按 SIM 保存，并在下次连接应用；核心仍区分发现地址与认证身份。
+同一 ICCID 的 AT / EF.IMSI 不同读数保留为候选，成功历史优先，不把一个 IMSI 的 EF_AD
+MNC 长度套给另一个。详见 [ePDG 发现与多 IMSI 回退](docs/EPDG_DISCOVERY.md)。
+
+2026-10-16 ePDG DNS 恢复更新：Windows 默认使用配置的系统 DNS，独立并行查询 A / AAAA、
+每类限时 6 秒，以新查询避开本机解析缓存；一类超时 / 无记录不丢弃另一类的有效地址。
+不自动更换 DNS 服务器、固定运营商 IP 或使用过期缓存。`EpdgDnsQueryResult` 增加解析器
+名称与各记录类型的结果诊断；自定义 `IEpdgDnsResolver` 保持原有注入行为。
+依据 [DnsQueryEx](https://learn.microsoft.com/en-us/windows/win32/api/windns/nf-windns-dnsqueryex)
+与 [查询选项](https://learn.microsoft.com/en-us/windows/win32/dns/dns-constants)，异步原生
+请求可取消，原生回调结束前保留请求 / 取消句柄与记录内存，不派生 PowerShell 子进程。
+网络地址变化仅唤醒离线且仍启用的自动恢复，不改变已注册的其他实例。
+
+离线全方案 1197 通过、22 显式跳过、0 失败；原生 DNS 实网查询单项通过。
+COM10 EC20 / DITO 单模组实测注入首次 DNS 失败后，由同一生产恢复任务自动重新查询，
+真实 IKE / IMS 注册成功并保持 DPD，测试清理获远端注销；不打开 COM6、不拨号或发短信。
+这不等于自然隔夜故障已复测或其他运营商已通过。报告见
+`publish/vowifi-dns-recovery-20261016/tests/ec20-dns-recovery-live.trx`。
 
 - [1. 项目定位与核心理念](#1-项目定位与核心理念)
 - [2. 系统整体架构](#2-系统整体架构)
@@ -83,7 +168,7 @@
 ## 3. 核心功能特性
 
 ### 3.1 VoWiFi / IKEv2 / 用户态 ESP 通信栈（零 WFP 依赖）
-- **3GPP TS 23.003 ePDG 域名解析**：根据 SIM 卡 IMSI（MCC/MNC）自动计算标准 FQDN（如 `epdg.epc.mnc000.mcc460.pub.3gppnetwork.org`）并查询 DNS。
+- **3GPP TS 23.003 ePDG 域名解析**：优先采用 USIM EF_AD 的 MNC 长度；未知时尝试合法的两/三位候选。保留 FQDN/IP/归属 PLMN 对应关系，端点切换时同步 IKE 与 SIP 身份域；按 SIM、出口配置与鉴权域隔离短期失败记录。支持静态/漫游静态、PLMN、PCO、位置候选、可注入 DNS 解析器及 IPv4/IPv6 选择策略，并逐项记录 DNS 结果/耗时。默认系统 A/AAAA 解析不随 SOCKS5h 自动转为代理 DNS；完整 NAPTR/SRV 漫游选择与桌面 CarrierConfig 自动获取尚未实现，不能据此宣称全运营商兼容。
 - **纯 C# IKEv2 状态机（实验性）**：已有 `IKE_SA_INIT`、`IKE_AUTH` 与 CHILD_SA 代码，但 responder 身份验证、生命周期和真网互操作仍待完成。
 - **双模式 EAP-AKA 认证**：
   - **RFC 4187 (EAP-AKA Type 23)**：默认用于现网 3GPP ePDG 接入；
@@ -104,11 +189,12 @@
 - **WireGuard 私网 SIP Gateway**：内置 Digest registrar 与 B2BUA，将 VoWiFi IMS 或 AT + Quectel USB Audio 基带通话桥接为 PCMA/PCMU SIP/RTP；支持多终端注册、来电分叉抢接、外拨和 DTMF，且默认拒绝公网/通配地址监听。配置与边界见 [SIP_GATEWAY.md](docs/SIP_GATEWAY.md)。
 - **双路径媒体策略**：VoWiFi 可直接桥接 Windows 侧 IMS RTP；无 IMS 注册时回退到 `ATD`/`ATA` 与 USB Audio PCM。基带音频由独立 helper 经命名管道直连 SIP RTP，不经过电脑麦克风/扬声器。
 - **严格限制 ADB 边界**：标准 Quectel UAC 模组不探测、不调用 ADB；只有 QDC507 固件实际启用缺失的 D4 路由时才使用 ADB 兼容层，PCM 始终通过 Windows USB Audio 传输。
-- **蜂窝 Host IMS 前置探针与实验性 SIP 通话**：`host-ims probe` 只读检查 IMS APN、context 激活、运行时 P-CSCF、Quectel USB 网络模式，以及 IMS 地址是否归属于 Windows 蜂窝网卡；WPF 的“系统状态”页也会显示同一结果。`host-ims register|status|stop` 及页面按钮可在 `HostRoutable` 时绑定所选 IMS 地址，读取 ISIM 的 IMPI/DOMAIN/IMPU 并在 ISIM 上执行 AKA/REGISTER；注册后的普通拨号、来电和私网 SIP 网关可复用 Host SIP/RTP。它不激活 bearer，尚无蜂窝 `ipsec-3gpp` 数据面，真实运营商通话未验收。无 SIM 时探针只能预检硬件/驱动，不能验证 IMS 注册。设计见 [HOST_IMS.md](docs/HOST_IMS.md)。
+- **蜂窝 Host IMS 前置探针与 Windows IMS 通话**：`host-ims probe` 只读检查 IMS APN、P-CSCF 与 Windows 接口；可选的受控 PPP 租约将已验证的物理模组 IMS 承载交给 Windows，结束后恢复内部 IMS。数据面为 C# 用户态 ESP 与受信任的 WinDivert 原始 I/O 组件；已有中国卡单线路 CLI 双向语音实证，双模组 WPF 同时注册也已验证。真实两线路经 Asterisk 媒体仍未验收，不能推广为全模组 / 全运营商可用。无 SIM 时探针只做硬件预检。设计见 [HOST_IMS.md](docs/HOST_IMS.md)。
 - **3GPP TS 24.229 SIP 注册**：
   - 401 Unauthorized 挑战自动响应；
   - **Digest AKAv1-MD5 认证**：自动调用硬件 USIM 计算 RES 并生成响应摘要；
   - **3GPP Security Agreement (sec-agree)**：支持 `ipsec-3gpp` 安全联合协商与端口映射切换；
+  - **VoWiFi 安全续期**：提出新的 SPI / 客户端端口、保持 Contact 服务端口；临时关联确认前保留旧事务路径，重传与响应绑定加密代次，限时销毁旧密钥。DITO 三次同会话续期、加速本地调度续期及注销 200 OK 已实测；新挑战时的关联轮换由 IPv4 / IPv6 报文测试覆盖，不声称实网重新鉴权或自然一小时续期已验收。Windows Host IMS 现有端点预约后端未因此自动获得完整新参数轮换能力；
   - **Service-Route 与 P-Associated-URI 自动注入**。
 - **呼叫会话控制（部分实现）**：已有 `INVITE`、振铃、接听、拒接和挂断骨架；事务重传、ACK 激活、CANCEL/dialog 一致性仍在修复。
 - **音频采集与编解码**：
@@ -343,4 +429,5 @@ public class MainWindowViewModel
 
 ## 📄 许可证
 
-本项目基于 [MIT 许可证](LICENSE) 开源。
+本目录目前没有独立的 LICENSE；旧 README 的 MIT 标注没有随附文件支撑。
+发布前需核对[仓库许可证文本](../LICENSE)与各第三方随附许可；此说明不更改或重新授予任何许可证。

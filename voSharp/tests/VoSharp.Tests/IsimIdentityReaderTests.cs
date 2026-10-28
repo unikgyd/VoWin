@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using VoSharp.Common.Aka;
 using VoSharp.Modem;
 using VoSharp.Modem.At;
@@ -13,6 +14,83 @@ namespace VoSharp.Tests;
 
 public sealed class IsimIdentityReaderTests
 {
+    [Fact]
+    public async Task FailedChannelCloseWithholdsReadIdentity()
+    {
+        var card = new FakeIsimSession(channelId: 4) { CloseFails = true };
+        var result = await new IsimIdentityReader(card).ReadAsync();
+        Assert.Equal(IsimIdentityReadiness.ReadFailed, result.Readiness);
+        Assert.Null(result.Identity);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FailedChannelCloseWithholdsAkaKeys(bool synchronizationFailure)
+    {
+        var card = new FakeIsimSession(channelId: 4)
+        {
+            CloseFails = true, SynchronizationFailure = synchronizationFailure
+        };
+        var result = await new IsimIdentityReader(card).AuthenticateAsync(
+            AkaChallenge.Create(new byte[16], new byte[16]));
+        Assert.False(result.Success);
+        Assert.False(result.SynchronizationFailure);
+        Assert.Throws<InvalidOperationException>(() => result.Res);
+        Assert.Throws<InvalidOperationException>(() => result.Ck);
+        Assert.Throws<InvalidOperationException>(() => result.Ik);
+        Assert.Throws<InvalidOperationException>(() => result.Auts);
+    }
+
+    [Fact]
+    public async Task UnknownCleanupPreventsSameReaderOpeningAnotherChannel()
+    {
+        var card = new FakeIsimSession(channelId: 4) { CloseFails = true };
+        var reader = new IsimIdentityReader(card);
+        await reader.ReadAsync();
+        var before = card.Commands.Count;
+        card.CloseFails = false;
+        Assert.Equal(IsimIdentityReadiness.ReadFailed, (await reader.ReadAsync()).Readiness);
+        var result = await reader.AuthenticateAsync(AkaChallenge.Create(new byte[16], new byte[16]));
+        Assert.False(result.Success);
+        Assert.Equal(before, card.Commands.Count);
+    }
+
+    [Fact]
+    public void SharedLinuxLTEPaniContract()
+    {
+        using var contract = JsonDocument.Parse(File.ReadAllText(Path.Combine(
+            AppContext.BaseDirectory, "contracts", "ims-lte-pani-v1.json")));
+        foreach (var item in contract.RootElement.GetProperty("cases").EnumerateArray())
+        {
+            string Value(string key) => item.GetProperty(key).GetString()!;
+            var line = $"+QENG: \"servingcell\",\"NOCONN\",\"LTE\",\"{Value("duplex")}\",{Value("mcc")},{Value("mnc")},{Value("cell")},1,100,1,5,5,{Value("tac")}";
+            var expected = item.GetProperty("pani").GetString();
+            Assert.Equal(expected, HostImsRegistrationClient.ParseLteServingCellPani([line]));
+        }
+    }
+
+    [Fact]
+    public void LteServingCellBuildsStandardsFormattedCellularPani()
+    {
+        var fdd = HostImsRegistrationClient.ParseLteServingCellPani([
+            "+QENG: \"servingcell\",\"NOCONN\",\"LTE\",\"FDD\",111,22,76B4321,1,100,1,5,5,33C4,-90,-8,-65,15,40"
+        ]);
+        Assert.Equal("3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=1112233C476B4321", fdd);
+        var tdd = HostImsRegistrationClient.ParseLteServingCellPani([
+            "+QENG: \"servingcell\",\"CONNECT\",\"LTE\",\"TDD\",310,260,A12,1,100,1,5,5,4,-90,-8,-65,15,40"
+        ]);
+        Assert.Equal("3GPP-E-UTRAN-TDD;utran-cell-id-3gpp=31026000040000A12", tdd);
+    }
+
+    [Theory]
+    [InlineData("+QENG: \"servingcell\",\"LIMSRV\",\"LTE\",\"FDD\",111,22,76B4321,1,100,1,5,5,33C4")]
+    [InlineData("+QENG: \"servingcell\",\"NOCONN\",\"LTE\",\"FDD\",111,22,-,1,100,1,5,5,33C4")]
+    [InlineData("+QENG: \"servingcell\",\"NOCONN\",\"LTE\",\"FDD\",111,22,76B4321,1,100,1,5,5,FFFFF")]
+    [InlineData("+QENG: \"servingcell\",\"NOCONN\",\"NR5G-SA\",\"FDD\",111,22,76B4321,1,100,1,5,5,33C4")]
+    public void LteServingCellRejectsUnregisteredOrUnusableLocation(string line) =>
+        Assert.Null(HostImsRegistrationClient.ParseLteServingCellPani([line]));
+
     [Fact]
     public async Task ReadsProvisionedImpiDomainAndDefaultImpuAndClosesChannel()
     {
@@ -85,6 +163,7 @@ public sealed class IsimIdentityReaderTests
             "123456789012345", "127.0.0.1");
         Assert.Equal("234150999999999@ims.mnc015.mcc234.3gppnetwork.org", profile.PrivateIdentity);
         Assert.Equal("sip:234150999999999@ims.mnc015.mcc234.3gppnetwork.org", profile.PublicIdentity);
+        Assert.False(profile.AdvertiseSmsOverIms);
         Assert.Throws<InvalidOperationException>(() => HostImsRegistrationClient.BuildUsimFallbackProfile(
             sim with { IsHomePlmnAuthoritative = false }, "123456789012345", "127.0.0.1"));
         Assert.Throws<InvalidOperationException>(() => HostImsRegistrationClient.BuildUsimFallbackProfile(
@@ -207,10 +286,12 @@ public sealed class IsimIdentityReaderTests
             "ims.mnc001.mcc001.3gppnetwork.org", "sip:+15551234567@ims.mnc001.mcc001.3gppnetwork.org");
         var qmiReads = 0;
         var qmiAka = 0;
+        string? cellularPani = "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=1112233C476B4321";
         var serverTask = Task.Run(async () =>
         {
             var first = await pcscf.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3));
-            var challenge = SipMessage.Parse(first.Buffer).CreateResponse(401, "Unauthorized");
+            var initial = SipMessage.Parse(first.Buffer);
+            var challenge = initial.CreateResponse(401, "Unauthorized");
             challenge.SetHeader("WWW-Authenticate",
                 $"Digest realm=\"ims.mnc001.mcc001.3gppnetwork.org\", nonce=\"{Convert.ToBase64String(new byte[32])}\", algorithm=AKAv1-MD5, qop=\"auth\"");
             await pcscf.SendAsync(challenge.ToBytes(), first.RemoteEndPoint);
@@ -219,6 +300,7 @@ public sealed class IsimIdentityReaderTests
             var accepted = authenticated.CreateResponse(200, "OK");
             accepted.SetHeader("Contact", authenticated.GetHeader("Contact")!);
             await pcscf.SendAsync(accepted.ToBytes(), second.RemoteEndPoint);
+            return (initial, authenticated);
         });
 
         await using var client = await HostImsRegistrationClient.RegisterWithCardAsync(
@@ -234,8 +316,42 @@ public sealed class IsimIdentityReaderTests
             {
                 qmiAka++;
                 return Task.FromResult(AkaResult.Succeeded(new byte[8], new byte[16], new byte[16]));
-            });
-        await serverTask;
+            },
+            readCellularPani: _ => Task.FromResult<string?>(cellularPani));
+        var (initial, authenticated) = await serverTask;
+        Assert.Equal(cellularPani, initial.GetHeader("P-Access-Network-Info"));
+        Assert.Equal(cellularPani, authenticated.GetHeader("P-Access-Network-Info"));
+        Assert.Equal(cellularPani, client.Profile.PAccessNetworkInfo);
+        cellularPani = "3GPP-E-UTRAN-TDD;utran-cell-id-3gpp=11122000176B4321";
+        var refreshServer = Task.Run(async () =>
+        {
+            var packet = await pcscf.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3));
+            var refresh = SipMessage.Parse(packet.Buffer);
+            var accepted = refresh.CreateResponse(200, "OK");
+            accepted.SetHeader("Contact", refresh.GetHeader("Contact")!);
+            await pcscf.SendAsync(accepted.ToBytes(), packet.RemoteEndPoint);
+            return refresh;
+        });
+        await client.Registration.RegisterAsync((_, _, _) =>
+            throw new InvalidOperationException("No AKA challenge expected during this refresh."));
+        var refreshed = await refreshServer;
+        Assert.Equal(cellularPani, refreshed.GetHeader("P-Access-Network-Info"));
+        Assert.Equal(cellularPani, client.Profile.PAccessNetworkInfo);
+        cellularPani = null;
+        var unavailableCellServer = Task.Run(async () =>
+        {
+            var packet = await pcscf.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3));
+            var refresh = SipMessage.Parse(packet.Buffer);
+            var accepted = refresh.CreateResponse(200, "OK");
+            accepted.SetHeader("Contact", refresh.GetHeader("Contact")!);
+            await pcscf.SendAsync(accepted.ToBytes(), packet.RemoteEndPoint);
+            return refresh;
+        });
+        await client.Registration.RegisterAsync((_, _, _) =>
+            throw new InvalidOperationException("No AKA challenge expected during this refresh."));
+        var withoutCell = await unavailableCellServer;
+        Assert.Null(withoutCell.GetHeader("P-Access-Network-Info"));
+        Assert.Null(client.Profile.PAccessNetworkInfo);
         Assert.Equal(2, qmiReads);
         Assert.Equal(1, qmiAka);
         Assert.Equal("QMI ISIM", client.CardPath);
@@ -532,6 +648,7 @@ public sealed class IsimIdentityReaderTests
         private int _iccidReads;
         public bool IsOpen => true;
         public bool HasSim { get; set; } = true;
+        public bool CloseFails { get; set; }
         public bool CorruptImpu { get; set; }
         public bool RequireFullAid { get; set; }
         public bool SynchronizationFailure { get; set; }
@@ -566,7 +683,7 @@ public sealed class IsimIdentityReaderTests
                 return Task.FromResult(Reply($"+CCHO: {channelId}"));
             }
             if (command.StartsWith("AT+CCHC=", StringComparison.Ordinal))
-                return Task.FromResult(Reply("OK"));
+                return Task.FromResult(CloseFails ? new AtResponse(false, [], "ERROR") : Reply("OK"));
             if (command.StartsWith("AT+CSIM=", StringComparison.Ordinal))
             {
                 var csimQuote = command.IndexOf('"');

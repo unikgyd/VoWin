@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "description": "Explicit application-level SIP MESSAGE chunks, not carrier UDH or a transparent reassembly protocol. Fixed expected chunks preserve the original Unicode scalars and text without normalization.",
+  "rawChunkUtf8Bytes": 280,
+  "maxSipDatagramBytes": 1300,
+  "multipartPrefix": "[{index}/{count}] ",
+  "singlePartUnchanged": true,
+  "boundaryUnit": "Unicode scalar, not grapheme cluster or UTF-16 code unit",
+  "inputAdmission": {
+    "maxUtf16Units": 16384,
+    "strictUnicode": true,
+    "rejectEmpty": true,
+    "rejectNul": true,
+    "description": "Admission validates the original text before durable planning. Pure splitter vectors below contain valid scalar text; they do not assert that every existing splitter independently enforces all admission checks."
+  },
+  "cases": [
+    {
+      "id": "ascii-279",
+      "input": [{ "text": "A", "repeat": 279 }],
+      "expectedChunks": [[{ "text": "A", "repeat": 279 }]],
+      "wirePrefixes": [""]
+    },
+    {
+      "id": "ascii-280",
+      "input": [{ "text": "A", "repeat": 280 }],
+      "expectedChunks": [[{ "text": "A", "repeat": 280 }]],
+      "wirePrefixes": [""]
+    },
+    {
+      "id": "ascii-281",
+      "input": [{ "text": "A", "repeat": 281 }],
+      "expectedChunks": [[{ "text": "A", "repeat": 280 }], [{ "text": "A", "repeat": 1 }]],
+      "wirePrefixes": ["[1/2] ", "[2/2] "]
+    },
+    {
+      "id": "cjk-279-bytes",
+      "input": [{ "text": "中", "repeat": 93 }],
+      "expectedChunks": [[{ "text": "中", "repeat": 93 }]],
+      "wirePrefixes": [""]
+    },
+    {
+      "id": "cjk-282-bytes",
+      "input": [{ "text": "中", "repeat": 94 }],
+      "expectedChunks": [[{ "text": "中", "repeat": 93 }], [{ "text": "中", "repeat": 1 }]],
+      "wirePrefixes": ["[1/2] ", "[2/2] "]
+    },
+    {
+      "id": "emoji-280-bytes",
+      "input": [{ "text": "🌍", "repeat": 70 }],
+      "expectedChunks": [[{ "text": "🌍", "repeat": 70 }]],
+      "wirePrefixes": [""]
+    },
+    {
+      "id": "emoji-284-bytes",
+      "input": [{ "text": "🌍", "repeat": 71 }],
+      "expectedChunks": [[{ "text": "🌍", "repeat": 70 }], [{ "text": "🌍", "repeat": 1 }]],
+      "wirePrefixes": ["[1/2] ", "[2/2] "]
+    },
+    {
+      "id": "four-byte-scalar-cannot-straddle-boundary",
+      "input": [{ "text": "A", "repeat": 279 }, { "text": "🌍x", "repeat": 1 }],
+      "expectedChunks": [[{ "text": "A", "repeat": 279 }], [{ "text": "🌍x", "repeat": 1 }]],
+      "wirePrefixes": ["[1/2] ", "[2/2] "]
+    },
+    {
+      "id": "combining-mark-is-not-normalized-or-dropped",
+      "input": [{ "text": "A", "repeat": 278 }, { "text": "e\u0301", "repeat": 1 }],
+      "expectedChunks": [[{ "text": "A", "repeat": 278 }, { "text": "e", "repeat": 1 }], [{ "text": "\u0301", "repeat": 1 }]],
+      "wirePrefixes": ["[1/2] ", "[2/2] "]
+    },
+    {
+      "id": "crlf-is-preserved-across-boundary",
+      "input": [{ "text": "A", "repeat": 279 }, { "text": "\r\n", "repeat": 1 }],
+      "expectedChunks": [[{ "text": "A", "repeat": 279 }, { "text": "\r", "repeat": 1 }], [{ "text": "\n", "repeat": 1 }]],
+      "wirePrefixes": ["[1/2] ", "[2/2] "]
+    },
+    {
+      "id": "short-literal-prefix-is-ordinary-text",
+      "input": [{ "text": "[1/2] not protocol grouping", "repeat": 1 }],
+      "expectedChunks": [[{ "text": "[1/2] not protocol grouping", "repeat": 1 }]],
+      "wirePrefixes": [""]
+    },
+    {
+      "id": "mixed-scalars-three-parts",
+      "input": [{ "text": "测试🌍", "repeat": 70 }],
+      "expectedChunks": [[{ "text": "测试🌍", "repeat": 28 }], [{ "text": "测试🌍", "repeat": 28 }], [{ "text": "测试🌍", "repeat": 14 }]],
+      "wirePrefixes": ["[1/3] ", "[2/3] ", "[3/3] "]
+    }
+  ]
+}

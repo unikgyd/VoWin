@@ -36,6 +36,7 @@ namespace VoWin
             {
                 services.AddNavigationViewPageProvider();
 
+                services.AddHostedService(sp => sp.GetRequiredService<SmsApiService>());
                 services.AddHostedService<ApplicationHostService>();
 
                 // Theme manipulation
@@ -60,6 +61,8 @@ namespace VoWin
                 services.AddSingleton<VoWin.Services.RemoteControl.RemoteControlService>();
                 services.AddSingleton<IRemoteControlService>(sp => sp.GetRequiredService<VoWin.Services.RemoteControl.RemoteControlService>());
                 services.AddHostedService(sp => sp.GetRequiredService<VoWin.Services.RemoteControl.RemoteControlService>());
+                services.AddSingleton<SmsApiService>();
+                services.AddSingleton<ISmsApiService>(sp => sp.GetRequiredService<SmsApiService>());
 
                 // Pages and ViewModels
                 services.AddSingleton<ModemManagerPage>();
@@ -79,7 +82,8 @@ namespace VoWin
                 services.AddSingleton<AboutPage>();
                 services.AddSingleton<AboutViewModel>();
             }).Build();
-        private bool _cellularAudioHelperMode;
+        private Task? _stopServicesTask;
+        private Task? _shutdownTask;
         private Mutex? _singleInstanceMutex;
         private EventWaitHandle? _singleInstanceActivationEvent;
         private CancellationTokenSource? _singleInstanceListenerCts;
@@ -92,18 +96,52 @@ namespace VoWin
 
         private async void OnStartup(object sender, StartupEventArgs e)
         {
+            if (e.Args.Length == 2 && e.Args[0] == "--verify-runtime" && Path.IsPathFullyQualified(e.Args[1]))
+            {
+                ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                try { await RuntimeSmokeCheck.RunAsync(e.Args[1]); Shutdown(0); }
+                catch (Exception ex) { LogCrash("Runtime smoke check", ex); Shutdown(1); }
+                return;
+            }
             if (CellularAudioWorkerHost.IsRequested(e.Args))
             {
-                _cellularAudioHelperMode = true;
                 ShutdownMode = ShutdownMode.OnExplicitShutdown;
                 var exitCode = await CellularAudioWorkerHost.RunAsync(e.Args);
                 Shutdown(exitCode);
                 return;
             }
 
+            // An elevated successor must wait for the previous instance to
+            // finish modem/PPP cleanup before trying to acquire its ports.
+            if (e.Args.Length == 2 && e.Args[0] == "--wait-for-exit" &&
+                int.TryParse(e.Args[1], out var predecessorId) && predecessorId != Environment.ProcessId)
+            {
+                try
+                {
+                    using var predecessor = Process.GetProcessById(predecessorId);
+                    await predecessor.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(60));
+                }
+                catch (ArgumentException) { }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"原进程尚未退出，未启动新的通信实例。{ex.Message}", "VoWin 重启未完成");
+                    Shutdown(1);
+                    return;
+                }
+            }
+
             if (!AcquireSingleInstance())
             {
                 Shutdown(0);
+                return;
+            }
+
+            if (e.Args.Length == 2 && e.Args[0] == "--verify-startup" &&
+                (!Path.IsPathFullyQualified(e.Args[1]) || File.Exists(e.Args[1]) ||
+                 Environment.GetEnvironmentVariable("VOWIN_TEST_DUAL_MODEM") != "1" ||
+                 Environment.GetEnvironmentVariable("VOWIN_HOST_IMS_SUBSCRIBER_EGRESS_APPROVED") != "1"))
+            {
+                Shutdown(1);
                 return;
             }
 
@@ -140,7 +178,49 @@ namespace VoWin
                     Dispatcher.BeginInvoke(ApplyBrandTheme, DispatcherPriority.Background);
                 ApplyBrandTheme();
                 StartSingleInstanceActivationListener();
+                if (BundledRuntime.IsEmbedded)
+                {
+                    var setup = new RuntimeSetupWindow();
+                    using var preparation = new CancellationTokenSource();
+                    setup.Closed += (_, _) => preparation.Cancel();
+                    ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                    setup.Show();
+                    try
+                    {
+                        await Task.Run(() => BundledRuntime.PrepareAsync(
+                            new Progress<string>(message => Dispatcher.Invoke(() => setup.SetStatus(message))), preparation.Token));
+                    }
+                    catch (OperationCanceledException) { Shutdown(0); return; }
+                    catch (Exception ex)
+                    {
+                        LogCrash("Runtime extraction", ex);
+                        MessageBox.Show(setup, $"无法准备内置运行组件，通信尚未启动。\n{ex.Message}\n请检查磁盘空间与目录权限，或重新获取完整发布版。",
+                            "VoWin 组件准备失败", MessageBoxButton.OK, MessageBoxImage.Error);
+                        Shutdown(1);
+                        return;
+                    }
+                    finally { setup.Close(); }
+                    ShutdownMode = ShutdownMode.OnMainWindowClose;
+                }
                 await _host.StartAsync();
+                if (e.Args.Length == 2 && e.Args[0] == "--verify-startup" && Path.IsPathFullyQualified(e.Args[1]))
+                {
+                    try
+                    {
+                        var service = _host.Services.GetRequiredService<IVoKernelService>();
+                        var report = await StartupSmokeCheck.ObserveAsync(service);
+                        var observedSlots = service.Kernel.Pool.Slots.Values.ToArray();
+                        await StopApplicationServicesAsync();
+                        await StartupSmokeCheck.SaveAsync(e.Args[1], report, service, observedSlots);
+                        await ShutdownGracefullyAsync(report.Success ? 0 : 1);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogCrash("Published startup verification", ex);
+                        await ShutdownGracefullyAsync(1);
+                    }
+                    return;
+                }
                 _ = CheckForGitHubReleaseUpdateAsync();
             }
             catch (Exception ex)
@@ -166,11 +246,14 @@ namespace VoWin
         /// WPF-UI swaps its theme resources.
         /// </summary>
         public static void ApplyBrandTheme()
+            => ApplyBrandTheme(ApplicationThemeManager.GetAppTheme());
+
+        public static void ApplyBrandTheme(ApplicationTheme theme)
         {
             var res = System.Windows.Application.Current?.Resources;
             if (res == null) return;
 
-            var dark = ApplicationThemeManager.GetAppTheme() == ApplicationTheme.Dark;
+            var dark = theme == ApplicationTheme.Dark;
             var palette = dark
                 ? new Dictionary<string, string>
                 {
@@ -449,30 +532,92 @@ namespace VoWin
         /// <summary>
         /// Occurs when the application is closing.
         /// </summary>
-        private async void OnExit(object sender, ExitEventArgs e)
+        internal Task ShutdownGracefullyAsync(int exitCode = 0)
+        {
+            if (!Dispatcher.CheckAccess())
+                return Dispatcher.InvokeAsync(() => ShutdownGracefullyAsync(exitCode)).Task.Unwrap();
+            return _shutdownTask ??= ShutdownCoreAsync(exitCode);
+        }
+
+        private async Task ShutdownCoreAsync(int exitCode)
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            TrayManager.BeginExit();
+            if (MainWindow is MainWindow main) main.ShowShutdownProgress("正在注销 IMS 并关闭本机连接…");
+            try { await StopApplicationServicesAsync(); }
+            catch (Exception ex)
+            {
+                LogCrash("Shutdown incomplete", ex);
+                if (MainWindow is MainWindow failed) failed.ShowShutdownProgress("退出清理未完成，未强制结束进程。请保留 shutdown.log；若驱动持续无响应，请保存工作后重启 Windows。");
+                return; // Do not release ownership while a driver/lease still belongs to this process.
+            }
+            _servicesStoppedSafely = true;
+            TrayManager.CompleteExit();
+            ReleaseSingleInstance(); // Hold ownership until both modem leases have unwound.
+            Shutdown(exitCode);
+        }
+
+        private bool _servicesStoppedSafely;
+        private static readonly ApplicationShutdownCoordinator ShutdownCoordinator = new();
+
+        private Task StopApplicationServicesAsync() => _stopServicesTask ??= StopApplicationServicesCoreAsync();
+
+        private static async Task StopApplicationServicesCoreAsync()
+        {
+            var stages = new[]
+            {
+                new ShutdownStage("停止控制和提醒与后台服务…", () => _host.StopAsync()),
+                new ShutdownStage("注销 IMS、停止语音并关闭本机连接（不等待模组恢复）…", async () =>
+                {
+                    if (_host.Services.GetService<IVoKernelService>() is { } kernel) await kernel.DisposeAsync();
+                }),
+                new ShutdownStage("等待原生收发 I/O 和驱动句柄安全释放…", async () =>
+                {
+                    while (!await VoSharp.Telephony.HostImsIoCleanup.WaitForCompletionAsync(TimeSpan.FromSeconds(2)))
+                        await Task.Delay(250);
+                }),
+                new ShutdownStage("释放应用服务…", async () =>
+                {
+                    try
+                    {
+                        if (_host is IAsyncDisposable asynchronous) await asynchronous.DisposeAsync();
+                        else _host.Dispose();
+                    }
+                    catch (ObjectDisposedException ex)
+                    {
+                        // This stage is reached only AFTER kernel/lease teardown
+                        // and the native-I/O barrier. A duplicate managed-service
+                        // dispose must not leave a safely disconnected app stuck.
+                        LogCrash("Managed service already disposed after communication cleanup", ex);
+                    }
+                })
+            };
+            await ShutdownCoordinator.StopAsync(stages, message =>
+            {
+                try
+                {
+                    var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VoWin", "Logs");
+                    Directory.CreateDirectory(directory);
+                    File.AppendAllText(Path.Combine(directory, "shutdown.log"), $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}\r\n");
+                }
+                catch { }
+                var app = System.Windows.Application.Current;
+                if (app?.Dispatcher.HasShutdownStarted == false)
+                    app.Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (app.MainWindow is MainWindow window) window.ShowShutdownProgress(message);
+                    }));
+            }, TimeSpan.FromSeconds(30));
+        }
+
+        private void OnExit(object sender, ExitEventArgs e)
         {
             ReleaseSingleInstance();
-            if (_cellularAudioHelperMode)
-            {
-                try { _host.Dispose(); } catch { }
-                return;
-            }
-
-            var kernelService = _host.Services.GetService<IVoKernelService>();
-            if (kernelService != null)
-            {
-                try { await kernelService.DisposeAsync(); } catch { }
-            }
-
+            // Normal exits await cleanup before WPF stops its dispatcher. This
+            // event is synchronous: async work here cannot keep a process alive.
             try
             {
-                await _host.StopAsync();
-            }
-            catch { }
-
-            try
-            {
-                _host.Dispose();
+                if (!_servicesStoppedSafely) _host.Dispose();
             }
             catch { }
         }

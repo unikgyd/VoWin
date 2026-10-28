@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "purpose": "Tw3 BACKOFF_TIMER data only; not generic or extended periodic timers. Deactivated is not zero or an infinite TimeSpan.",
+  "sources": [
+    "https://www.etsi.org/deliver/etsi_ts/124300_124399/124302/18.06.00_60/ts_124302v180600p.pdf#page=127",
+    "https://www.etsi.org/deliver/etsi_ts/124000_124099/124008/18.07.00_60/ts_124008v180700p.pdf#page=715"
+  ],
+  "vectors": [
+    { "name": "ten-minute-unit", "dataHex": "0101", "status": "timed", "seconds": 600 },
+    { "name": "hour-unit", "dataHex": "0121", "status": "timed", "seconds": 3600 },
+    { "name": "ten-hour-unit", "dataHex": "0141", "status": "timed", "seconds": 36000 },
+    { "name": "two-second-unit", "dataHex": "0161", "status": "timed", "seconds": 2 },
+    { "name": "thirty-second-unit", "dataHex": "0181", "status": "timed", "seconds": 30 },
+    { "name": "minute-unit-ten", "dataHex": "01AA", "status": "timed", "seconds": 600 },
+    { "name": "unit-six-is-not-320-hours", "dataHex": "01C1", "status": "timed", "seconds": 3600 },
+    { "name": "max-unit-six", "dataHex": "01DF", "status": "timed", "seconds": 111600 },
+    { "name": "max-ten-minute-unit", "dataHex": "011F", "status": "timed", "seconds": 18600 },
+    { "name": "max-duration", "dataHex": "015F", "status": "timed", "seconds": 1116000 },
+    { "name": "deactivated-zero-count", "dataHex": "01E0", "status": "deactivated" },
+    { "name": "deactivated-max-count", "dataHex": "01FF", "status": "deactivated" },
+    { "name": "zero-ten-minute-unit", "dataHex": "0100", "status": "timed", "seconds": 0 },
+    { "name": "zero-hour-unit", "dataHex": "0120", "status": "timed", "seconds": 0 },
+    { "name": "zero-two-second-unit", "dataHex": "0160", "status": "timed", "seconds": 0 },
+    { "name": "zero-unit-six", "dataHex": "01C0", "status": "timed", "seconds": 0 },
+    { "name": "empty", "dataHex": "", "status": "invalid" },
+    { "name": "bare-value-not-policy", "dataHex": "AA", "status": "invalid" },
+    { "name": "zero-length", "dataHex": "00AA", "status": "invalid" },
+    { "name": "wrong-length", "dataHex": "02AA", "status": "invalid" },
+    { "name": "trailing-data", "dataHex": "01AA00", "status": "invalid" },
+    { "name": "extra-prefix", "dataHex": "0001AA", "status": "invalid" }
+  ]
+}

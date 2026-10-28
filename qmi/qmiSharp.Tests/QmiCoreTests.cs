@@ -8,6 +8,77 @@ namespace qmiSharp.Tests;
 public class QmiCoreTests
 {
     [Fact]
+    public void ImsaRegistrationStatusUsesProtocolTlvIdsAndFourByteEnums()
+    {
+        var response = new QmiPacket(QmiServiceType.IMSA, 1, 1, 0x0020,
+        [
+            new QmiTlv(0x12, [2, 0, 0, 0]),
+            new QmiTlv(0x11, [0x93, 0x01]),
+            new QmiTlv(0x13, "diagnostic"u8.ToArray()),
+            new QmiTlv(0x14, [1, 0, 0, 0])
+        ]);
+        var status = ImsaService.ParseRegistrationStatus(response);
+        Assert.True(status.IsRegistered);
+        Assert.Equal((ushort)403, status.ErrorCode);
+        Assert.Equal("diagnostic", status.ErrorMessage);
+        Assert.Equal(qmiSharp.Generated.QmiImsaRegistrationTechnology.QMI_IMSA_REGISTERED_WWAN,
+            status.RegistrationTechnology);
+
+        var absent = ImsaService.ParseRegistrationStatus(
+            new QmiPacket(QmiServiceType.IMSA, 1, 1, 0x0020, []));
+        Assert.Null(absent.Status);
+        Assert.Null(absent.RegistrationTechnology);
+        Assert.False(absent.IsRegistered);
+    }
+
+    [Fact]
+    public void ImsaIndicationUsesDifferentTlvIdsFromStatusResponse()
+    {
+        var indication = new QmiPacket(QmiServiceType.IMSA, 1, 1, 0x0023,
+        [
+            new QmiTlv(0x11, [3, 0, 0, 0]),
+            new QmiTlv(0x10, [0x09, 0]),
+            new QmiTlv(0x12, "limited"u8.ToArray()),
+            new QmiTlv(0x13, [1, 0, 0, 0])
+        ]);
+        var status = ImsaService.ParseRegistrationStatus(indication, indication: true);
+        Assert.Equal(qmiSharp.Generated.QmiImsaImsRegistrationStatus.QMI_IMSA_IMS_LIMITED_REGISTERED,
+            status.Status);
+        Assert.False(status.IsRegistered);
+        Assert.Equal((ushort)9, status.ErrorCode);
+        Assert.Equal("limited", status.ErrorMessage);
+    }
+
+    [Fact]
+    public void ImsaVoiceServiceIsAvailableOnlyForFourByteAvailableEnum()
+    {
+        var response = new QmiPacket(QmiServiceType.IMSA, 1, 1, 0x0021,
+        [
+            new QmiTlv(0x10, [0, 0, 0, 0]),
+            new QmiTlv(0x11, [2, 0, 0, 0]),
+            new QmiTlv(0x12, [1, 0, 0, 0])
+        ]);
+        var services = ImsaService.ParseServicesStatus(response);
+        Assert.False(services.SmsSupported);
+        Assert.True(services.VoiceSupported);
+        Assert.False(services.VideoTelephonySupported);
+        Assert.Equal(qmiSharp.Generated.QmiImsaServiceStatus.QMI_IMSA_SERVICE_LIMITED,
+            services.VideoTelephony);
+        Assert.Throws<InvalidDataException>(() => ImsaService.ParseServicesStatus(
+            new QmiPacket(QmiServiceType.IMSA, 1, 1, 0x0021,
+                [new QmiTlv(0x11, [2])])));
+    }
+
+    [Fact]
+    public void ImsaReadOnlyOptionsEnterTheQmiCliPath()
+    {
+        Assert.True(qmiSharp.Cli.QmiCliRunner.IsQmiCliCommand(
+            ["--auto", "--imsa-get-ims-registration-status"]));
+        Assert.True(qmiSharp.Cli.QmiCliRunner.IsQmiCliCommand(
+            ["--auto", "--imsa-get-ims-services-status"]));
+    }
+
+    [Fact]
     public void WdsCurrentSettingsParsesImsApnAndPcscfWithoutConfusingProfileIndexWithCid()
     {
         var response = new QmiPacket(QmiServiceType.WDS, 1, 1, 0x002D,
@@ -30,6 +101,107 @@ public class QmiCoreTests
         var response = new QmiPacket(QmiServiceType.WDS, 1, 1, 0x002D,
         [new QmiTlv(0x23, [2, 1, 0, 0, 10])]);
         Assert.Throws<FormatException>(() => WdsService.ParseCurrentSettings(response));
+    }
+
+    [Theory]
+    [InlineData(new byte[] { })]
+    [InlineData(new byte[] { 2, 0, 10 })]
+    [InlineData(new byte[] { 2, 0, 0, 10, 99 })]
+    public void WdsCurrentSettingsRejectsNonExactIpv4Field(byte[] value)
+    {
+        var response = new QmiPacket(QmiServiceType.WDS, 1, 1, 0x002D,
+            [new QmiTlv(0x1E, value)]);
+        Assert.Throws<FormatException>(() => WdsService.ParseCurrentSettings(response));
+    }
+
+    [Theory]
+    [InlineData((byte)0x14)]
+    [InlineData((byte)0x1E)]
+    [InlineData((byte)0x23)]
+    public void WdsCurrentSettingsRejectsAmbiguousDuplicateFields(byte type)
+    {
+        var value = type == 0x14 ? "ims"u8.ToArray() : type == 0x23 ? new byte[] { 0 } : new byte[] { 2, 0, 0, 10 };
+        var response = new QmiPacket(QmiServiceType.WDS, 1, 1, 0x002D,
+            [new QmiTlv(type, value), new QmiTlv(type, value)]);
+        Assert.Throws<FormatException>(() => WdsService.ParseCurrentSettings(response));
+    }
+
+    [Fact]
+    public void WdsCurrentSettingsParsesIpv6PcscfListAlongsideIpv4()
+    {
+        var response = new QmiPacket(QmiServiceType.WDS, 1, 1, 0x002D,
+        [
+            new QmiTlv(0x23, [1, 1, 0, 0, 10]),
+            new QmiTlv(0x2E, [2,
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2])
+        ]);
+        var servers = WdsService.ParseCurrentSettings(response).PcscfServers;
+        Assert.Equal(["10.0.0.1", "2001:db8::1", "2001:db8::2"],
+            servers.Select(address => address.ToString()));
+    }
+
+    [Theory]
+    [InlineData(new byte[] { })]
+    [InlineData(new byte[] { 1 })]
+    [InlineData(new byte[] { 0, 0 })]
+    [InlineData(new byte[] { 2, 0x20, 0x01 })]
+    public void WdsCurrentSettingsRejectsMalformedIpv6PcscfList(byte[] value)
+    {
+        var response = new QmiPacket(QmiServiceType.WDS, 1, 1, 0x002D,
+        [new QmiTlv(0x2E, value)]);
+        Assert.Throws<FormatException>(() => WdsService.ParseCurrentSettings(response));
+    }
+
+    [Fact]
+    public void WdsCurrentSettingsParsesNetworkOrderIpv6AddressAndPrefix()
+    {
+        var response = new QmiPacket(QmiServiceType.WDS, 1, 1, 0x002D,
+        [
+            new QmiTlv(0x25, [0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0, 0,
+                              0, 0, 0, 0, 0, 0, 0, 1, 64]),
+            new QmiTlv(0x26, [0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+                              0, 0, 0, 0, 0, 0, 0, 2, 64]),
+            new QmiTlv(0x27, [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                              0, 0, 0, 0, 0, 0, 0, 0x53]),
+            new QmiTlv(0x2B, [6])
+        ]);
+        var settings = WdsService.ParseCurrentSettings(response);
+        Assert.Equal("2001:db8:1234::1", settings.Ipv6Address?.ToString());
+        Assert.Equal((byte)64, settings.Ipv6PrefixLength);
+        Assert.Equal("fe80::2", settings.Ipv6Gateway?.ToString());
+        Assert.Equal((byte)6, settings.IpFamily);
+        Assert.Null(settings.Ipv4Address);
+    }
+
+    [Theory]
+    [InlineData(0x25, 16)]
+    [InlineData(0x25, 18)]
+    [InlineData(0x27, 15)]
+    public void WdsCurrentSettingsRejectsMalformedIpv6Tlv(byte type, int length)
+    {
+        var response = new QmiPacket(QmiServiceType.WDS, 1, 1, 0x002D,
+            [new QmiTlv(type, new byte[length])]);
+        Assert.Throws<FormatException>(() => WdsService.ParseCurrentSettings(response));
+    }
+
+    [Fact]
+    public void WdaDataFormatRetainsQmapAggregationProtocol()
+    {
+        var response = new QmiPacket(QmiServiceType.WDA, 1, 1, 0x0021,
+        [
+            QmiTlv.FromUInt32(0x11, 2),
+            QmiTlv.FromUInt32(0x12, 5),
+            QmiTlv.FromUInt32(0x13, 5),
+            QmiTlv.FromUInt32(0x18, 4096),
+            QmiTlv.FromUInt32(0x16, 4096)
+        ]);
+        var format = WdaService.ParseDataFormat(response, WdaLinkProtocol.Ethernet, 0, 0);
+        Assert.Equal(WdaLinkProtocol.RawIP, format.LinkProtocol);
+        Assert.Equal((uint)5, format.UplinkAggregationProtocol);
+        Assert.Equal((uint)5, format.DownlinkAggregationProtocol);
+        Assert.Equal((uint)4096, format.UlAggregationSize);
+        Assert.Equal((uint)4096, format.DlAggregationSize);
     }
 
     [Fact]

@@ -378,15 +378,17 @@ public static class SecurityAgreementBuilder
 
             var eq = segment.IndexOf('=');
             if (eq <= 0)
-                continue;
+                return null;
 
             var key = segment[..eq].Trim();
             var value = segment[(eq + 1)..].Trim().Trim('"');
-            parameters[key] = value;
-
-            if (key.Equals("q", StringComparison.OrdinalIgnoreCase) &&
-                double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+            if (key.Length == 0 || value.Length == 0 || !parameters.TryAdd(key, value))
+                return null;
+            if (key.Equals("q", StringComparison.OrdinalIgnoreCase))
             {
+                if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture,
+                        out var parsed) || !double.IsFinite(parsed) || parsed is < 0 or > 1)
+                    return null;
                 q = parsed;
             }
         }

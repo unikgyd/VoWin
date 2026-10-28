@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "scope": "Synthetic IMS AKAv1-MD5 control-plane vectors; no carrier credentials",
+  "username": "001010123456789@ims.test",
+  "realm": "ims.test",
+  "uri": "sip:ims.test",
+  "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "cnonce": "0123456789abcdef",
+  "digests": [
+    { "id": "binary-qop", "resHex": "0080ff4119223711", "method": "REGISTER", "qop": "auth", "expected": "c134fe3be806a7ccb93dfc66ac7287d5" },
+    { "id": "binary-no-qop", "resHex": "0080ff4119223711", "method": "REGISTER", "qop": "", "expected": "c33dc39b6061df61b967409423ff0bed" },
+    { "id": "max-res", "resHex": "000102030405060708090a0b0c0d0e0f", "method": "REGISTER", "qop": "auth", "expected": "c8d034b108a663dc5aabbe66d877dbe8" },
+    { "id": "auts-empty-password", "resHex": "", "method": "REGISTER", "qop": "auth", "expected": "fc430b8c7b69fd22dbd9135b52a427cd" },
+    { "id": "registrar-rspauth", "resHex": "0080ff4119223711", "method": "", "qop": "auth", "expected": "cba3ad546403194af4dbbfbb50a03eba" }
+  ],
+  "challenges": [
+    { "id": "no-qop", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5", "accepted": true },
+    { "id": "choose-auth", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5, qop=\"auth-int, auth\"", "accepted": true },
+    { "id": "quoted-algorithm", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=\"AKAv1-MD5\", qop=auth", "accepted": true },
+    { "id": "case-insensitive", "header": "digest REALM=\"ims.test\", nonce=\"challenge\", algorithm=akav1-md5, qop=AUTH", "accepted": true },
+    { "id": "escaped-opaque", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5, opaque=\"quoted\\\"value\"", "accepted": true },
+    { "id": "missing-algorithm", "header": "Digest realm=\"ims.test\", nonce=\"challenge\"", "accepted": false },
+    { "id": "no-digest-downgrade", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=MD5", "accepted": false },
+    { "id": "no-aka2-downgrade", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv2-MD5", "accepted": false },
+    { "id": "auth-int-only", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5, qop=auth-int", "accepted": false },
+    { "id": "empty-nonce", "header": "Digest realm=\"ims.test\", nonce=\"\", algorithm=AKAv1-MD5", "accepted": false },
+    { "id": "empty-realm", "header": "Digest realm=\"\", nonce=\"challenge\", algorithm=AKAv1-MD5", "accepted": false },
+    { "id": "duplicate-case-folded", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", NONCE=\"other\", algorithm=AKAv1-MD5", "accepted": false },
+    { "id": "trailing-comma", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5,", "accepted": false },
+    { "id": "unterminated-quote", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5, opaque=\"oops", "accepted": false },
+    { "id": "junk-after-quote", "header": "Digest realm=\"ims.test\"junk, nonce=\"challenge\", algorithm=AKAv1-MD5", "accepted": false },
+    { "id": "invalid-field-name", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5, bad_name=x", "accepted": false },
+    { "id": "invalid-token", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5, extra=a/b", "accepted": false },
+    { "id": "empty-opaque", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5, opaque=\"\"", "accepted": false },
+    { "id": "control-tab", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5, opaque=\"a\tb\"", "accepted": false },
+    { "id": "header-injection", "header": "Digest realm=\"ims.test\", nonce=\"challenge\", algorithm=AKAv1-MD5\r\nX: yes", "accepted": false }
+  ]
+}

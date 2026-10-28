@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "cases": [
+    {"id":"authoritative-two", "imsi":"999123123456789", "mnc":"12", "known":true, "equivalents":["999123"], "homes":["99912"]},
+    {"id":"authoritative-three", "imsi":"999123123456789", "mnc":"123", "known":true, "equivalents":["99912"], "homes":["999123"]},
+    {"id":"unknown-two-first", "imsi":"999123123456789", "mnc":"12", "known":false, "equivalents":[], "homes":["99912","999123"]},
+    {"id":"unknown-three-first", "imsi":"999123123456789", "mnc":"123", "known":false, "equivalents":[], "homes":["999123","99912"]},
+    {"id":"equivalent-priority", "imsi":"999123123456789", "mnc":"12", "known":false, "equivalents":["999123","99912"], "homes":["999123","99912"]},
+    {"id":"foreign-not-auth", "imsi":"999123123456789", "mnc":"12", "known":false, "equivalents":["20404","51566"], "homes":["99912","999123"]},
+    {"id":"equivalent-dedup", "imsi":"999123123456789", "mnc":"12", "known":false, "equivalents":["999123","999123","99912"], "homes":["999123","99912"]},
+    {"id":"leading-zero-mnc", "imsi":"999012123456789", "mnc":"01", "known":false, "equivalents":[], "homes":["99901","999012"]}
+  ]
+}

@@ -16,6 +16,7 @@ using VoSharp.Telephony;
 using VoSharp.Telephony.Calls;
 using VoSharp.Telephony.Sms;
 using VoSharp.Telephony.VoWifi;
+using qmiSharp.Transport;
 
 namespace VoSharp.Kernel.Pool;
 
@@ -27,6 +28,8 @@ public enum SlotState
     Error
 }
 
+public enum HostImsLossKind { None, RegistrationRefreshFailed, BearerLost, RestorationFailed, ManuallyStopped }
+
 public sealed record HostImsRegistrationStatus(
     bool IsRegistered,
     string State,
@@ -35,7 +38,25 @@ public sealed record HostImsRegistrationStatus(
     DateTime? ExpiresAtUtc,
     string? LastError,
     bool? RemoteDeregistered = null,
-    string? CardPath = null);
+    string? CardPath = null,
+    bool SmsReceiveEnabled = false)
+{
+    public SipRegistrationFailureInfo? Failure { get; init; }
+    public DateTime? RetryNotBeforeUtc { get; init; }
+    public bool AutomaticRecoveryPaused { get; init; }
+    public HostImsLossKind LossKind { get; init; }
+}
+
+public sealed record HostImsPppBearerStatus(
+    bool IsActive,
+    WindowsHostImsPppBearerInfo? Bearer,
+    string? LastError,
+    int RenewalCount = 0,
+    DateTime? LastRenewedAtUtc = null,
+    int MediaRouteCount = 0)
+{
+    public int DefaultRouteRepairCount { get; init; }
+}
 
 /// <summary>
 /// Result of a read-only eUICC capability probe.  Unsupported is reserved for
@@ -72,16 +93,40 @@ public sealed record EuiccProbeResult(
 /// Encapsulates a single modem hardware instance, its SIM identity, AKA credentials,
 /// VoWiFi tunnel manager, IMS call manager, and dedicated SOCKS5 proxy configuration.
 /// </summary>
-public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
+public partial class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 {
     private readonly SemaphoreSlim _profileSwitchGate = new(1, 1);
     private readonly SemaphoreSlim _euiccProbeGate = new(1, 1);
     private readonly SemaphoreSlim _hostImsRegistrationGate = new(1, 1);
+    private WindowsHostImsPppBearerLease? _hostImsPppLease;
+    private string? _hostImsPppError;
+    private int _hostImsPppTransition;
+    public bool IsHostImsPppTransition => Volatile.Read(ref _hostImsPppTransition) != 0;
+    public bool IsHostImsPppTransitionOrActive =>
+        Volatile.Read(ref _hostImsPppTransition) != 0 || Volatile.Read(ref _hostImsPppLease) is not null;
     private HostImsRegistrationClient? _hostImsRegistration;
+    private readonly SipRegistrationRetryGate _hostImsRetryGate = new();
+    private int _hostImsLossKind;
+    /// <summary>Explicit stop intent only; background fallback does not raise it.</summary>
+    public event Action? HostImsManualStopRequested;
+    public bool HostImsRecoveryCleanupPending => IsHostImsPppTransitionOrActive ||
+        Volatile.Read(ref _hostImsRegistration) is not null || IsProfileSwitchInProgress;
+
+    private void NotifyHostImsManualStop()
+    {
+        InvalidateSmsIdentity();
+        Volatile.Write(ref _hostImsLossKind, (int)HostImsLossKind.ManuallyStopped);
+        try { HostImsManualStopRequested?.Invoke(); } catch { }
+    }
+
+    public Task WaitForHostImsRegistrarRetryAsync(string expectedIccid, CancellationToken ct) =>
+        _hostImsRetryGate.WaitUntilAllowedAsync(expectedIccid, ct);
     private ModemDriver? _hostImsRegisteredModem;
     private string? _hostImsRegisteredIccid;
     private string? _hostImsRegisteredImsi;
+    private Action<IncomingSms>? _hostImsIncomingSmsHandler;
     private string? _hostImsRegistrationError;
+    private long _hostImsRegistrationAttemptGeneration;
     private int _hostImsRemoteDeregistration = -1;
     private readonly SimIdentityHistoryStore _identityHistory;
     private int _profileSwitchInProgress;
@@ -92,6 +137,34 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 
     public string Id { get; }
+    // Null retains CLI/library automatic routing. Desktop mode selection is strict.
+    public TelephonyMode? PreferredTelephonyMode { get; set; }
+    private TelephonyMode? _cellularImsMode;
+    /// <summary>Cellular owner only; VoWiFi has a separate lifecycle on this instance.</summary>
+    public TelephonyMode? CellularImsMode
+    {
+        get => _cellularImsMode;
+        set
+        {
+            if (value is not (null or TelephonyMode.ModemBridge or TelephonyMode.HostIms))
+                throw new ArgumentOutOfRangeException(nameof(value));
+            _cellularImsMode = value;
+            OnPropertyChanged();
+        }
+    }
+    public bool TelephonyEnabled { get; set; } = true;
+    private ModemControlPreference _controlPreference;
+    public ModemControlPreference ControlPreference
+    {
+        get => _controlPreference;
+        set
+        {
+            if (!Enum.IsDefined(value)) throw new ArgumentOutOfRangeException(nameof(value));
+            _controlPreference = value;
+            if (Modem is { } modem) modem.ControlPreference = value;
+            OnPropertyChanged();
+        }
+    }
 
     private string _name = string.Empty;
     public string Name
@@ -103,6 +176,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             {
                 _name = value;
                 OnPropertyChanged();
+                OnPropertyChanged(nameof(DeviceTitle));
                 OnPropertyChanged(nameof(DisplayTitle));
             }
         }
@@ -244,12 +318,13 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             {
                 var oldIccid = _sim?.Iccid;
                 var oldImsi = _sim?.Imsi;
-                _sim = value;
+                PublishSmsIdentity(value);
                 if (!string.Equals(oldIccid, value?.Iccid, StringComparison.Ordinal) ||
                     !string.Equals(oldImsi, value?.Imsi, StringComparison.Ordinal))
                     Volatile.Read(ref _hostImsRegistration)?.Invalidate();
                 if (!string.Equals(oldIccid, value?.Iccid, StringComparison.Ordinal))
                 {
+                    VoWifi.UserEpdgConfiguration = null;
                     CardNickname = null;
                     // A physical-card replacement (or a successful eSIM
                     // switch) invalidates any support result cached for the
@@ -335,11 +410,13 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         }
     }
 
+    public string DeviceTitle => Name == $"Slot {Id} ({PortName})" ? DeviceModel ?? Name : Name;
+
     public string DisplayTitle
     {
         get
         {
-            var moduleName = !string.IsNullOrWhiteSpace(Name) ? Name : "模组";
+            var moduleName = !string.IsNullOrWhiteSpace(DeviceTitle) ? DeviceTitle : "模组";
             var cardName = !string.IsNullOrWhiteSpace(CardNickname)
                 ? CardNickname
                 : !string.IsNullOrWhiteSpace(CarrierName)
@@ -377,6 +454,18 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     }
 
     private string? _imei;
+    private string? _deviceModel;
+    public string? DeviceModel
+    {
+        get => _deviceModel;
+        private set
+        {
+            if (_deviceModel == value) return;
+            _deviceModel = value; OnPropertyChanged();
+            OnPropertyChanged(nameof(DeviceTitle)); OnPropertyChanged(nameof(DisplayTitle));
+        }
+    }
+    public Guid? UsbContainerId { get; private set; }
     public string? Imei
     {
         get => _imei;
@@ -425,6 +514,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     private readonly AsyncEventBus _eventBus;
     private readonly ConcurrentQueue<IncomingCallEventArgs> _pendingIncomingCalls = new();
     private readonly ConcurrentQueue<SmsReceivedEventArgs> _pendingReceivedSms = new();
+    private int _nextHostImsSmsIndex;
     private readonly object _lock = new();
     private readonly object _cellularCallLock = new();
     private string? _cellularCallId;
@@ -456,6 +546,12 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         }
     }
 
+    internal bool IsCurrentCellularCall(string callId)
+    {
+        lock (_cellularCallLock)
+            return string.Equals(_cellularCallId, callId, StringComparison.OrdinalIgnoreCase) && HasCellularCall;
+    }
+
     public ModemSlot(
         string id,
         string portName,
@@ -463,7 +559,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         string? name = null,
         string? proxyUrl = null,
         AsyncEventBus? eventBus = null,
-        SimIdentityHistoryStore? identityHistory = null)
+        SimIdentityHistoryStore? identityHistory = null, IkeRetryGate? ikeRetry = null)
     {
         Id = id ?? throw new ArgumentNullException(nameof(id));
         PortName = portName ?? throw new ArgumentNullException(nameof(portName));
@@ -473,10 +569,11 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         _eventBus = eventBus ?? new AsyncEventBus();
         _identityHistory = identityHistory ?? new SimIdentityHistoryStore();
 
-        VoWifi = new VoWifiManager(_eventBus)
+        VoWifi = new VoWifiManager(_eventBus, ikeRetry: ikeRetry, retryDeviceId: Id)
         {
             ProxyUrl = proxyUrl
         };
+        VoWifi.SmsReceived += (_, e) => RaiseReceivedSms(new SmsReceivedEventArgs(e.Message, Id, e.SimBinding));
         Calls = new ImsCallManager(_eventBus);
         VoWifi.Calls = Calls;
 
@@ -748,8 +845,10 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     /// Attaches to the physical or virtual modem on the configured serial COM port,
     /// performs AT handshake, queries IMEI/IMSI/ICCID, sets up AKA provider, and configures VoWiFi.
     /// </summary>
-    public async Task<bool> AttachAsync(CancellationToken ct = default)
+    public async Task<bool> AttachAsync(CancellationToken ct = default, bool initializeSms = true)
     {
+        if (IsHostImsPppTransitionOrActive)
+            throw new InvalidOperationException("The modem is owned by a Windows Host IMS PPP handoff.");
         lock (_lock)
         {
             LastError = null;
@@ -757,7 +856,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
         try
         {
-            var driver = new ModemDriver(PortName, BaudRate, _eventBus);
+            var driver = new ModemDriver(PortName, BaudRate, _eventBus) { ControlPreference = ControlPreference };
             driver.UrcReceived += (_, e) => HandleCellularCallUrc(e.UrcLine);
             driver.Open();
 
@@ -818,6 +917,12 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             // Probe device metadata
             await driver.GetFirmwareRevisionAsync(ct).ConfigureAwait(false);
             Imei = await driver.GetImeiAsync(ct).ConfigureAwait(false);
+            var modelResponse = await driver.SendRawAtCommandAsync("AT+CGMM", 2000, ct).ConfigureAwait(false);
+            if (modelResponse.Success)
+                DeviceModel = modelResponse.Lines.Select(line => line.Trim()).FirstOrDefault(line =>
+                    line.Length > 0 && !line.StartsWith("AT", StringComparison.OrdinalIgnoreCase) && line != "OK");
+            try { UsbContainerId = ModemDiscoveryPolicy.FindContainer(WindowsUsbTopology.EnumeratePresent(), PortName); }
+            catch { } // Non-USB modems remain usable, without claiming verified USB pairing.
             var reportedImsi = await driver.GetImsiAsync(ct).ConfigureAwait(false);
             var permanentImsi = await driver.GetPermanentImsiAsync(ct).ConfigureAwait(false);
             var imsi = !string.IsNullOrWhiteSpace(permanentImsi) ? permanentImsi : reportedImsi;
@@ -864,20 +969,24 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
                 }
             }
 
-            // Initialize 3GPP Phase 2+ SMS mode, storage, and real-time indications (AT+CNMI)
-            try
+            // Read-only bearer experiments do not need to touch SMS storage.
+            // Normal application attachment retains its established behavior.
+            if (initializeSms)
             {
-                await driver.InitializeSmsModeAsync(ct).ConfigureAwait(false);
-
-                // Fetch any unread SMS on the card received while offline
-                var unreadMessages = await Sms.ListSmsAsync(SmsStatus.Unread, ct).ConfigureAwait(false);
-                foreach (var unreadMsg in unreadMessages)
+                try
                 {
-                    Sms.ProcessDecodedSms(unreadMsg);
-                    _ = Sms.DeleteSmsAsync(unreadMsg.Index, ct);
+                    await driver.InitializeSmsModeAsync(ct).ConfigureAwait(false);
+
+                    // Fetch any unread SMS on the card received while offline
+                    var unreadMessages = await Sms.ListSmsAsync(SmsStatus.Unread, ct).ConfigureAwait(false);
+                    foreach (var unreadMsg in unreadMessages)
+                    {
+                        Sms.ProcessDecodedSms(unreadMsg);
+                        _ = Sms.DeleteSmsAsync(unreadMsg.Index, ct);
+                    }
                 }
+                catch { }
             }
-            catch { }
 
             // Radio metrics are meaningless while RF is disabled. They are
             // otherwise refreshed by the background telemetry loop after the
@@ -911,6 +1020,28 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     /// </summary>
     public async Task DetachHardwareAsync(CancellationToken ct = default)
     {
+        // CFUN reboot intentionally removes USB ports. The managed owner, not
+        // generic hotplug handling, owns AT lifetime until handoff/restore ends.
+        if (IsHostImsPppTransition) return;
+        if (_hostImsPppLease is not null)
+        {
+            try { await StopHostImsPppBearerAsync().ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                _eventBus.Publish(EventTopics.SystemLog, "Host IMS",
+                    $"Slot {Id}: PPP restoration after hardware detach failed: {ex.Message}");
+            }
+        }
+        // Serialize actual disposal against a handoff beginning after the first check.
+        // Never wait behind an intentional reboot and then replay a stale detach.
+        if (!await _profileSwitchGate.WaitAsync(0, ct).ConfigureAwait(false)) return;
+        try { await DetachHardwareCoreAsync(ct).ConfigureAwait(false); }
+        finally { _profileSwitchGate.Release(); }
+    }
+
+    private async Task DetachHardwareCoreAsync(CancellationToken ct)
+    {
+        InvalidateSmsIdentity();
         await StopHostImsRegistrationLocallyAsync().ConfigureAwait(false);
         if (IsPcscReader)
         {
@@ -989,12 +1120,350 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         catch { }
     }
 
+    public HostImsPppBearerStatus GetHostImsPppBearerStatus()
+    {
+        var lease = Volatile.Read(ref _hostImsPppLease);
+        return new HostImsPppBearerStatus(
+            lease is not null && !lease.IsLost,
+            lease is not null && !lease.IsLost ? lease.Bearer : null,
+            Volatile.Read(ref _hostImsPppError),
+            lease?.RenewalCount ?? 0,
+            lease?.LastRenewedAtUtc,
+            lease?.MediaRouteCount ?? 0) { DefaultRouteRepairCount = lease?.DefaultRouteRepairCount ?? 0 };
+    }
+
+    /// <summary>Explicit user retry releases a rejection pause, never an unexpired carrier timer.</summary>
+    public void PrepareExplicitHostImsRetry()
+    {
+        var scope = Sim?.Iccid ?? throw new InvalidOperationException("A verified SIM is required before retrying Host IMS.");
+        _hostImsRetryGate.ReleasePause(scope);
+        _hostImsRetryGate.ThrowIfBlocked(scope);
+    }
+
+    /// <summary>Verify the existing P-CSCF /128 through the owner's media-route control path, without sending carrier traffic.</summary>
+    public async Task CheckHostImsPppRouteControlAsync(CancellationToken ct = default)
+    {
+        var lease = Volatile.Read(ref _hostImsPppLease);
+        if (lease?.Bearer is not { PcscfAddresses: { Count: > 0 } } bearer || lease.IsLost)
+            throw new InvalidOperationException("No live isolated IMS PPP bearer is available for route-control verification.");
+        await lease.EnsureMediaRouteAsync(bearer.PcscfAddresses[0], ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Explicit, experimental PPP ownership of the IMS bearer. No SIP packet is
+    /// sent here. The guarded child owns modem reboot, route isolation and
+    /// recovery; this slot releases AT only while the child needs it.
+    /// </summary>
+    public async Task<HostImsPppBearerStatus> StartHostImsPppBearerAsync(
+        string handoffScript, string rasProbeExecutable, int maxLeaseSeconds = 3600,
+        CancellationToken ct = default)
+    {
+        await _profileSwitchGate.WaitAsync(ct).ConfigureAwait(false);
+        Interlocked.Exchange(ref _profileSwitchInProgress, 1);
+        Interlocked.Exchange(ref _hostImsPppTransition, 1);
+        ModemDriver? modem = null;
+        WindowsHostImsPppBearerLease? lease = null;
+        try
+        {
+            if (_hostImsPppLease is not null)
+                throw new InvalidOperationException("This slot already owns a Host IMS PPP bearer; stop it first.");
+            if (IsPcscReader || Sim is null || Modem is not { IsOpen: true })
+                throw new InvalidOperationException("A connected modem with a verified SIM is required. " +
+                    (IsPcscReader ? "读卡器仅支持 VoWiFi，请选择蜂窝模组。" :
+                        Modem is not { IsOpen: true } ? "模组串口已断开，请重新扫描设备；保留的 SIM 信息不代表硬件仍在线。" :
+                        "SIM 尚未完成校验，请等待识别或先解锁 PIN。"));
+            _hostImsRetryGate.ThrowIfBlocked(Sim.Iccid);
+            if (HasCellularCall || Calls.ActiveCall is not null || _hostImsRegistration is not null ||
+                VoWifi.State is not (VoWifiState.Disconnected or VoWifiState.Failed))
+                throw new InvalidOperationException("Stop calls, Host IMS registration and VoWiFi before changing the modem IMS mode.");
+            modem = Modem;
+            var expectedImei = await modem.GetImeiAsync(ct).ConfigureAwait(false);
+            var expectedIccid = Sim.Iccid;
+            var expectedImsi = Sim.Imsi;
+            var expectedReportedImsi = await modem.GetImsiAsync(ct).ConfigureAwait(false);
+            if (!await modem.CloseAsync(ct).ConfigureAwait(false))
+                throw new InvalidOperationException("The AT handle did not close cleanly; IMS handoff was not started.");
+
+            lease = await WindowsHostImsPppBearerLease.StartAsync(
+                handoffScript, rasProbeExecutable, modem.PortName, maxLeaseSeconds, ct: ct)
+                .ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            if (Volatile.Read(ref _applicationExitRequested) != 0)
+                throw new OperationCanceledException("Application is exiting; do not reopen the modem.");
+            modem.Open();
+            if (!await modem.PingAsync(ct).ConfigureAwait(false) ||
+                !string.Equals(await modem.GetImeiAsync(ct).ConfigureAwait(false), expectedImei, StringComparison.Ordinal) ||
+                !string.Equals(await modem.GetIccidAsync(ct).ConfigureAwait(false), expectedIccid, StringComparison.Ordinal) ||
+                !string.Equals(await modem.GetImsiAsync(ct).ConfigureAwait(false), expectedReportedImsi, StringComparison.Ordinal) ||
+                !ReferenceEquals(Modem, modem) || Sim?.Iccid != expectedIccid || Sim.Imsi != expectedImsi)
+                throw new InvalidOperationException("The modem or SIM identity changed during the IMS handoff.");
+            var probe = await modem.ProbeHostImsPdnAsync(ct).ConfigureAwait(false);
+            if (lease.Bearer is { } ownedBearer)
+                probe = BindHostImsProbeToBearer(probe, ownedBearer);
+            if (!probe.CanAttemptWindowsIms || lease.Bearer is not { } bearer ||
+                !probe.EndpointCandidates.Any(endpoint =>
+                    endpoint.LocalAddress.Equals(bearer.LocalAddress) &&
+                    bearer.PcscfAddresses.Contains(endpoint.PcscfAddress) && probe.IsRouteVerified(endpoint)))
+                throw new InvalidOperationException($"The Windows-owned IMS route did not match PPP READY: {probe.Summary}");
+
+            Volatile.Write(ref _hostImsPppLease, lease);
+            Volatile.Write(ref _hostImsPppError, null);
+            _ = ObserveHostImsPppOwnerAsync(lease);
+            return GetHostImsPppBearerStatus();
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref _hostImsPppError, ex.Message);
+            if (lease is not null)
+            {
+                if (modem?.IsOpen == true)
+                {
+                    try { await modem.CloseAsync().ConfigureAwait(false); }
+                    catch (Exception close) { Volatile.Write(ref _hostImsPppError, $"{ex.Message}; AT close: {close.Message}"); }
+                }
+                try { await ReleaseHostImsLeaseAsync(lease).ConfigureAwait(false); }
+                catch (Exception restore) { Volatile.Write(ref _hostImsPppError, $"{ex.Message}; restore: {restore.Message}"); }
+            }
+            if (Volatile.Read(ref _applicationExitRequested) == 0 &&
+                modem is { IsOpen: false } && ReferenceEquals(Modem, modem))
+            {
+                try { modem.Open(); } catch { }
+            }
+            throw;
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _hostImsPppTransition, 0);
+            Interlocked.Exchange(ref _profileSwitchInProgress, 0);
+            _profileSwitchGate.Release();
+        }
+    }
+
+    private async Task ObserveHostImsPppOwnerAsync(WindowsHostImsPppBearerLease lease)
+    {
+        await Task.WhenAny(lease.Lost, lease.Completion).ConfigureAwait(false);
+        if (!ReferenceEquals(Volatile.Read(ref _hostImsPppLease), lease)) return;
+        Volatile.Write(ref _hostImsLossKind, (int)HostImsLossKind.BearerLost);
+        if (lease.Completion.IsCompleted)
+        {
+            try { await lease.Completion.ConfigureAwait(false); }
+            catch (Exception ex) { Volatile.Write(ref _hostImsPppError, ex.Message); }
+        }
+        else Volatile.Write(ref _hostImsPppError,
+            "The isolated IMS PPP bearer was lost; local SIP signaling is disabled during modem restoration.");
+        if (ReferenceEquals(Volatile.Read(ref _hostImsPppLease), lease))
+        {
+            try { await StopHostImsPppBearerCoreAsync(expectedRegistration: null).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                Volatile.Write(ref _hostImsLossKind, (int)HostImsLossKind.RestorationFailed);
+                _eventBus.Publish(EventTopics.SystemLog, "Host IMS",
+                    $"Slot {Id}: PPP owner exit cleanup failed: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// A terminal REGISTER refresh failure leaves no live IMS binding. Release
+    /// the Windows PPP owner so modem-internal IMS/USB voice can take over.
+    /// Yield first: the failure event is raised by the refresh task, and Stop
+    /// must not await that same task before its event handler has returned.
+    /// </summary>
+    internal async Task RestoreHostImsAfterRefreshFailureAsync(
+        HostImsRegistrationClient failedClient, string reason)
+    {
+        await Task.Yield();
+        if (!ReferenceEquals(Volatile.Read(ref _hostImsRegistration), failedClient)) return;
+        var failedGeneration = Volatile.Read(ref _hostImsRegistrationAttemptGeneration);
+        Interlocked.CompareExchange(ref _hostImsLossKind, (int)HostImsLossKind.RegistrationRefreshFailed, (int)HostImsLossKind.None);
+        try
+        {
+            var hadPppOwner = Volatile.Read(ref _hostImsPppLease) is not null;
+            if (hadPppOwner)
+            {
+                if (!await StopHostImsPppBearerCoreAsync(failedClient).ConfigureAwait(false))
+                    return; // Another registration or bearer superseded this one.
+            }
+            else
+            {
+                await _hostImsRegistrationGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (!ReferenceEquals(Volatile.Read(ref _hostImsRegistration), failedClient)) return;
+                    await StopHostImsRegistrationCoreAsync().ConfigureAwait(false);
+                }
+                finally { _hostImsRegistrationGate.Release(); }
+            }
+            var bearerError = hadPppOwner ? Volatile.Read(ref _hostImsPppError) : null;
+            if (failedGeneration != Volatile.Read(ref _hostImsRegistrationAttemptGeneration)) return;
+            if (bearerError is not null) Volatile.Write(ref _hostImsLossKind, (int)HostImsLossKind.RestorationFailed);
+            Volatile.Write(ref _hostImsRegistrationError,
+                $"Host IMS registration refresh failed: {reason}; Windows IMS session stopped" +
+                (hadPppOwner ? bearerError is null
+                    ? "; PPP owner recovery completed."
+                    : $"; PPP owner recovery reported: {bearerError}"
+                    : "."));
+        }
+        catch (Exception ex)
+        {
+            if (failedGeneration != Volatile.Read(ref _hostImsRegistrationAttemptGeneration)) return;
+            Volatile.Write(ref _hostImsLossKind, (int)HostImsLossKind.RestorationFailed);
+            Volatile.Write(ref _hostImsRegistrationError,
+                $"Host IMS registration refresh failed: {reason}; automatic fallback reported: {ex.Message}");
+        }
+    }
+
+    public async Task StopHostImsPppBearerAsync()
+    {
+        NotifyHostImsManualStop();
+        await StopHostImsPppBearerCoreAsync(expectedRegistration: null).ConfigureAwait(false);
+    }
+
+    private int _applicationExitRequested;
+    private WindowsHostImsPppBearerLease? _hostImsStoppingLease;
+    public void PrepareForApplicationExit()
+    {
+        Volatile.Write(ref _applicationExitRequested, 1);
+        Volatile.Read(ref _hostImsPppLease)?.AllowBackgroundCleanupOnApplicationExit();
+        Volatile.Read(ref _hostImsStoppingLease)?.AllowBackgroundCleanupOnApplicationExit();
+        NotifyHostImsManualStop();
+    }
+
+    private async Task ReleaseHostImsLeaseAsync(WindowsHostImsPppBearerLease lease)
+    {
+        // Keep an in-progress explicit stop reachable by application exit too.
+        // The active lease may already have been removed before the user exits.
+        Volatile.Write(ref _hostImsStoppingLease, lease);
+        try
+        {
+            if (Volatile.Read(ref _applicationExitRequested) != 0)
+                lease.AllowBackgroundCleanupOnApplicationExit();
+            await lease.DisposeAsync().ConfigureAwait(false);
+        }
+        finally { Interlocked.CompareExchange(ref _hostImsStoppingLease, null, lease); }
+    }
+
+    /// <summary>Unwind an owner's failed automatic attempt without inventing new user stop intent.</summary>
+    public async Task AbortHostImsRecoveryAttemptAsync()
+    {
+        try
+        {
+            if (!await StopHostImsPppBearerCoreAsync(expectedRegistration: null).ConfigureAwait(false))
+                await StopHostImsRegistrationWithSignalingAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            Volatile.Write(ref _hostImsLossKind, (int)HostImsLossKind.RestorationFailed);
+            throw;
+        }
+    }
+
+    private async Task<bool> StopHostImsPppBearerCoreAsync(
+        HostImsRegistrationClient? expectedRegistration,
+        WindowsHostImsPppBearerLease? expectedFailedRegistrationLease = null,
+        long? expectedFailedRegistrationGeneration = null)
+    {
+        await _profileSwitchGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_hostImsPppLease is null ||
+                (expectedRegistration is not null &&
+                 !ReferenceEquals(Volatile.Read(ref _hostImsRegistration), expectedRegistration)))
+                return false;
+            if (expectedFailedRegistrationLease is not null)
+            {
+                // Serialize the stale-attempt check with registration startup.
+                // Once transition is set, a queued start cannot publish a new
+                // client even after this gate is released.
+                await _hostImsRegistrationGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (!ReferenceEquals(_hostImsPppLease, expectedFailedRegistrationLease) ||
+                        expectedFailedRegistrationGeneration !=
+                            Volatile.Read(ref _hostImsRegistrationAttemptGeneration) ||
+                        Volatile.Read(ref _hostImsRegistration) is not null)
+                        return false;
+                    Interlocked.Exchange(ref _hostImsPppTransition, 1);
+                }
+                finally { _hostImsRegistrationGate.Release(); }
+            }
+            else Interlocked.Exchange(ref _hostImsPppTransition, 1);
+            // SIP de-registration must happen before the transition flag makes
+            // the current route ineligible for signaling. A failed SIP cleanup
+            // must never strand the PPP owner with modem-internal IMS disabled.
+            List<Exception> stopErrors = [];
+            try
+            {
+                if (_hostImsPppLease?.IsLost == true)
+                    await StopHostImsRegistrationLocallyAsync().ConfigureAwait(false);
+                else
+                    await StopHostImsRegistrationWithSignalingAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                stopErrors.Add(ex);
+                // Close any still-live SIP transport locally before removing
+                // its bearer, even if remote de-registration failed.
+                try { await StopHostImsRegistrationLocallyAsync().ConfigureAwait(false); }
+                catch (Exception cleanupError) { stopErrors.Add(cleanupError); }
+            }
+            Interlocked.Exchange(ref _profileSwitchInProgress, 1);
+            Volatile.Write(ref _hostImsStoppingLease, Volatile.Read(ref _hostImsPppLease));
+            var lease = Interlocked.Exchange(ref _hostImsPppLease, null);
+            if (lease is null) return false;
+            var modem = Modem;
+            try
+            {
+                Exception? closeError = null;
+                if (modem?.IsOpen == true)
+                {
+                    try
+                    {
+                        if (!await modem.CloseAsync().ConfigureAwait(false))
+                            closeError = new InvalidOperationException("The AT handle did not close cleanly before IMS restoration.");
+                    }
+                    catch (Exception ex) { closeError = ex; }
+                }
+                Exception? restoreError = null;
+                try { await ReleaseHostImsLeaseAsync(lease).ConfigureAwait(false); }
+                catch (Exception ex) { restoreError = ex; }
+                if (closeError is not null) stopErrors.Add(closeError);
+                if (restoreError is not null) stopErrors.Add(restoreError);
+                if (stopErrors.Count == 1) throw stopErrors[0];
+                if (stopErrors.Count > 1) throw new AggregateException(stopErrors);
+                Volatile.Write(ref _hostImsPppError, null);
+            }
+            catch (Exception ex)
+            {
+                Volatile.Write(ref _hostImsPppError, ex.Message);
+                throw;
+            }
+            finally
+            {
+                if (Volatile.Read(ref _applicationExitRequested) == 0 &&
+                    modem is { IsOpen: false } && ReferenceEquals(Modem, modem))
+                {
+                    try { modem.Open(); } catch (Exception ex) { Volatile.Write(ref _hostImsPppError, ex.Message); }
+                }
+            }
+            return true;
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _hostImsPppTransition, 0);
+            Interlocked.Exchange(ref _profileSwitchInProgress, 0);
+            _profileSwitchGate.Release();
+        }
+    }
+
     public HostImsRegistrationStatus GetHostImsRegistrationStatus()
     {
         var client = Volatile.Read(ref _hostImsRegistration);
         var error = Volatile.Read(ref _hostImsRegistrationError);
         var remoteDeregistration = Volatile.Read(ref _hostImsRemoteDeregistration);
-        var registered = client?.IsRegistered == true && HostImsCardMatchesCurrentSlot() && !IsProfileSwitchInProgress;
+        var bearer = Volatile.Read(ref _hostImsPppLease);
+        var registered = client?.IsRegistered == true && HostImsCardMatchesCurrentSlot() &&
+            !IsProfileSwitchInProgress && (bearer is null || !bearer.IsLost);
         var result = registered ? client?.CurrentResult : null;
         return new HostImsRegistrationStatus(
             registered,
@@ -1005,36 +1474,129 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             result is null ? null : result.RegisteredAt.AddSeconds(result.ExpiresSeconds),
             error,
             remoteDeregistration < 0 ? null : remoteDeregistration == 1,
-            client?.CardPath);
+            client?.CardPath,
+            registered && client?.CanReceiveSmsOverIms == true)
+        {
+            Failure = Sim is { } sim ? _hostImsRetryGate.GetFailure(sim.Iccid) : null,
+            RetryNotBeforeUtc = Sim is { } currentSim ? _hostImsRetryGate.RetryNotBeforeUtc(currentSim.Iccid) : null,
+            AutomaticRecoveryPaused = Sim is { } card && _hostImsRetryGate.IsPaused(card.Iccid),
+            LossKind = (HostImsLossKind)Volatile.Read(ref _hostImsLossKind)
+        };
     }
 
     public async Task<HostImsRegistrationStatus> StartHostImsRegistrationAsync(
         HostImsEndpointCandidate? selectedEndpoint = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        IHostImsSecurityBackend? securityBackend = null,
+        Action<string>? diagnosticLog = null,
+        bool enableSmsReceiver = false)
+    {
+        var attemptGeneration = Interlocked.Increment(ref _hostImsRegistrationAttemptGeneration);
+        try
+        {
+            return await StartHostImsRegistrationCoreAsync(
+                selectedEndpoint, ct, securityBackend, diagnosticLog,
+                enableSmsReceiver).ConfigureAwait(false);
+        }
+        catch (Exception registrationError)
+        {
+            // The core has released the registration gate before control gets
+            // here. Roll back only this failed attempt's still-unregistered
+            // PPP owner; an existing or newly published session must survive.
+            var failedLease = Volatile.Read(ref _hostImsPppLease);
+            if (failedLease is not null && Volatile.Read(ref _hostImsRegistration) is null)
+            {
+                try
+                {
+                    if (await StopHostImsPppBearerCoreAsync(
+                            expectedRegistration: null,
+                            expectedFailedRegistrationLease: failedLease,
+                            expectedFailedRegistrationGeneration: attemptGeneration).ConfigureAwait(false))
+                        Volatile.Write(ref _hostImsRegistrationError,
+                            $"{registrationError.Message}; PPP stopped and modem-internal IMS restoration requested.");
+                }
+                catch (Exception rollbackError)
+                {
+                    Volatile.Write(ref _hostImsRegistrationError,
+                        $"{registrationError.Message}; PPP fallback failed: {rollbackError.Message}");
+                    throw new AggregateException(registrationError, rollbackError);
+                }
+            }
+            throw;
+        }
+    }
+
+    private async Task<HostImsRegistrationStatus> StartHostImsRegistrationCoreAsync(
+        HostImsEndpointCandidate? selectedEndpoint,
+        CancellationToken ct,
+        IHostImsSecurityBackend? securityBackend,
+        Action<string>? diagnosticLog,
+        bool enableSmsReceiver)
     {
         await _hostImsRegistrationGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             if (_hostImsRegistration?.IsRegistered == true && HostImsCardMatchesCurrentSlot())
+            {
+                if (securityBackend is not null ||
+                    _hostImsRegistration.CanReceiveSmsOverIms != enableSmsReceiver)
+                    throw new InvalidOperationException("Stop the existing Host IMS registration before changing its security backend or SMS receiver capability.");
                 return GetHostImsRegistrationStatus();
+            }
             await StopHostImsRegistrationCoreAsync().ConfigureAwait(false);
 
-            if (IsPcscReader || IsProfileSwitchInProgress || Sim is null || Modem is not { IsOpen: true } modem)
+            if (IsPcscReader || IsProfileSwitchInProgress || Volatile.Read(ref _hostImsPppTransition) != 0 ||
+                Sim is null || Modem is not { IsOpen: true } modem)
                 throw new InvalidOperationException("Host IMS registration requires a connected modem and a stable selected SIM.");
             var selectedSim = Sim;
             var expectedIccid = selectedSim.Iccid;
             var expectedImsi = selectedSim.Imsi;
+            var pppLease = Volatile.Read(ref _hostImsPppLease);
+            if (!IsHostImsPppOwnerCurrent(pppLease))
+                throw new InvalidOperationException("The managed IMS bearer owner is no longer available; registration was refused.");
             var probe = await modem.ProbeHostImsPdnAsync(ct).ConfigureAwait(false);
+            if (!IsHostImsPppOwnerCurrent(pppLease))
+                throw new InvalidOperationException("The managed IMS bearer owner changed during the IMS probe.");
+            var pppBearer = pppLease?.Bearer;
+            if (pppBearer is not null)
+                probe = BindHostImsProbeToBearer(probe, pppBearer);
             if (!probe.CanAttemptWindowsIms)
                 throw new InvalidOperationException($"Windows does not own an active IMS bearer: {probe.Readiness}; {probe.Summary}");
             var candidates = probe.EndpointCandidates.Where(probe.IsRouteVerified).ToArray();
-            var endpoint = selectedEndpoint ?? (candidates.Length == 1 ? candidates[0] : null);
+            var endpoint = SelectHostImsEndpoint(candidates, selectedEndpoint, pppBearer, probe.RouteChecks);
             if (endpoint is null || !candidates.Contains(endpoint))
                 throw new InvalidOperationException("Select one current IMS address/P-CSCF candidate before registration.");
 
             var client = await HostImsRegistrationClient.RegisterWithCardAsync(
-                modem, selectedSim, probe, endpoint, ct: ct).ConfigureAwait(false);
-            if (IsProfileSwitchInProgress || !ReferenceEquals(Modem, modem) ||
+                modem, selectedSim, probe, endpoint, ct: ct,
+                securityBackend: securityBackend, diagnosticLog: diagnosticLog,
+                enableSmsReceiver: enableSmsReceiver, retryGate: _hostImsRetryGate).ConfigureAwait(false);
+            if (!IsHostImsPppOwnerCurrent(pppLease))
+            {
+                client.Invalidate();
+                await client.DisposeAsync().ConfigureAwait(false);
+                throw new InvalidOperationException("The managed IMS bearer owner changed during registration.");
+            }
+            if (Volatile.Read(ref _hostImsPppLease) is { } mediaLease &&
+                !mediaLease.Completion.IsCompleted)
+            {
+                if (mediaLease.Bearer is not { } mediaBearer ||
+                    !mediaBearer.LocalAddress.Equals(endpoint.LocalAddress) ||
+                    !mediaBearer.PcscfAddresses.Contains(endpoint.PcscfAddress) ||
+                    client.InterfaceIndex != mediaBearer.InterfaceIndex ||
+                    client.Transport.BoundInterfaceIndex != mediaBearer.InterfaceIndex ||
+                    mediaBearer.InterfaceLuid is { } mediaLuid && client.InterfaceLuid != mediaLuid)
+                {
+                    client.Invalidate();
+                    await client.DisposeAsync().ConfigureAwait(false);
+                    throw new InvalidOperationException("Host IMS registration did not use the active PPP bearer; media routing was refused.");
+                }
+                client.AttachMediaRouteProvisioner(mediaLease.EnsureMediaRouteAsync);
+                client.AttachMediaRouteClearer(mediaLease.ClearMediaRoutesAsync);
+            }
+            if (IsProfileSwitchInProgress || Volatile.Read(ref _hostImsPppTransition) != 0 ||
+                !IsHostImsPppOwnerCurrent(pppLease) ||
+                !ReferenceEquals(Modem, modem) ||
                 Sim?.Iccid != expectedIccid || Sim.Imsi != expectedImsi)
             {
                 client.Invalidate();
@@ -1043,18 +1605,38 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             }
 
             client.Registration.RegistrationFailed += (_, error) =>
+            {
+                if (!ReferenceEquals(Volatile.Read(ref _hostImsRegistration), client)) return;
                 Volatile.Write(ref _hostImsRegistrationError, error);
+                _ = RestoreHostImsAfterRefreshFailureAsync(client, error);
+            };
             client.Transport.IncomingRequestReceived += OnHostImsIncomingRequest;
+            _hostImsIncomingSmsHandler = incoming => OnHostImsSmsReceived(client, expectedIccid, incoming);
+            client.IncomingSmsReceived += _hostImsIncomingSmsHandler;
+            client.SmsStatusReportReceived += OnHostImsSmsStatusReportReceived;
+            client.SmsDeliveryReportAccepted += OnHostImsSmsDeliveryReportAccepted;
             _hostImsRegisteredModem = modem;
             _hostImsRegisteredIccid = expectedIccid;
             _hostImsRegisteredImsi = expectedImsi;
             Volatile.Write(ref _hostImsRegistrationError, null);
             Volatile.Write(ref _hostImsRegistration, client);
-            if (IsProfileSwitchInProgress || !ReferenceEquals(Modem, modem) ||
+            Volatile.Write(ref _hostImsLossKind, (int)HostImsLossKind.None);
+            if (IsProfileSwitchInProgress || Volatile.Read(ref _hostImsPppTransition) != 0 ||
+                !IsHostImsPppOwnerCurrent(pppLease) ||
+                !ReferenceEquals(Modem, modem) ||
                 Sim?.Iccid != expectedIccid || Sim.Imsi != expectedImsi)
             {
                 await StopHostImsRegistrationCoreAsync().ConfigureAwait(false);
                 throw new InvalidOperationException("The selected SIM or modem changed during Host IMS registration.");
+            }
+            // Refreshing begins in RegisterWithCardAsync, before this slot can
+            // attach its failure callback. Catch an unusually short grant that
+            // expired in that handoff window and release its PPP owner too.
+            if (!client.IsRegistered)
+            {
+                const string error = "Host IMS registration expired during slot activation.";
+                _ = RestoreHostImsAfterRefreshFailureAsync(client, error);
+                throw new InvalidOperationException(error);
             }
             return GetHostImsRegistrationStatus();
         }
@@ -1066,14 +1648,65 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         finally { _hostImsRegistrationGate.Release(); }
     }
 
+    public static HostImsEndpointCandidate? SelectHostImsEndpoint(
+        IReadOnlyList<HostImsEndpointCandidate> routeVerifiedCandidates,
+        HostImsEndpointCandidate? selectedEndpoint,
+        WindowsHostImsPppBearerInfo? pppBearer,
+        IReadOnlyList<HostImsRouteCheck>? routeChecks = null)
+    {
+        if (pppBearer is not null)
+        {
+            if (pppBearer.InterfaceIndex <= 0 || pppBearer.InterfaceLuid is 0) return null;
+            // The managed CID 5 lease has already verified the Windows address and
+            // P-CSCF host routes. Respect the modem's advertised P-CSCF order.
+            var owned = routeVerifiedCandidates.Where(candidate =>
+                candidate.ContextId == 5 && candidate.LocalAddress.Equals(pppBearer.LocalAddress) &&
+                pppBearer.PcscfAddresses.Contains(candidate.PcscfAddress) &&
+                routeChecks?.Any(route => route.Endpoint == candidate && route.IsVerified &&
+                    route.InterfaceIndex == pppBearer.InterfaceIndex &&
+                    (pppBearer.InterfaceLuid is null || route.InterfaceLuid == pppBearer.InterfaceLuid)) == true).ToArray();
+            if (selectedEndpoint is not null)
+                return owned.Contains(selectedEndpoint) ? selectedEndpoint : null;
+            foreach (var pcscf in pppBearer.PcscfAddresses)
+            {
+                var match = owned.FirstOrDefault(candidate =>
+                    candidate.PcscfAddress.Equals(pcscf));
+                if (match is not null) return match;
+            }
+            return null;
+        }
+        if (selectedEndpoint is not null)
+            return routeVerifiedCandidates.Contains(selectedEndpoint) ? selectedEndpoint : null;
+        return routeVerifiedCandidates.Count == 1 ? routeVerifiedCandidates[0] : null;
+    }
+
+    private static HostImsProbeResult BindHostImsProbeToBearer(HostImsProbeResult probe,
+        WindowsHostImsPppBearerInfo bearer) => probe with
+        {
+            OwnedInterfaceIndex = bearer.InterfaceIndex,
+            OwnedInterfaceLuid = bearer.InterfaceLuid,
+            RouteChecks = HostImsRouteVerifier.Check(probe.EndpointCandidates,
+                bearer.InterfaceIndex, bearer.InterfaceLuid)
+        };
+
+    internal bool IsHostImsPppOwnerCurrent(WindowsHostImsPppBearerLease? expected) =>
+        ReferenceEquals(Volatile.Read(ref _hostImsPppLease), expected) &&
+        (expected is null || !expected.IsLost && !expected.Completion.IsCompleted && expected.Bearer is not null);
+
     public async Task StopHostImsRegistrationAsync()
+    {
+        NotifyHostImsManualStop();
+        await StopHostImsRegistrationWithSignalingAsync().ConfigureAwait(false);
+    }
+
+    private async Task StopHostImsRegistrationWithSignalingAsync()
     {
         // A dial attempt holds the registration gate until INVITE completes.
         // End it before waiting for that gate, otherwise Stop can stall for
         // the entire SIP transaction timeout while the bearer keeps sending.
         if (Calls.IsHostImsCall)
         {
-            var canSignalNow = HostImsCardMatchesCurrentSlot() && !IsProfileSwitchInProgress;
+            var canSignalNow = CanSignalHostImsDuringStop();
             try { await Calls.HangupAsync(sendSignaling: canSignalNow).ConfigureAwait(false); }
             catch (Exception ex)
             {
@@ -1084,7 +1717,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         await _hostImsRegistrationGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            var canSignal = HostImsCardMatchesCurrentSlot() && !IsProfileSwitchInProgress;
+            var canSignal = CanSignalHostImsDuringStop();
             if (Calls.IsHostImsCall)
             {
                 try { await Calls.HangupAsync(sendSignaling: canSignal).ConfigureAwait(false); }
@@ -1095,6 +1728,15 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
                 }
             }
             var client = Volatile.Read(ref _hostImsRegistration);
+            if (client is null)
+            {
+                // PPP stop already released this registration. Do not erase a
+                // confirmed (or failed) remote de-registration on an idempotent
+                // second stop; a new registration flow clears it explicitly.
+                if (Volatile.Read(ref _hostImsRemoteDeregistration) < 0)
+                    Volatile.Write(ref _hostImsRegistrationError, null);
+                return;
+            }
             var hadRegistration = client?.IsRegistered == true;
             var remoteDeregistered = false;
             string? deregistrationError = null;
@@ -1126,6 +1768,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
     private async Task StopHostImsRegistrationLocallyAsync()
     {
+        InvalidateSmsIdentity();
         if (Calls.IsHostImsCall)
         {
             try { await Calls.HangupAsync(sendSignaling: false).ConfigureAwait(false); }
@@ -1162,6 +1805,10 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         if (client is not null)
         {
             client.Transport.IncomingRequestReceived -= OnHostImsIncomingRequest;
+            if (_hostImsIncomingSmsHandler is { } smsHandler) client.IncomingSmsReceived -= smsHandler;
+            _hostImsIncomingSmsHandler = null;
+            client.SmsStatusReportReceived -= OnHostImsSmsStatusReportReceived;
+            client.SmsDeliveryReportAccepted -= OnHostImsSmsDeliveryReportAccepted;
             client.Invalidate();
             await client.DisposeAsync().ConfigureAwait(false);
         }
@@ -1176,6 +1823,43 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         sim.Iccid == _hostImsRegisteredIccid &&
         sim.Imsi == _hostImsRegisteredImsi;
 
+    private bool CanSignalHostImsDuringStop() =>
+        HostImsCardMatchesCurrentSlot() && !IsProfileSwitchInProgress &&
+        Volatile.Read(ref _hostImsPppLease)?.IsLost != true;
+
+    internal static bool IsPppOwnerAvailableForSignaling(Task<int>? ownerCompletion) =>
+        ownerCompletion is null || !ownerCompletion.IsCompleted;
+
+    private void OnHostImsSmsReceived(HostImsRegistrationClient source, string sourceIccid, IncomingSms incoming)
+    {
+        if (!ReferenceEquals(Volatile.Read(ref _hostImsRegistration), source) || !source.IsRegistered ||
+            !HostImsCardMatchesCurrentSlot()) return;
+        var message = new SmsMessage(
+            Index: -Interlocked.Increment(ref _nextHostImsSmsIndex),
+            Status: SmsStatus.Unread,
+            SenderOrRecipient: incoming.SenderNumber,
+            Text: incoming.Text,
+            Timestamp: incoming.Timestamp,
+            RawPdu: incoming.RawPdu,
+            Direction: SmsDirection.Received,
+            ServiceCenterTimestamp: incoming.ServiceCenterTimestamp,
+            Concat: incoming.Concat,
+            Id: $"host-ims-{Guid.NewGuid():N}");
+        RaiseReceivedSms(new SmsReceivedEventArgs(message, Id, SmsSubscriptionIdentity.ForIccid(sourceIccid)));
+    }
+
+    private void OnHostImsSmsStatusReportReceived(SmsStatusReport report)
+    {
+        if (Volatile.Read(ref _hostImsRegistration)?.IsRegistered != true ||
+            !HostImsCardMatchesCurrentSlot()) return;
+        try { SmsStatusReportReceived?.Invoke(this, new SmsStatusReportEventArgs(report, Id)); }
+        catch { }
+    }
+
+    private void OnHostImsSmsDeliveryReportAccepted(int sipCode) =>
+        _eventBus.Publish(EventTopics.SystemLog, "Host IMS",
+            $"Slot {Id}: SMS RP delivery report acknowledged by network with SIP {sipCode}.");
+
     private void OnHostImsIncomingRequest(object? sender, SipMessage request)
     {
         var client = Volatile.Read(ref _hostImsRegistration);
@@ -1186,6 +1870,10 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     private async Task RouteHostImsIncomingRequestAsync(
         HostImsRegistrationClient client, SipMessage request)
     {
+        var method = request.Method.ToUpperInvariant();
+        if (method is "INVITE" or "PRACK" or "UPDATE" or "CANCEL" or "BYE" or "ACK")
+            _eventBus.Publish(EventTopics.SystemLog, "Host IMS",
+                $"Slot {Id}: incoming SIP {method}; call-state={Calls.State}; registered={client.IsRegistered}; no headers or subscriber identity logged.");
         if (!ReferenceEquals(Volatile.Read(ref _hostImsRegistration), client) ||
             !client.IsRegistered || !HostImsCardMatchesCurrentSlot() || IsProfileSwitchInProgress)
             return;
@@ -1193,7 +1881,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         Task Reply(SipMessage response) => client.Transport.SendAsync(response);
         try
         {
-            switch (request.Method.ToUpperInvariant())
+            switch (method)
             {
                 case "INVITE":
                     await Calls.HandleIncomingInviteAsync(request, client, Reply).ConfigureAwait(false);
@@ -1208,12 +1896,19 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
                         await Reply(request.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
                     break;
                 case "UPDATE":
-                    if (Calls.State is CallState.Active or CallState.Held)
+                    if (Calls.State is CallState.Incoming or CallState.Dialing or CallState.Ringing or CallState.Active or CallState.Held)
                         await Calls.HandleIncomingUpdateAsync(request, Reply).ConfigureAwait(false);
                     else
                         await Reply(request.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
                     break;
+                case "MESSAGE":
+                    await client.HandleIncomingSmsReportAsync(request, Reply).ConfigureAwait(false);
+                    break;
+                case "PRACK":
+                    await Calls.HandleIncomingPrackAsync(request, Reply).ConfigureAwait(false);
+                    break;
                 case "ACK":
+                    Calls.HandleIncomingAck(request);
                     break;
                 case "OPTIONS":
                 case "NOTIFY":
@@ -1235,7 +1930,11 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     /// Refreshes SIM identity (e.g. after profile or slot switch) by querying IMSI and ICCID.
     /// </summary>
     public async Task<bool> RefreshSimAsync(CancellationToken ct = default)
+        => await RunSmsSourceMutationAsync(RefreshSimCoreAsync, ct).ConfigureAwait(false);
+
+    private async Task<bool> RefreshSimCoreAsync(CancellationToken ct)
     {
+        InvalidateSmsIdentity();
         if (IsPcscReader)
         {
             if (Aka is not PcscAkaProvider pcsc)
@@ -1423,14 +2122,14 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         VoWifi.ProxyUrl = ProxyUrl;
         VoWifi.AkaProvider = Aka;
         VoWifi.DeviceImei = VoWifiImei;
-        if (!await Aka.CheckReadyAsync(Sim.Iccid, ct).ConfigureAwait(false))
+        var canReadReady = true;
+        try { await VoWifi.PreflightIkeRetryAsync(Sim, customEpdg, ct).ConfigureAwait(false); }
+        catch (IkeRetryGateException) { canReadReady = false; } // Manager records the user's start intent and wait/pause state below.
+        if (canReadReady && !await Aka.CheckReadyAsync(Sim.Iccid, ct).ConfigureAwait(false))
             throw new InvalidOperationException(
                 $"Slot {Id} live USIM does not match the refreshed VoWiFi identity. Registration was blocked before EAP-AKA.");
 
-        var candidates = new List<SimIdentity>();
-        AddCandidate(VoWifiIdentityOverride);
-        foreach (var learned in _identityHistory.GetCandidates(Sim)) AddCandidate(learned);
-        AddCandidate(Sim);
+        var candidates = BuildVoWifiIdentityCandidates();
 
         bool started = await VoWifi.StartVoWifiAsync(candidates, customEpdg, suite, proxyUrl: ProxyUrl, ct: ct).ConfigureAwait(false);
         if (started)
@@ -1439,16 +2138,25 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             var successfulImsi = VoWifi.EpdgInfo?.Impi.Split('@')[0];
             var successfulIdentity = candidates.FirstOrDefault(candidate => candidate.Imsi == successfulImsi);
             if (successfulIdentity != null)
+            {
+                var discoveredHome = VoWifi.EpdgInfo!;
+                if (EpdgResolver.BuildHomePlmnCandidates(successfulIdentity).Contains((discoveredHome.HomeMcc, discoveredHome.HomeMnc)))
+                    successfulIdentity = successfulIdentity with { Mcc = discoveredHome.HomeMcc, Mnc = discoveredHome.HomeMnc };
                 _identityHistory.MarkSuccessful(successfulIdentity);
+            }
         }
         return started;
 
-        void AddCandidate(SimIdentity? identity)
-        {
-            if (identity != null && identity.Iccid == Sim.Iccid &&
-                candidates.All(candidate => candidate.Imsi != identity.Imsi))
-                candidates.Add(identity);
-        }
+    }
+
+    internal IReadOnlyList<SimIdentity> BuildVoWifiIdentityCandidates()
+    {
+        if (Sim is not { } live) return [];
+        return _identityHistory.GetCandidates(live, successfulOnly: true)
+            .Concat(new[] { live, VoWifiIdentityOverride }.OfType<SimIdentity>())
+            .Concat(_identityHistory.GetCandidates(live))
+            .Where(identity => identity.Iccid == live.Iccid)
+            .DistinctBy(identity => identity.Imsi, StringComparer.Ordinal).ToArray();
     }
 
     private async Task RecoverSimIdentityForVoWifiAsync(CancellationToken ct)
@@ -1507,7 +2215,8 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         try
         {
             var client = _hostImsRegistration;
-            if (client?.IsRegistered != true || IsProfileSwitchInProgress ||
+            if (client?.IsRegistered != true || Volatile.Read(ref _hostImsPppLease)?.IsLost == true ||
+                IsProfileSwitchInProgress ||
                 !HostImsCardMatchesCurrentSlot())
                 throw new InvalidOperationException($"Slot {Id} has no active Host IMS registration on a stable modem and SIM.");
             SetState(SlotState.Busy);
@@ -1521,12 +2230,40 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         finally { _hostImsRegistrationGate.Release(); }
     }
 
+    /// <summary>Explicit experimental MO SMS over the Windows Host IMS SIP session.</summary>
+    public async Task<SmsSubmitResult> SendHostImsSmsAsync(
+        string recipient, string text, bool requestStatusReport = false,
+        CancellationToken ct = default)
+    {
+        await _hostImsRegistrationGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var client = _hostImsRegistration;
+            var modem = Modem;
+            if (client?.IsRegistered != true || modem is not { IsOpen: true } ||
+                Volatile.Read(ref _hostImsPppLease)?.IsLost == true ||
+                IsProfileSwitchInProgress || !HostImsCardMatchesCurrentSlot())
+                throw new InvalidOperationException($"Slot {Id} has no stable Windows Host IMS registration for SMS.");
+            var smsc = await modem.GetSmsCenterAsync(ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(smsc))
+                throw new InvalidOperationException("The selected SIM did not provide an SMS centre; no IMS SMS was sent.");
+            if (!ReferenceEquals(client, _hostImsRegistration) ||
+                !HostImsCardMatchesCurrentSlot())
+                throw new InvalidOperationException("The Host IMS card changed before SMS submission; no SMS was sent.");
+            return await client.SendSmsOverImsAsync(recipient, text, smsc,
+                requestStatusReport, ct).ConfigureAwait(false);
+        }
+        finally { _hostImsRegistrationGate.Release(); }
+    }
+
     /// <summary>
     /// Dials through the cellular baseband and emits the same call events used
     /// by VoWiFi so GUI clients have one transport-independent call model.
     /// </summary>
     public async Task<CallInfo> DialCellularAsync(string number, CancellationToken ct = default)
     {
+        if (IsHostImsPppTransitionOrActive)
+            throw new InvalidOperationException("Cellular AT dialing is unavailable while Windows owns the IMS PPP bearer; stop the experimental bearer first.");
         if (Modem == null || !Modem.IsOpen)
             throw new InvalidOperationException($"Slot {Id} cellular modem is not ready.");
 
@@ -1865,7 +2602,13 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     /// Sets flight mode (airplane mode) for this slot.
     /// </summary>
     public async Task<bool> SetFlightModeAsync(bool enabled, CancellationToken ct = default)
+        => await RunSmsSourceMutationAsync(token => SetFlightModeCoreAsync(enabled, token), ct).ConfigureAwait(false);
+
+    private async Task<bool> SetFlightModeCoreAsync(bool enabled, CancellationToken ct)
     {
+        InvalidateSmsIdentity();
+        if (IsHostImsPppTransitionOrActive)
+            throw new InvalidOperationException("Stop the Windows Host IMS PPP bearer before changing flight mode.");
         if (IsPcscReader)
             throw new InvalidOperationException("PC/SC 读卡器没有蜂窝射频，无法切换飞行模式。");
         if (Modem == null || !Modem.IsOpen) return false;
@@ -1881,7 +2624,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             }
             else
             {
-                await RefreshSimAsync(ct).ConfigureAwait(false);
+                await RefreshSimCoreAsync(ct).ConfigureAwait(false);
                 await RefreshMetricsAsync(ct).ConfigureAwait(false);
             }
         }
@@ -1893,6 +2636,8 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     /// </summary>
     public async Task<bool> SetCellularDataEnabledAsync(bool enabled, CancellationToken ct = default)
     {
+        if (IsHostImsPppTransitionOrActive)
+            throw new InvalidOperationException("Stop the Windows Host IMS PPP bearer before changing packet attachment.");
         if (IsPcscReader)
             throw new NotSupportedException("PC/SC 卡槽没有蜂窝数据附着功能。");
         if (Modem == null || !Modem.IsOpen || IsFlightMode) return false;
@@ -1949,7 +2694,11 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     /// Soft-reboots the modem via AT+CFUN=1,1.
     /// </summary>
     public async Task<bool> RebootAsync(CancellationToken ct = default)
+        => await RunSmsSourceMutationAsync(RebootCoreAsync, ct).ConfigureAwait(false);
+
+    private async Task<bool> RebootCoreAsync(CancellationToken ct)
     {
+        InvalidateSmsIdentity();
         if (IsPcscReader)
             throw new NotSupportedException("PC/SC 卡槽没有可重启的蜂窝模组。");
         if (Modem == null || !Modem.IsOpen) return false;
@@ -1991,16 +2740,18 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
     {
         var mgr = GetOrCreateEuiccManager();
         if (mgr == null) throw new InvalidOperationException("当前卡槽未就绪，无法访问 eUICC 芯片。");
-        var inventory = await mgr.GetInventoryAsync(ct).ConfigureAwait(false);
-        return inventory.First().Eid;
+        await _euiccProbeGate.WaitAsync(ct).ConfigureAwait(false);
+        try { return (await ReadEuiccInventoryAndRestoreUsimAsync(mgr, ct).ConfigureAwait(false)).First().Eid; }
+        finally { _euiccProbeGate.Release(); }
     }
 
     public async Task<IReadOnlyList<Profile>> GetEuiccProfilesAsync(CancellationToken ct = default)
     {
         var mgr = GetOrCreateEuiccManager();
         if (mgr == null) return Array.Empty<Profile>();
-        var inventory = await mgr.GetInventoryAsync(ct).ConfigureAwait(false);
-        return inventory.SelectMany(entry => entry.Profiles).ToArray();
+        await _euiccProbeGate.WaitAsync(ct).ConfigureAwait(false);
+        try { return (await ReadEuiccInventoryAndRestoreUsimAsync(mgr, ct).ConfigureAwait(false)).SelectMany(entry => entry.Profiles).ToArray(); }
+        finally { _euiccProbeGate.Release(); }
     }
 
     /// <summary>
@@ -2034,7 +2785,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
             try
             {
-                inventory = await mgr.GetInventoryAsync(ct).ConfigureAwait(false);
+                inventory = await ReadEuiccInventoryAndRestoreUsimAsync(mgr, ct).ConfigureAwait(false);
                 eids = inventory.Select(entry => entry.Eid).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
                 eid = eids.FirstOrDefault();
             }
@@ -2099,6 +2850,35 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
         }
     }
 
+    private async Task<IReadOnlyList<EuiccInventoryEntry>> ReadEuiccInventoryAndRestoreUsimAsync(
+        EuiccManager manager, CancellationToken ct)
+    {
+        var originalUsim = Aka as Ec25AkaProvider;
+        var originalModem = Modem;
+        try { return await manager.GetInventoryAsync(ct).ConfigureAwait(false); }
+        finally
+        {
+            // Inventory must not leave a verified modem's baseband USIM view
+            // unusable. Restore before returning to preference/radio restoration;
+            // waiting for CPIN to fail first is too late on affected EC20 firmware.
+            if (originalUsim != null && ReferenceEquals(Aka, originalUsim) &&
+                ReferenceEquals(Modem, originalModem) && originalModem is { IsOpen: true } &&
+                Sim != null && !IsProfileSwitchInProgress)
+            {
+                using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                try
+                {
+                    if (!await originalUsim.RestoreBasicUsimApplicationAsync(cleanup.Token).ConfigureAwait(false))
+                        _eventBus.Publish(EventTopics.SystemLog, "SIM", $"Slot {Id}: USIM application restoration after eUICC probe was not confirmed; registration still requires full SIM readiness verification.");
+                }
+                catch (Exception ex)
+                {
+                    _eventBus.Publish(EventTopics.SystemLog, "SIM", $"Slot {Id}: USIM application restoration after eUICC probe failed ({ex.GetType().Name}); no profile or identity was changed.");
+                }
+            }
+        }
+    }
+
     private EuiccProbeResult CompleteEuiccProbe(
         EuiccCapability capability,
         string? eid,
@@ -2141,10 +2921,13 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
     public async Task<bool> SwitchEuiccProfileAsync(string iccidOrAid, bool refresh = true, CancellationToken ct = default, string? euiccAid = null)
     {
+        using var smsMutation = BeginSmsSourceMutation();
         await _profileSwitchGate.WaitAsync(ct).ConfigureAwait(false);
         Interlocked.Exchange(ref _profileSwitchInProgress, 1);
         try
         {
+            if (_hostImsPppLease is not null)
+                throw new InvalidOperationException("Stop the Windows Host IMS PPP bearer before switching an eUICC profile.");
             await StopHostImsRegistrationLocallyAsync().ConfigureAwait(false);
             if (!IsPcscReader && (Modem == null || !Modem.IsOpen))
                 throw new InvalidOperationException("当前卡槽模组未就绪。");
@@ -2179,7 +2962,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
             {
                 // PC/SC has no baseband to refresh. Re-read EF.ICCID/EF.IMSI
                 // from the card itself and reject an unexpected active profile.
-                await RefreshSimAsync(ct).ConfigureAwait(false);
+                await RefreshSimCoreAsync(ct).ConfigureAwait(false);
                 if (Sim == null || (expectedIccid != null &&
                     !string.Equals(NormalizeIccidCandidate(Sim.Iccid), expectedIccid, StringComparison.Ordinal)))
                 {
@@ -2428,7 +3211,7 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
         identity = identity with { HasPlmnConflict = HasImsiPlmnConflict };
         Sim = identity;
-        _identityHistory.Observe(identity);
+        _identityHistory.ObserveProfileIdentities(identity);
         VoWifiIdentityOverride = _identityHistory.GetCandidates(identity)
             .FirstOrDefault(candidate => candidate.Imsi != identity.Imsi);
         try { SimChanged?.Invoke(this, new SimStateChangedEventArgs(identity, 1, "READY", Id)); } catch { }
@@ -2455,17 +3238,34 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
     public async Task<bool> DisableEuiccProfileAsync(string iccidOrAid, bool refresh = true, CancellationToken ct = default, string? euiccAid = null)
     {
-        var targetEuicc = await GetVerifiedEuiccManagerAsync(iccidOrAid, euiccAid, ct).ConfigureAwait(false);
-        await targetEuicc.Manager.DisableProfileAsync(iccidOrAid, targetEuicc.Aid, refresh, ct).ConfigureAwait(false);
-        await RefreshSimAsync(ct).ConfigureAwait(false);
-        return true;
+        using var smsMutation = BeginSmsSourceMutation();
+        await _profileSwitchGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            InvalidateSmsIdentity();
+            var targetEuicc = await GetVerifiedEuiccManagerAsync(iccidOrAid, euiccAid, ct).ConfigureAwait(false);
+            await targetEuicc.Manager.DisableProfileAsync(iccidOrAid, targetEuicc.Aid, refresh, ct).ConfigureAwait(false);
+            Sim = null;
+            await RefreshSimCoreAsync(ct).ConfigureAwait(false);
+            return true;
+        }
+        finally { _profileSwitchGate.Release(); }
     }
 
     public async Task<bool> DeleteEuiccProfileAsync(string iccidOrAid, CancellationToken ct = default, string? euiccAid = null)
     {
-        var targetEuicc = await GetVerifiedEuiccManagerAsync(iccidOrAid, euiccAid, ct).ConfigureAwait(false);
-        await targetEuicc.Manager.DeleteProfileAsync(iccidOrAid, targetEuicc.Aid, ct).ConfigureAwait(false);
-        return true;
+        using var smsMutation = BeginSmsSourceMutation();
+        await _profileSwitchGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            InvalidateSmsIdentity();
+            var targetEuicc = await GetVerifiedEuiccManagerAsync(iccidOrAid, euiccAid, ct).ConfigureAwait(false);
+            await targetEuicc.Manager.DeleteProfileAsync(iccidOrAid, targetEuicc.Aid, ct).ConfigureAwait(false);
+            Sim = null;
+            await RefreshSimCoreAsync(ct).ConfigureAwait(false);
+            return true;
+        }
+        finally { _profileSwitchGate.Release(); }
     }
 
     public async Task<bool> RenameEuiccProfileAsync(string iccidOrAid, string nickname, CancellationToken ct = default, string? euiccAid = null)
@@ -2589,9 +3389,18 @@ public class ModemSlot : IAsyncDisposable, INotifyPropertyChanged
 
     public async ValueTask DisposeAsync()
     {
+        InvalidateSmsIdentity();
+        NotifyHostImsManualStop();
         _cellularCallMonitorCts?.Cancel();
-        try { await StopHostImsRegistrationLocallyAsync().ConfigureAwait(false); } catch { }
-        try { await HangupAsync().ConfigureAwait(false); } catch { }
+        if (Volatile.Read(ref _applicationExitRequested) != 0)
+        {
+            try { await StopHostImsRegistrationWithSignalingAsync().ConfigureAwait(false); } catch { }
+        }
+        else
+            try { await StopHostImsRegistrationLocallyAsync().ConfigureAwait(false); } catch { }
+        try { await StopHostImsPppBearerAsync().ConfigureAwait(false); } catch { }
+        if (Volatile.Read(ref _applicationExitRequested) == 0)
+            try { await HangupAsync().ConfigureAwait(false); } catch { }
         try { await VoWifi.StopVoWifiAsync().ConfigureAwait(false); } catch { }
         VoWifi.Dispose();
         Calls.Dispose();

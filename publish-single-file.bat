@@ -13,13 +13,16 @@ if "%~1"=="" (
 
 set "VOWIN_VERSION=%~1"
 
-if exist "publish\win-x64\VoWin.exe" (
-    del /f /q "publish\win-x64\VoWin.exe" 2>nul
-)
+pwsh -NoProfile -File packaging/Prepare-RuntimeBundle.ps1
+if errorlevel 1 exit /b 1
 
-dotnet publish VoWin/VoWin.csproj -c Release -r win-x64 --self-contained false -p:Version=%VOWIN_VERSION% -o publish/win-x64
+dotnet publish VoWin/VoWin.csproj -c Release -r win-x64 --self-contained false -p:Version=%VOWIN_VERSION% -p:VoWinRuntimeBundle="%~dp0packaging\runtime.zip" -o publish/win-x64
 
 if %ERRORLEVEL% equ 0 (
+    for %%F in ("publish\win-x64\VoWin.exe") do if %%~zF GTR 33554432 (
+        echo [ERROR] VoWin.exe exceeded the 32 MiB release size budget.
+        exit /b 1
+    )
     echo.
     echo ==========================================
     echo [SUCCESS] Single-file executable ready!

@@ -1,4 +1,5 @@
 using System.Net;
+using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 using VoSharp.Common.Events;
@@ -27,6 +28,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     public AsyncEventBus? EventBus { get; }
     public bool IsIncoming => ActiveCall != null && !ActiveCall.IsOutgoing;
     public bool IsHostImsCall => _currentHostIms is not null && ActiveCall is not null;
+    public RtpMediaStats? GetMediaStats() => _rtp?.GetMediaStats();
     public bool SaveAudioRecordings { get; private set; } = true;
     public string? RecordingDirectory { get; private set; }
 
@@ -75,6 +77,8 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     private int _outgoingInviteProvisionalReceived;
     private int _outgoingInviteFinalReceived;
     private int _outgoingInviteCancelSent;
+    private CancellationTokenSource? _outgoingInviteDrain;
+    private string? _outgoingEarlyAnswerSdp;
     private readonly object _prackGate = new();
     private readonly HashSet<string> _reliableProvisionals = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _recordingRetentionGate = new(1, 1);
@@ -90,6 +94,13 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     private SipMessage? _incomingInvite;
     private Func<SipMessage, Task>? _incomingReplySender;
     private string? _remoteOfferSdp;
+    private volatile bool _incomingAnswerAwaitingAck;
+    private volatile bool _incomingQosEarlyAnswer;
+    private volatile bool _incomingPrackReceived;
+    private volatile bool _incomingQosSatisfied;
+    private int _incomingRingingStarted;
+    private const int IncomingReliableRseq = 1;
+    private int _incomingReliableOutstandingRseq;
 
     public ImsCallManager(AsyncEventBus? eventBus = null)
     {
@@ -102,6 +113,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     {
         SaveAudioRecordings = enabled;
         RecordingDirectory = string.IsNullOrWhiteSpace(directory) ? null : directory.Trim();
+        _audio.SetRecordingEnabled(enabled);
     }
 
     /// <summary>
@@ -128,24 +140,31 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     }
 
     /// <summary>Places a call over an already registered Windows-owned cellular IMS bearer.</summary>
-    public Task<CallInfo> DialAsync(
+    public async Task<CallInfo> DialAsync(
         string number,
         HostImsRegistrationClient hostIms,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(hostIms);
-        var result = hostIms.CurrentResult
-            ?? throw new InvalidOperationException("Host IMS registration is not active.");
+        if (!hostIms.IsRegistered)
+            throw new InvalidOperationException("Host IMS registration is not active.");
         var transport = hostIms.Transport;
         if (transport.BoundInterfaceIndex is not > 0 ||
             transport.LocalEndPoint?.Address.Equals(hostIms.Endpoint.LocalAddress) != true)
             throw new InvalidOperationException("Host IMS signaling is not bound to a verified cellular interface.");
+        // A cell can change between the last REGISTER and this call. Do not
+        // announce the previous cell in PANI on a new originating INVITE.
+        var preparation = Stopwatch.StartNew();
+        await hostIms.RefreshAccessNetworkInfoAsync(ct, TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+        hostIms.Registration.TraceCallSetup($"Host IMS access metadata prepared; elapsed={preparation.ElapsedMilliseconds}ms.");
+        var result = hostIms.CurrentResult
+            ?? throw new InvalidOperationException("Host IMS registration ended before the call started.");
         var profile = hostIms.Profile;
         var access = new ImsDialAccess(transport, hostIms.Endpoint.LocalAddress.ToString(),
             profile.HomeDomain, profile.PrivateIdentity, profile.PublicIdentity,
             result.ContactUri, result.ServiceRoute, result.PAssociatedUri,
             profile.PAccessNetworkInfo, null, hostIms, transport.BoundInterfaceIndex);
-        return DialCoreAsync(number, access, ct);
+        return await DialCoreAsync(number, access, ct).ConfigureAwait(false);
     }
 
     private sealed record ImsDialAccess(
@@ -190,17 +209,19 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         _remoteDialogCseq = 0;
         _dialogRoutes = null;
         _dialogTargetUri = null;
+        _outgoingEarlyAnswerSdp = null;
         CancelSessionTimer();
 
         var startedAt = DateTime.UtcNow;
+        var setupClock = Stopwatch.StartNew();
 
         // BUG-20 FIX: clear recorded audio buffer before starting a new call
         _audio.ClearRecording();
         ReleaseRtpSession();
         _rtp = access.InterfaceIndex is { } interfaceIndex
             ? new RtpSession(_audio, EventBus, localAddress: IPAddress.Parse(access.LocalIp),
-                outgoingInterfaceIndex: interfaceIndex)
-            : new RtpSession(_audio, EventBus);
+                outgoingInterfaceIndex: interfaceIndex, recordAudio: SaveAudioRecordings)
+            : new RtpSession(_audio, EventBus, recordAudio: SaveAudioRecordings);
         AttachExternalMediaSink(_rtp);
         _currentVoWifi = access.VoWifi;
         _currentHostIms = access.HostIms;
@@ -289,8 +310,10 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             : access.PrivateIdentity.Split('@')[0];
         if (string.IsNullOrEmpty(contactUser)) contactUser = user;
 
+        var signalingReceivePort = access.HostIms?.Transport.ProtectedServerEndPoint?.Port
+            ?? signalingEndpoint.Port;
         var contactAddress = ExtractRegisteredContactAddress(access.ContactUri)
-            ?? $"{signalingHost}:{signalingEndpoint.Port}";
+            ?? $"{signalingHost}:{signalingReceivePort}";
         string contact = $"<sip:{contactUser}@{contactAddress};transport=udp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\";audio";
         if (!string.IsNullOrWhiteSpace(access.ContactUri))
         {
@@ -300,7 +323,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         }
 
         _currentLocalIp = signalingEndpoint.Address.ToString();
-        _currentSignalingPort = signalingEndpoint.Port;
+        _currentSignalingPort = signalingReceivePort;
         _targetUri = targetUri;
 
         var invite = new SipMessage
@@ -319,12 +342,12 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
 
         var branch = "z9hG4bK" + Guid.NewGuid().ToString("N")[..12];
         // An IPv6 address must be bracketed or "host:port" becomes ambiguous (RFC 3261 §25.1).
-        var inviteVia = $"SIP/2.0/UDP {signalingHost}:{signalingEndpoint.Port};branch={branch};rport";
+        var inviteVia = $"SIP/2.0/UDP {signalingHost}:{signalingReceivePort};branch={branch};rport";
         _dialogFrom = $"<{fromIdentity}>;tag={_currentFromTag}";
         _dialogTo = $"<{targetUri}>";
         _targetUri = targetUri;
         _currentLocalIp = signalingEndpoint.Address.ToString();
-        _currentSignalingPort = signalingEndpoint.Port;
+        _currentSignalingPort = signalingReceivePort;
 
         invite.SetHeader("Via",      inviteVia);
         invite.SetHeader("Max-Forwards", "70");
@@ -338,7 +361,9 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         invite.SetHeader("Accept-Contact",      "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"");
         if (!string.IsNullOrWhiteSpace(access.AccessNetworkInfo))
             invite.SetHeader("P-Access-Network-Info", access.AccessNetworkInfo);
-        invite.SetHeader("Allow",         "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, PRACK, UPDATE, INFO");
+        invite.SetHeader("Allow", access.HostIms is null
+            ? "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, PRACK, UPDATE, INFO"
+            : "INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE, INFO");
         invite.SetHeader("Supported",     "100rel, timer, replaces");
         invite.SetHeader("Session-Expires", "1800;refresher=uac");
         invite.SetHeader("Min-SE",        "90");
@@ -348,7 +373,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         invite.SetHeader("User-Agent",    "iPhone Pro/17");
         _pendingOutgoingInvite = invite;
 
-        Console.WriteLine($"[ImsCallManager] INVITE prepared for {targetUri} via IMS signalling port {signalingEndpoint.Port}.");
+        Console.WriteLine($"[ImsCallManager] INVITE prepared for {targetUri} via IMS receive port {signalingReceivePort}.");
 
         var wavPath = CreateRecordingPath(cleanNumber, isIncoming: false);
 
@@ -373,13 +398,42 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         {
             _callTransport = sipTransport; // reuse VoWiFi SIP transport
 
+            // Cancelling a bridge request means hang up, not discard the IMS
+            // transaction reader. Keep it alive for 487 or a late 200 (ACK/BYE).
+            using var cancellationDrain = new CancellationTokenSource();
+            Volatile.Write(ref _outgoingInviteDrain, cancellationDrain);
+            Task cancellationCleanup = Task.CompletedTask;
+            using var cancellationRegistration = ct.Register(() =>
+            {
+                cancellationDrain.CancelAfter(TimeSpan.FromSeconds(32));
+                cancellationCleanup = HangupAsync();
+            });
+
             try
             {
+                ct.ThrowIfCancellationRequested();
+                if (Volatile.Read(ref _outgoingInviteCancelled) != 0)
+                    throw new OperationCanceledException("IMS call ended before INVITE send.");
+                EventBus?.Publish(EventTopics.SystemLog, "ImsCallManager", "Outbound IMS INVITE starting; identities omitted.");
                 var finalResp = await sipTransport.SendAndReceiveFinalAsync(
                     invite,
                     onProvisional: prov =>
                     {
+                        EventBus?.Publish(EventTopics.SystemLog, "ImsCallManager",
+                            $"Outbound IMS provisional; status={prov.StatusCode}; elapsed={setupClock.ElapsedMilliseconds}ms; identities omitted.");
                         Volatile.Write(ref _outgoingInviteProvisionalReceived, 1);
+                        if (prov.StatusCode > 100 &&
+                            !string.IsNullOrWhiteSpace(ExtractTag(prov.GetHeader("To"))))
+                        {
+                            _dialogTo = prov.GetHeader("To");
+                            if (prov.Headers.TryGetValue("Record-Route", out var earlyRoutes) && earlyRoutes.Count > 0)
+                                _dialogRoutes = ParseRecordRoute(earlyRoutes, reverse: true);
+                            var earlyContact = prov.GetHeader("Contact");
+                            var earlyTarget = Regex.Match(earlyContact ?? string.Empty, @"<([^>]+)>");
+                            if (earlyTarget.Success) _dialogTargetUri = earlyTarget.Groups[1].Value.Trim();
+                            if (!string.IsNullOrWhiteSpace(prov.Body))
+                                _outgoingEarlyAnswerSdp = prov.Body;
+                        }
                         if (Volatile.Read(ref _outgoingInviteCancelled) != 0)
                         {
                             if (Volatile.Read(ref _outgoingInviteMaySignal) != 0)
@@ -387,7 +441,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
                             return;
                         }
                         if (RequiresReliableProvisional(prov))
-                            _ = SendPrackAsync(sipTransport, prov, ct);
+                            _ = SendPrackAsync(sipTransport, prov, cancellationDrain.Token);
                         if (prov.StatusCode is 180 or 183)
                         {
                             var old = State;
@@ -399,9 +453,12 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
                         }
                     },
                     timeoutMs: 30000,
-                    ct: ct
+                    provisionalTimeoutMs: 180000,
+                    ct: cancellationDrain.Token
                 ).ConfigureAwait(false);
                 Volatile.Write(ref _outgoingInviteFinalReceived, 1);
+                EventBus?.Publish(EventTopics.SystemLog, "ImsCallManager",
+                    $"Outbound IMS final; status={finalResp.StatusCode}; elapsed={setupClock.ElapsedMilliseconds}ms; cancelled={Volatile.Read(ref _outgoingInviteCancelled) != 0}.");
 
                 if (finalResp?.StatusCode == 200)
                 {
@@ -412,16 +469,12 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
                     _dialogFrom = invite.GetHeader("From") ?? "";
                     if (finalResp.Headers.TryGetValue("Record-Route", out var recordRoutes) && recordRoutes.Count > 0)
                     {
-                        _dialogRoutes = ParseAndReverseRecordRoute(recordRoutes);
+                        _dialogRoutes = ParseRecordRoute(recordRoutes, reverse: true);
                     }
-                    else if (invite.Headers.TryGetValue("Route", out var invRoutes) && invRoutes.Count > 0)
-                    {
-                        _dialogRoutes = invRoutes;
-                    }
-                    else if (!string.IsNullOrEmpty(access.ServiceRoute))
-                    {
-                        _dialogRoutes = [access.ServiceRoute];
-                    }
+                    // RFC 3261 §12.1.2: a final response without Record-Route
+                    // establishes an empty dialog route set. The REGISTER
+                    // Service-Route only applied to the initial INVITE.
+                    else _dialogRoutes = [];
 
                     // CANCEL can lose the race with a 200 OK. A user hangup
                     // still needs ACK then BYE, but a card-removal abort must
@@ -439,15 +492,29 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
                     }
 
                     // Send ACK (RFC 3261 §13.2.2.4)
-                    await SendAckAsync(sipTransport, invite, finalResp, ct).ConfigureAwait(false);
+                    await SendAckAsync(sipTransport, invite, finalResp, CancellationToken.None).ConfigureAwait(false);
 
                     // Extract remote RTP endpoint from SDP Answer
-                    try { SetRtpFromSdpAnswer(finalResp.Body ?? string.Empty); }
+                    try
+                    {
+                        await SetRtpFromSdpAnswerAsync(
+                            string.IsNullOrWhiteSpace(finalResp.Body) ? _outgoingEarlyAnswerSdp ?? string.Empty : finalResp.Body,
+                            cancellationDrain.Token,
+                            new HashSet<byte> { 102, 8, 0 }).ConfigureAwait(false);
+                    }
                     catch (InvalidOperationException)
                     {
-                        try { await sipTransport.SendAsync(BuildByeRequest(), ct).ConfigureAwait(false); }
+                        try { await sipTransport.SendAsync(BuildByeRequest(), CancellationToken.None).ConfigureAwait(false); }
                         catch { /* The local media session must still fail closed. */ }
                         throw;
+                    }
+
+                    // Cancellation can also win while route/media setup awaits.
+                    if (Volatile.Read(ref _outgoingInviteCancelled) != 0)
+                    {
+                        if (Volatile.Read(ref _outgoingInviteMaySignal) != 0)
+                            await sipTransport.SendAsync(BuildByeRequest(), CancellationToken.None).ConfigureAwait(false);
+                        throw new OperationCanceledException("IMS call ended during media setup.");
                     }
 
                     var codec = _rtp?.Codec ?? ExtractCodecFromSdp(finalResp.Body ?? string.Empty);
@@ -467,6 +534,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
                 }
                 else if (finalResp != null)
                 {
+                    await SendRejectedInviteAckAsync(sipTransport, invite, finalResp).ConfigureAwait(false);
                     if (Volatile.Read(ref _outgoingInviteCancelled) != 0)
                         throw new OperationCanceledException("IMS call was hung up before the network answered.");
                     CancelSessionTimer();
@@ -486,8 +554,12 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             {
                 if (Volatile.Read(ref _outgoingInviteCancelled) != 0)
                     throw new OperationCanceledException("IMS call setup ended after local hangup.");
+                // A ringing INVITE must not simply disappear locally when the
+                // post-provisional wait expires. Ask the network to clear it.
+                if (Volatile.Read(ref _outgoingInviteProvisionalReceived) != 0)
+                    await SendPendingCancelAsync(sipTransport).ConfigureAwait(false);
                 CancelSessionTimer();
-                // P-CSCF unreachable — call failed
+                // No final response arrived before the bounded setup deadline.
                 var old = State;
                 State      = CallState.Ended;
                 call       = (ActiveCall ?? call) with { State = CallState.Ended, EndedAt = DateTime.UtcNow };
@@ -497,8 +569,29 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
                 EventBus?.Publish("call.failed", "ImsCallManager", "INVITE timeout");
                 throw;
             }
+            catch (Exception ex)
+            {
+                // Transport errors, cancellation during setup and media errors
+                // must all emit a terminal event before finally clears ActiveCall.
+                // Otherwise the kernel/UI retain a call which can no longer hang up.
+                if (ActiveCall is { State: not CallState.Ended } failed)
+                {
+                    CancelSessionTimer();
+                    var old = State;
+                    State = CallState.Ended;
+                    ActiveCall = failed with { State = CallState.Ended, EndedAt = DateTime.UtcNow };
+                    NotifyCallStateChanged(old, CallState.Ended);
+                    NotifyCallEnded(ActiveCall, ex is OperationCanceledException ? "CANCEL" : "Call setup failed");
+                    EventBus?.Publish("call.ended", "ImsCallManager", ActiveCall);
+                }
+                throw;
+            }
             finally
             {
+                // Stop further callbacks before disposing their drain token.
+                await cancellationRegistration.DisposeAsync().ConfigureAwait(false);
+                Interlocked.CompareExchange(ref _outgoingInviteDrain, null, cancellationDrain);
+                try { await cancellationCleanup.ConfigureAwait(false); } catch { }
                 if (State is not (CallState.Active or CallState.Held))
                 {
                     ReleaseRtpSession();
@@ -559,11 +652,11 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             return;
         }
 
-        if (State is CallState.Active or CallState.Held or CallState.Dialing or CallState.Ringing)
+        if (State is CallState.Active or CallState.Held or CallState.Dialing or CallState.Incoming or CallState.Ringing)
         {
             if (string.Equals(_currentCallId, invite.GetHeader("Call-ID"), StringComparison.OrdinalIgnoreCase))
             {
-                if (State == CallState.Ringing)
+                if (State is CallState.Incoming or CallState.Ringing)
                 {
                     await replySender(invite.CreateResponse(491, "Request Pending")).ConfigureAwait(false);
                     return;
@@ -585,24 +678,19 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             }
 
             // Busy here (486)
-            var busyResp = new SipMessage
-            {
-                IsRequest = false,
-                StatusCode = 486,
-                ReasonPhrase = "Busy Here",
-                SipVersion = "SIP/2.0"
-            };
-            busyResp.SetHeader("Via", invite.GetHeader("Via") ?? string.Empty);
-            busyResp.SetHeader("From", invite.GetHeader("From") ?? string.Empty);
+            var busyResp = invite.CreateResponse(486, "Busy Here");
             busyResp.SetHeader("To", EnsureTag(invite.GetHeader("To") ?? string.Empty, Guid.NewGuid().ToString("N")[..8]));
-            busyResp.SetHeader("Call-ID", invite.GetHeader("Call-ID") ?? string.Empty);
-            busyResp.SetHeader("CSeq", invite.GetHeader("CSeq") ?? "1 INVITE");
-            busyResp.SetHeader("Content-Length", "0");
             await replySender(busyResp).ConfigureAwait(false);
             return;
         }
 
         _incomingInvite = invite;
+        _incomingAnswerAwaitingAck = false;
+        _incomingQosEarlyAnswer = false;
+        _incomingPrackReceived = false;
+        _incomingQosSatisfied = false;
+        Interlocked.Exchange(ref _incomingRingingStarted, 0);
+        _incomingReliableOutstandingRseq = 0;
         _incomingReplySender = replySender;
         _currentVoWifi = voWifi;
         _currentHostIms = hostIms;
@@ -615,78 +703,198 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         _remoteOfferSdp = invite.Body;
         var incomingEndpoint = transport?.LocalEndPoint;
         _currentLocalIp = incomingEndpoint?.Address.ToString() ?? localAddress ?? "127.0.0.1";
-        _currentSignalingPort = incomingEndpoint?.Port ?? 5060;
+        _currentSignalingPort = _currentHostIms?.Transport.ProtectedServerEndPoint?.Port
+            ?? incomingEndpoint?.Port ?? 5060;
+
+        var callerIdentity = ReadIncomingCallerIdentity();
+        EventBus?.Publish(EventTopics.SystemLog, "ImsCallManager",
+            $"Incoming IMS INVITE accepted for negotiation; {callerIdentity}");
 
         var fromHeader = invite.GetHeader("From") ?? "Unknown";
-        var callerNumber = ExtractNumberFromUri(fromHeader);
 
         _dialogFrom = EnsureTag(invite.GetHeader("To") ?? string.Empty, _currentFromTag);
         _dialogTo = fromHeader;
-        if (invite.Headers.TryGetValue("Record-Route", out var rrs))
-        {
-            _dialogRoutes = rrs.AsEnumerable().Reverse().ToList();
-        }
+        // The UAS copies request Record-Route values in their original order.
+        _dialogRoutes = invite.Headers.TryGetValue("Record-Route", out var rrs)
+            ? ParseRecordRoute(rrs, reverse: false) : [];
         var contactHeader = invite.GetHeader("Contact") ?? "";
         var contactMatch = Regex.Match(contactHeader, @"<([^>]+)>");
         _dialogTargetUri = contactMatch.Success ? contactMatch.Groups[1].Value : (string.IsNullOrWhiteSpace(contactHeader) ? fromHeader : contactHeader);
 
         // 1. Send 100 Trying
-        var resp100 = new SipMessage
-        {
-            IsRequest = false,
-            StatusCode = 100,
-            ReasonPhrase = "Trying",
-            SipVersion = "SIP/2.0"
-        };
-        resp100.SetHeader("Via", invite.GetHeader("Via") ?? string.Empty);
-        resp100.SetHeader("From", invite.GetHeader("From") ?? string.Empty);
-        resp100.SetHeader("To", invite.GetHeader("To") ?? string.Empty);
-        resp100.SetHeader("Call-ID", _currentCallId);
-        resp100.SetHeader("CSeq", invite.GetHeader("CSeq") ?? "1 INVITE");
-        resp100.SetHeader("Content-Length", "0");
+        var resp100 = invite.CreateResponse(100, "Trying");
         await replySender(resp100).ConfigureAwait(false);
 
-        // 2. Send 180 Ringing
-        var localIp = _currentLocalIp;
-        var resp180 = new SipMessage
+        if (HasUnverifiedLocalMandatoryQos(_remoteOfferSdp))
         {
-            IsRequest = false,
-            StatusCode = 180,
-            ReasonPhrase = "Ringing",
-            SipVersion = "SIP/2.0"
-        };
-        resp180.SetHeader("Via", invite.GetHeader("Via") ?? string.Empty);
-        resp180.SetHeader("From", invite.GetHeader("From") ?? string.Empty);
-        resp180.SetHeader("To", _dialogFrom);
-        resp180.SetHeader("Call-ID", _currentCallId);
-        resp180.SetHeader("CSeq", invite.GetHeader("CSeq") ?? "1 INVITE");
-        resp180.SetHeader("Contact", $"<sip:{ImsRegisterBuilder.FormatHost(localIp)}:{_currentSignalingPort};transport=udp>;audio");
-        resp180.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE");
-        resp180.SetHeader("Content-Length", "0");
-        await replySender(resp180).ConfigureAwait(false);
+            var failure = invite.CreateResponse(580, "Precondition Failure");
+            failure.SetHeader("To", _dialogFrom!);
+            await replySender(failure).ConfigureAwait(false);
+            _incomingInvite = null;
+            _incomingReplySender = null;
+            return;
+        }
 
-        // 3. Set Ringing state and notify event bus
+        if (RequiresEarlyQosAnswer(_remoteOfferSdp))
+        {
+            if (!HeaderHasOption(invite.GetHeader("Supported"), "100rel") &&
+                !HeaderHasOption(invite.GetHeader("Require"), "100rel"))
+            {
+                var failure = invite.CreateResponse(580, "Precondition Failure");
+                failure.SetHeader("To", _dialogFrom!);
+                await replySender(failure).ConfigureAwait(false);
+                _incomingInvite = null;
+                _incomingReplySender = null;
+                return;
+            }
+
+            EnsureIncomingRtpSession();
+            try
+            {
+                await SetRtpFromSdpAnswerAsync(_remoteOfferSdp!, CancellationToken.None,
+                    startMediaSenders: false).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException)
+            {
+                var unsupported = invite.CreateResponse(488, "Not Acceptable Here");
+                unsupported.SetHeader("To", _dialogFrom!);
+                await replySender(unsupported).ConfigureAwait(false);
+                ReleaseRtpSession();
+                _incomingInvite = null;
+                _incomingReplySender = null;
+                return;
+            }
+            var earlySdp = BuildLocalSdpAnswer() + BuildQosAnswer(_remoteOfferSdp!, requestConfirmation: true);
+            var progress = invite.CreateResponse(183, "Session Progress");
+            progress.Body = earlySdp;
+            progress.SetHeader("To", _dialogFrom!);
+            CopyRecordRoute(invite, progress);
+            progress.SetHeader("Contact", BuildDialogContact(_currentLocalIp!));
+            progress.SetHeader("Require", "100rel");
+            progress.SetHeader("Supported", "precondition, 100rel, timer, replaces");
+            progress.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE");
+            progress.SetHeader("RSeq", IncomingReliableRseq.ToString());
+            progress.SetHeader("Content-Type", "application/sdp");
+            progress.SetHeader("Content-Length", Encoding.UTF8.GetByteCount(earlySdp).ToString());
+            _incomingQosEarlyAnswer = true;
+            State = CallState.Incoming;
+            ActiveCall = CreateIncomingCallInfo(CallState.Incoming);
+            _incomingReliableOutstandingRseq = IncomingReliableRseq;
+            await replySender(progress).ConfigureAwait(false);
+            EventBus?.Publish(EventTopics.SystemLog, "ImsCallManager",
+                "Incoming IMS reliable 183 sent; waiting for PRACK and originator QoS confirmation before alerting.");
+            _ = ExpirePendingIncomingQosAsync(_currentCallId!);
+            return;
+        }
+
+        // 2. No pending mandatory precondition: alert the user.
+        await BeginIncomingRingingAsync().ConfigureAwait(false);
+    }
+
+    private async Task BeginIncomingRingingAsync()
+    {
+        if (_incomingInvite is not { } invite || _incomingReplySender is not { } replySender)
+            return;
+        if (Interlocked.Exchange(ref _incomingRingingStarted, 1) != 0) return;
+        var localIp = _currentLocalIp!;
+        var resp180 = invite.CreateResponse(180, "Ringing");
+        resp180.SetHeader("To", _dialogFrom!);
+        CopyRecordRoute(invite, resp180);
+        resp180.SetHeader("Contact", BuildDialogContact(localIp));
+        var requireReliable = HeaderHasOption(invite.GetHeader("Require"), "100rel");
+        resp180.SetHeader("Allow", _currentHostIms is null
+            ? requireReliable
+                ? "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, PRACK, UPDATE"
+                : "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE"
+            : requireReliable
+                ? "INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE"
+                : "INVITE, ACK, CANCEL, BYE, OPTIONS");
+        if (requireReliable)
+        {
+            resp180.SetHeader("Require", "100rel");
+            _incomingReliableOutstandingRseq = _incomingQosEarlyAnswer
+                ? IncomingReliableRseq + 1 : IncomingReliableRseq;
+            resp180.SetHeader("RSeq", _incomingReliableOutstandingRseq.ToString());
+        }
         var oldState = State;
         State = CallState.Ringing;
-        var startedAt = DateTime.UtcNow;
-        var wavPath = CreateRecordingPath(callerNumber, isIncoming: true);
+        ActiveCall = ActiveCall is { } pending
+            ? pending with { State = CallState.Ringing }
+            : CreateIncomingCallInfo(CallState.Ringing);
+        await replySender(resp180).ConfigureAwait(false);
 
-        ActiveCall = new CallInfo(
-            CallId: _currentCallId,
-            TargetNumber: callerNumber,
-            State: CallState.Ringing,
-            StartedAt: startedAt,
+        NotifyCallStateChanged(oldState, CallState.Ringing);
+        NotifyIncomingCall(_currentCallId!, ActiveCall.TargetNumber);
+        EventBus?.Publish("call.incoming", "ImsCallManager", ActiveCall);
+        EventBus?.Publish(EventTopics.CallIncoming, "ImsCallManager", ActiveCall.TargetNumber);
+    }
+
+    private ImsIncomingCallerIdentity ReadIncomingCallerIdentity() =>
+        ImsIncomingCallerIdentity.Read(_incomingInvite ?? new SipMessage(),
+            trustedCarrier: _currentHostIms is not null || _currentVoWifi is not null);
+
+    private CallInfo CreateIncomingCallInfo(CallState state) => new(
+            CallId: _currentCallId!,
+            TargetNumber: ReadIncomingCallerIdentity().Number,
+            State: state,
+            StartedAt: DateTime.UtcNow,
             ConnectedAt: null,
             EndedAt: null,
             Codec: ExtractCodecFromSdp(_remoteOfferSdp ?? string.Empty),
-            WavRecordingPath: wavPath,
+            WavRecordingPath: CreateRecordingPath(
+                ReadIncomingCallerIdentity().Number, isIncoming: true),
             IsOutgoing: false
         );
 
-        NotifyCallStateChanged(oldState, CallState.Ringing);
-        NotifyIncomingCall(_currentCallId, callerNumber);
-        EventBus?.Publish("call.incoming", "ImsCallManager", ActiveCall);
-        EventBus?.Publish(EventTopics.CallIncoming, "ImsCallManager", callerNumber);
+    private static bool HeaderHasOption(string? header, string option) =>
+        (header ?? string.Empty).Split(',').Any(value =>
+            value.Trim().Equals(option, StringComparison.OrdinalIgnoreCase));
+
+    private static bool RequiresEarlyQosAnswer(string? offer) =>
+        Regex.IsMatch(offer ?? string.Empty,
+            @"(?im)^a=des:qos\s+mandatory\s+local\s+sendrecv\s*$") &&
+        !Regex.IsMatch(offer ?? string.Empty,
+            @"(?im)^a=curr:qos\s+local\s+sendrecv\s*$");
+
+    private static bool HasUnverifiedLocalMandatoryQos(string? offer) =>
+        Regex.IsMatch(offer ?? string.Empty,
+            @"(?im)^a=des:qos\s+mandatory\s+remote\s+(?:sendrecv|send|recv)\s*$");
+
+    private static bool IsOriginatorQosReady(string? offer) =>
+        Regex.IsMatch(offer ?? string.Empty,
+            @"(?im)^a=curr:qos\s+local\s+sendrecv\s*$");
+
+    private static string BuildQosAnswer(string offer, bool requestConfirmation)
+    {
+        var lines = Regex.Matches(offer, @"(?im)^a=(?:curr|des):qos[^\r\n]*")
+            .Select(match => Regex.IsMatch(match.Value, @"^a=curr:qos\s+remote\b",
+                    RegexOptions.IgnoreCase)
+                ? "a=curr:qos local none" // No verified Windows-side reservation.
+                : Regex.Replace(match.Value,
+                @"\b(local|remote|send|recv)\b", token => token.Value.ToLowerInvariant() switch
+                {
+                    "local" => "remote",
+                    "remote" => "local",
+                    "send" => "recv",
+                    _ => "send"
+                }, RegexOptions.IgnoreCase))
+            .ToArray();
+        return string.Concat(lines.Select(line => line + "\r\n")) +
+            (requestConfirmation ? "a=conf:qos remote sendrecv\r\n" : string.Empty);
+    }
+
+    private void EnsureIncomingRtpSession()
+    {
+        if (_rtp is not null) return;
+        _audio.ClearRecording();
+        var hostIms = _currentHostIms;
+        _rtp = hostIms?.Transport.BoundInterfaceIndex is { } interfaceIndex
+            ? new RtpSession(_audio, EventBus, localAddress: hostIms.Endpoint.LocalAddress,
+                outgoingInterfaceIndex: interfaceIndex, recordAudio: SaveAudioRecordings)
+            : new RtpSession(_audio, EventBus, recordAudio: SaveAudioRecordings);
+        _rtp.MediaEnabled = false;
+        AttachExternalMediaSink(_rtp);
+        _currentVoWifi?.RegisterRtpSession(_rtp);
     }
 
     /// <summary>
@@ -694,24 +902,22 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     /// </summary>
     public async Task<CallInfo> AnswerAsync(CancellationToken ct = default)
     {
-        if (State != CallState.Ringing || _incomingInvite == null || _incomingReplySender == null ||
+        if (State != CallState.Ringing || _incomingAnswerAwaitingAck || _incomingInvite == null || _incomingReplySender == null ||
             (_currentVoWifi == null && _currentHostIms?.IsRegistered != true))
             throw new InvalidOperationException("No incoming call in ringing state to answer.");
 
-        _audio.ClearRecording();
         var voWifi = _currentVoWifi;
         var hostIms = _currentHostIms;
-        ReleaseRtpSession();
-        _rtp = hostIms?.Transport.BoundInterfaceIndex is { } interfaceIndex
-            ? new RtpSession(_audio, EventBus, localAddress: hostIms.Endpoint.LocalAddress,
-                outgoingInterfaceIndex: interfaceIndex)
-            : new RtpSession(_audio, EventBus);
-        AttachExternalMediaSink(_rtp);
-        _currentVoWifi = voWifi;
-        _currentHostIms = hostIms;
-        voWifi?.RegisterRtpSession(_rtp);
+        if (!_incomingQosEarlyAnswer)
+        {
+            ReleaseRtpSession();
+            _currentVoWifi = voWifi;
+            _currentHostIms = hostIms;
+        }
+        EnsureIncomingRtpSession();
 
-        try { SetRtpFromSdpAnswer(_remoteOfferSdp ?? string.Empty); }
+        try { await SetRtpFromSdpAnswerAsync(_remoteOfferSdp ?? string.Empty, ct,
+            startMediaSenders: false).ConfigureAwait(false); }
         catch (InvalidOperationException)
         {
             await RejectAsync(488, "Not Acceptable Here", ct).ConfigureAwait(false);
@@ -719,48 +925,64 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             throw;
         }
         var localIp = _currentLocalIp ?? voWifi?.AssignedIp ?? hostIms?.Endpoint.LocalAddress.ToString() ?? "127.0.0.1";
-        var sdpStr = BuildLocalSdpAnswer();
+        var sdpStr = _incomingQosEarlyAnswer ? string.Empty : BuildLocalSdpAnswer();
 
-        var resp200 = new SipMessage
-        {
-            IsRequest = false,
-            StatusCode = 200,
-            ReasonPhrase = "OK",
-            SipVersion = "SIP/2.0",
-            Body = sdpStr
-        };
-        resp200.SetHeader("Via", _incomingInvite.GetHeader("Via") ?? string.Empty);
-        resp200.SetHeader("From", _incomingInvite.GetHeader("From") ?? string.Empty);
+        var resp200 = _incomingInvite.CreateResponse(200, "OK");
+        resp200.Body = sdpStr;
         resp200.SetHeader("To", _dialogFrom ?? EnsureTag(_incomingInvite.GetHeader("To") ?? string.Empty, _currentFromTag ?? string.Empty));
-        resp200.SetHeader("Call-ID", _currentCallId ?? string.Empty);
-        resp200.SetHeader("CSeq", _incomingInvite.GetHeader("CSeq") ?? "1 INVITE");
-        resp200.SetHeader("Contact", $"<sip:{ImsRegisterBuilder.FormatHost(localIp)}:{_currentSignalingPort};transport=udp>;audio");
-        resp200.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE");
-        resp200.SetHeader("Supported", "100rel, timer, replaces");
+        CopyRecordRoute(_incomingInvite, resp200);
+        resp200.SetHeader("Contact", BuildDialogContact(localIp));
+        resp200.SetHeader("Allow", _incomingQosEarlyAnswer
+            ? _currentHostIms is null
+                ? "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, PRACK, UPDATE"
+                : "INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE"
+            : _currentHostIms is null
+                ? "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE"
+                : "INVITE, ACK, CANCEL, BYE, OPTIONS");
+        resp200.SetHeader("Supported", _incomingQosEarlyAnswer
+            ? "precondition, 100rel, timer, replaces" : "100rel, timer, replaces");
         if (TryParseSessionExpires(_incomingInvite.GetHeader("Session-Expires"), out var sessionExpires, out var refresher))
         {
             resp200.SetHeader("Session-Expires", $"{sessionExpires};refresher={refresher}");
             resp200.SetHeader("Require", "timer");
         }
-        resp200.SetHeader("Content-Type", "application/sdp");
-        resp200.SetHeader("Content-Length", sdpStr.Length.ToString());
-
-        await _incomingReplySender(resp200).ConfigureAwait(false);
-
-        var codec = _rtp?.Codec ?? ExtractCodecFromSdp(_remoteOfferSdp ?? string.Empty);
-        var old = State;
-        State = CallState.Active;
-        if (ActiveCall != null)
+        if (sdpStr.Length != 0)
         {
-            ActiveCall = ActiveCall with
-            {
-                State = CallState.Active,
-                ConnectedAt = DateTime.UtcNow,
-                Codec = codec
-            };
+            resp200.SetHeader("Content-Type", "application/sdp");
+            resp200.SetHeader("Content-Length", Encoding.UTF8.GetByteCount(sdpStr).ToString());
         }
 
-        NotifyCallStateChanged(old, CallState.Active, codec);
+        _incomingAnswerAwaitingAck = true;
+        try { await _incomingReplySender(resp200).ConfigureAwait(false); }
+        catch
+        {
+            _incomingAnswerAwaitingAck = false;
+            throw;
+        }
+        _ = ExpireUnacknowledgedIncomingAnswerAsync(_currentCallId!);
+        return ActiveCall!;
+    }
+
+    /// <summary>Only the matching ACK proves that an incoming 2xx dialog was established.</summary>
+    public void HandleIncomingAck(SipMessage ack)
+    {
+        if (!_incomingAnswerAwaitingAck || State != CallState.Ringing ||
+            !string.Equals(ack.Method, "ACK", StringComparison.OrdinalIgnoreCase) ||
+            !MatchesCurrentDialog(ack) || _incomingInvite == null ||
+            ParseCseqNumber(ack) != ParseCseqNumber(_incomingInvite))
+            return;
+
+        _incomingAnswerAwaitingAck = false;
+        if (_rtp is not null) _rtp.MediaEnabled = true;
+        _rtp?.StartSenders();
+        var codec = _rtp?.Codec ?? ExtractCodecFromSdp(_remoteOfferSdp ?? string.Empty);
+        try { AudioStreamStateChanged?.Invoke(this,
+            new AudioStreamStateChangedEventArgs(true, true, 8000, codec)); }
+        catch { }
+        State = CallState.Active;
+        if (ActiveCall != null)
+            ActiveCall = ActiveCall with { State = CallState.Active, ConnectedAt = DateTime.UtcNow, Codec = codec };
+        NotifyCallStateChanged(CallState.Ringing, CallState.Active, codec);
         if (ActiveCall != null)
         {
             NotifyCallConnected(ActiveCall);
@@ -768,7 +990,105 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         }
         EventBus?.Publish(EventTopics.CallState, "ImsCallManager", "ACTIVE");
         StartSessionTimer(_incomingInvite.GetHeader("Session-Expires"), localIsUac: false);
-        return ActiveCall!;
+    }
+
+    private async Task ExpireUnacknowledgedIncomingAnswerAsync(string callId)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(35)).ConfigureAwait(false);
+        if (!_incomingAnswerAwaitingAck || State != CallState.Ringing ||
+            !string.Equals(_currentCallId, callId, StringComparison.OrdinalIgnoreCase))
+            return;
+        EventBus?.Publish(EventTopics.SystemLog, "ImsCallManager", "Incoming 200 OK was not acknowledged; clearing unestablished call.");
+        await HangupAsync(sendSignaling: false).ConfigureAwait(false);
+    }
+
+    private async Task ExpirePendingIncomingQosAsync(string callId)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(35)).ConfigureAwait(false);
+        if (!_incomingQosEarlyAnswer || State != CallState.Incoming ||
+            !string.Equals(_currentCallId, callId, StringComparison.OrdinalIgnoreCase))
+            return;
+        EventBus?.Publish(EventTopics.SystemLog, "ImsCallManager",
+            "Mandatory QoS precondition was not confirmed; ending the early IMS dialog.");
+        try
+        {
+            if (_incomingInvite is { } invite && _incomingReplySender is { } reply)
+            {
+                var failure = invite.CreateResponse(580, "Precondition Failure");
+                failure.SetHeader("To", _dialogFrom!);
+                await reply(failure).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            EventBus?.Publish(EventTopics.SystemError, "ImsCallManager",
+                $"QoS timeout response could not be sent: {ex.Message}");
+        }
+        await HangupAsync(sendSignaling: false).ConfigureAwait(false);
+    }
+
+    public async Task HandleIncomingPrackAsync(SipMessage prack, Func<SipMessage, Task> replySender)
+    {
+        if (_incomingReliableOutstandingRseq == 0 ||
+            State is not (CallState.Incoming or CallState.Ringing or CallState.Active) ||
+            _incomingInvite is null || !MatchesCurrentDialog(prack))
+        {
+            await replySender(prack.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
+            return;
+        }
+        var rack = Regex.Match(prack.GetHeader("RAck") ?? string.Empty,
+            @"^\s*(\d+)\s+(\d+)\s+INVITE\s*$", RegexOptions.IgnoreCase);
+        if (!rack.Success || !int.TryParse(rack.Groups[1].Value, out var rseq) ||
+            rseq != _incomingReliableOutstandingRseq || !long.TryParse(rack.Groups[2].Value, out var inviteCseq) ||
+            inviteCseq != ParseCseqNumber(_incomingInvite) ||
+            ParseCseqNumber(prack) <= inviteCseq)
+        {
+            await replySender(prack.CreateResponse(481, "RAck Mismatch")).ConfigureAwait(false);
+            return;
+        }
+        if (!_incomingQosEarlyAnswer || rseq != IncomingReliableRseq)
+        {
+            if (!string.IsNullOrWhiteSpace(prack.Body))
+            {
+                await replySender(prack.CreateResponse(488, "Not Acceptable Here")).ConfigureAwait(false);
+                return;
+            }
+            TryAdvanceRemoteDialogCseq(prack);
+            await replySender(prack.CreateResponse(200, "OK")).ConfigureAwait(false);
+            _incomingReliableOutstandingRseq = 0;
+            return;
+        }
+        var response = prack.CreateResponse(200, "OK");
+        if (!string.IsNullOrWhiteSpace(prack.Body))
+        {
+            try
+            {
+                await SetRtpFromSdpAnswerAsync(prack.Body, CancellationToken.None,
+                    startMediaSenders: false).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException)
+            {
+                await replySender(prack.CreateResponse(488, "Not Acceptable Here")).ConfigureAwait(false);
+                return;
+            }
+            var sdp = BuildLocalSdpAnswer(GetAnswerDirection(prack.Body)) +
+                BuildQosAnswer(prack.Body, requestConfirmation: false);
+            response.Body = sdp;
+            response.SetHeader("Content-Type", "application/sdp");
+            response.SetHeader("Content-Length", Encoding.UTF8.GetByteCount(sdp).ToString());
+            _remoteOfferSdp = prack.Body;
+            _incomingQosSatisfied = IsOriginatorQosReady(prack.Body);
+        }
+        // A valid RAck identifies the 183 even if a later UPDATE was delivered
+        // first over UDP. Do not reject that PRACK solely for older CSeq.
+        TryAdvanceRemoteDialogCseq(prack);
+        await replySender(response).ConfigureAwait(false);
+        _incomingReliableOutstandingRseq = 0;
+        _incomingPrackReceived = true;
+        EventBus?.Publish(EventTopics.SystemLog, "ImsCallManager",
+            $"Incoming IMS PRACK accepted; originator-QoS-ready={_incomingQosSatisfied}.");
+        if (_incomingQosSatisfied)
+            await BeginIncomingRingingAsync().ConfigureAwait(false);
     }
 
     /// <summary>Handles an in-dialog UPDATE without mistaking it for a second call.</summary>
@@ -776,6 +1096,97 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     {
         ArgumentNullException.ThrowIfNull(update);
         ArgumentNullException.ThrowIfNull(replySender);
+        if (ActiveCall?.IsOutgoing == true &&
+            Volatile.Read(ref _outgoingInviteInProgress) != 0 &&
+            State is CallState.Dialing or CallState.Ringing)
+        {
+            if (!MatchesCurrentDialog(update))
+            {
+                await replySender(update.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
+                return;
+            }
+            if (!TryAdvanceRemoteDialogCseq(update))
+            {
+                await replySender(update.CreateResponse(500, "CSeq Out of Order")).ConfigureAwait(false);
+                return;
+            }
+            // An UPDATE offer cannot overtake the unanswered INVITE offer.
+            if (!string.IsNullOrWhiteSpace(update.Body) &&
+                string.IsNullOrWhiteSpace(_outgoingEarlyAnswerSdp))
+            {
+                await replySender(update.CreateResponse(491, "Request Pending")).ConfigureAwait(false);
+                return;
+            }
+            var earlyResponse = update.CreateResponse(200, "OK");
+            if (!string.IsNullOrWhiteSpace(update.Body))
+            {
+                try
+                {
+                    await SetRtpFromSdpAnswerAsync(update.Body, CancellationToken.None,
+                        new HashSet<byte> { 102, 8, 0 }, startMediaSenders: false).ConfigureAwait(false);
+                }
+                catch (InvalidOperationException)
+                {
+                    await replySender(update.CreateResponse(488, "Not Acceptable Here")).ConfigureAwait(false);
+                    return;
+                }
+                var answer = BuildLocalSdpAnswer(GetAnswerDirection(update.Body)) +
+                    BuildQosAnswer(update.Body, requestConfirmation: false);
+                earlyResponse.Body = answer;
+                earlyResponse.SetHeader("Content-Type", "application/sdp");
+                earlyResponse.SetHeader("Content-Length", Encoding.UTF8.GetByteCount(answer).ToString());
+            }
+            earlyResponse.SetHeader("Contact", BuildDialogContact(_currentLocalIp ?? "127.0.0.1"));
+            await replySender(earlyResponse).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(update.Body))
+                _outgoingEarlyAnswerSdp = update.Body;
+            var updatedContact = Regex.Match(update.GetHeader("Contact") ?? string.Empty, @"<([^>]+)>");
+            if (updatedContact.Success) _dialogTargetUri = updatedContact.Groups[1].Value.Trim();
+            return;
+        }
+        if (_incomingQosEarlyAnswer && State == CallState.Incoming)
+        {
+            if (!MatchesCurrentDialog(update))
+            {
+                await replySender(update.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
+                return;
+            }
+            if (!TryAdvanceRemoteDialogCseq(update))
+            {
+                await replySender(update.CreateResponse(500, "CSeq Out of Order")).ConfigureAwait(false);
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(update.Body))
+            {
+                await replySender(update.CreateResponse(488, "Not Acceptable Here")).ConfigureAwait(false);
+                return;
+            }
+            try
+            {
+                await SetRtpFromSdpAnswerAsync(update.Body, CancellationToken.None,
+                    startMediaSenders: false).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException)
+            {
+                await replySender(update.CreateResponse(488, "Not Acceptable Here")).ConfigureAwait(false);
+                return;
+            }
+            var sdp = BuildLocalSdpAnswer(GetAnswerDirection(update.Body)) +
+                BuildQosAnswer(update.Body, requestConfirmation: false);
+            var earlyResponse = update.CreateResponse(200, "OK");
+            earlyResponse.Body = sdp;
+            earlyResponse.SetHeader("Contact", BuildDialogContact(_currentLocalIp ?? "127.0.0.1"));
+            earlyResponse.SetHeader("Content-Type", "application/sdp");
+            earlyResponse.SetHeader("Content-Length", Encoding.UTF8.GetByteCount(sdp).ToString());
+            await replySender(earlyResponse).ConfigureAwait(false);
+            _remoteOfferSdp = update.Body;
+            _incomingQosSatisfied = IsOriginatorQosReady(update.Body);
+            EventBus?.Publish(EventTopics.SystemLog, "ImsCallManager",
+                $"Incoming IMS early UPDATE accepted; PRACK-received={_incomingPrackReceived}; originator-QoS-ready={_incomingQosSatisfied}.");
+            if (_incomingPrackReceived && _incomingQosSatisfied)
+                await BeginIncomingRingingAsync().ConfigureAwait(false);
+            return;
+        }
         if (State is not (CallState.Active or CallState.Held) || !MatchesCurrentDialog(update))
         {
             await replySender(update.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
@@ -801,7 +1212,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
 
         if (!string.IsNullOrWhiteSpace(request.Body))
         {
-            try { SetRtpFromSdpAnswer(request.Body); }
+            try { await SetRtpFromSdpAnswerAsync(request.Body, CancellationToken.None).ConfigureAwait(false); }
             catch (InvalidOperationException)
             {
                 await replySender(request.CreateResponse(488, "Not Acceptable Here")).ConfigureAwait(false);
@@ -817,9 +1228,10 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             response.SetHeader("Content-Type", "application/sdp");
             response.SetHeader("Content-Length", Encoding.UTF8.GetByteCount(answer).ToString());
         }
-        response.SetHeader("Contact",
-            $"<sip:{ImsRegisterBuilder.FormatHost(_currentLocalIp ?? "127.0.0.1")}:{_currentSignalingPort};transport=udp>;audio");
-        response.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, PRACK, UPDATE, INFO, NOTIFY");
+        response.SetHeader("Contact", BuildDialogContact(_currentLocalIp ?? "127.0.0.1"));
+        response.SetHeader("Allow", _currentHostIms is null
+            ? "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, PRACK, UPDATE, INFO, NOTIFY"
+            : "INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE, INFO, NOTIFY");
         response.SetHeader("Supported", "100rel, timer, replaces");
         if (TryParseSessionExpires(request.GetHeader("Session-Expires"), out var sessionExpires, out var refresher))
         {
@@ -829,6 +1241,23 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         await replySender(response).ConfigureAwait(false);
         ApplyRemoteMediaDirection(request.Body);
         StartSessionTimer(request.GetHeader("Session-Expires"), localIsUac: false);
+    }
+
+    private string BuildDialogContact(string localIp)
+    {
+        var fallback = $"<sip:{ImsRegisterBuilder.FormatHost(localIp)}:{_currentSignalingPort};transport=udp>;audio";
+        var registered = _currentHostIms?.CurrentResult?.ContactUri;
+        if (string.IsNullOrWhiteSpace(registered) ||
+            !string.Equals(ExtractRegisteredContactAddress(registered),
+                $"{ImsRegisterBuilder.FormatHost(localIp)}:{_currentSignalingPort}",
+                StringComparison.OrdinalIgnoreCase))
+            return fallback;
+
+        // Keep the registrar-accepted UE identity, instance and MMTel feature
+        // tags on the terminating dialog. The registration lifetime itself is
+        // not a dialog Contact parameter.
+        return Regex.Replace(registered, @";\s*expires\s*=\s*\d+(?=\s*(?:;|$))", "",
+            RegexOptions.IgnoreCase);
     }
 
     private string BuildLocalSdpAnswer(string direction = "sendrecv")
@@ -842,8 +1271,9 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         var payloadType = rtp?.PayloadType ?? 8;
         var codec = rtp?.Codec ?? "PCMA";
         var clockRate = codec == "AMR-WB" ? 16000 : 8000;
+        var amrModeSet = rtp?.AmrModeSet is { } modes ? $"; mode-set={modes}" : string.Empty;
         var codecParameters = codec.StartsWith("AMR", StringComparison.Ordinal)
-            ? $"a=fmtp:{payloadType} mode-change-capability=2; max-red=0; octet-align={(rtp?.AmrOctetAligned == true ? 1 : 0)}\r\n"
+            ? $"a=fmtp:{payloadType} mode-change-capability=2; max-red=0; octet-align={(rtp?.AmrOctetAligned == true ? 1 : 0)}{amrModeSet}\r\n"
             : string.Empty;
         return $"v=0\r\n" +
                $"o=- {sessionId} {sessionId} IN {family} {localIp}\r\n" +
@@ -862,22 +1292,12 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     /// </summary>
     public async Task<CallInfo?> RejectAsync(int statusCode = 603, string reason = "Decline", CancellationToken ct = default)
     {
-        if (State != CallState.Ringing || _incomingInvite == null)
+        if (State is not (CallState.Incoming or CallState.Ringing) || _incomingAnswerAwaitingAck || _incomingInvite == null)
             return await HangupAsync().ConfigureAwait(false);
 
-        var resp = new SipMessage
-        {
-            IsRequest = false,
-            StatusCode = statusCode,
-            ReasonPhrase = reason,
-            SipVersion = "SIP/2.0"
-        };
-        resp.SetHeader("Via", _incomingInvite.GetHeader("Via") ?? string.Empty);
-        resp.SetHeader("From", _incomingInvite.GetHeader("From") ?? string.Empty);
-        resp.SetHeader("To", $"{_incomingInvite.GetHeader("To")};tag={_currentFromTag}");
-        resp.SetHeader("Call-ID", _currentCallId ?? string.Empty);
-        resp.SetHeader("CSeq", _incomingInvite.GetHeader("CSeq") ?? "1 INVITE");
-        resp.SetHeader("Content-Length", "0");
+        var resp = _incomingInvite.CreateResponse(statusCode, reason);
+        resp.SetHeader("To", EnsureTag(_incomingInvite.GetHeader("To") ?? string.Empty,
+            _currentFromTag ?? string.Empty));
 
         if (_incomingReplySender != null)
         {
@@ -891,9 +1311,13 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         ActiveCall = null;
         _incomingInvite = null;
         _incomingReplySender = null;
+        _incomingAnswerAwaitingAck = false;
+        _incomingQosEarlyAnswer = false;
+        _incomingReliableOutstandingRseq = 0;
         State = CallState.Idle;
         NotifyCallStateChanged(old, CallState.Ended);
         NotifyCallEnded(ended, reason);
+        ReleaseRtpSession();
         EventBus?.Publish("call.ended", "ImsCallManager", ended);
         return ended;
     }
@@ -903,49 +1327,39 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     /// </summary>
     public async Task HandleIncomingCancelAsync(SipMessage cancel, Func<SipMessage, Task> replySender)
     {
-        var matchesPendingInvite = State == CallState.Ringing && _incomingInvite != null &&
-            string.Equals(_incomingInvite.GetHeader("Call-ID"), cancel.GetHeader("Call-ID"), StringComparison.OrdinalIgnoreCase) &&
-            ParseCseqNumber(_incomingInvite) == ParseCseqNumber(cancel);
-        if (!matchesPendingInvite)
+        var invite = _incomingInvite;
+        var localTag = _currentFromTag;
+        if (State is not (CallState.Incoming or CallState.Ringing) || invite == null ||
+            !MatchesIncomingCancelTransaction(invite, cancel))
         {
             await replySender(cancel.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
             return;
         }
+        if (_incomingAnswerAwaitingAck)
+        {
+            // The INVITE already has a final response; CANCEL cannot undo it.
+            await replySender(cancel.CreateResponse(200, "OK")).ConfigureAwait(false);
+            return;
+        }
 
         // 1. Reply 200 OK to CANCEL
-        var cancel200 = new SipMessage
-        {
-            IsRequest = false,
-            StatusCode = 200,
-            ReasonPhrase = "OK",
-            SipVersion = "SIP/2.0"
-        };
-        cancel200.SetHeader("Via", cancel.GetHeader("Via") ?? string.Empty);
-        cancel200.SetHeader("From", cancel.GetHeader("From") ?? string.Empty);
-        cancel200.SetHeader("To", cancel.GetHeader("To") ?? string.Empty);
-        cancel200.SetHeader("Call-ID", cancel.GetHeader("Call-ID") ?? string.Empty);
-        cancel200.SetHeader("CSeq", cancel.GetHeader("CSeq") ?? "1 CANCEL");
-        cancel200.SetHeader("Content-Length", "0");
+        var cancel200 = cancel.CreateResponse(200, "OK");
+        var resp487 = invite.CreateResponse(487, "Request Terminated");
+        resp487.SetHeader("To", EnsureTag(invite.GetHeader("To") ?? string.Empty, localTag ?? string.Empty));
         await replySender(cancel200).ConfigureAwait(false);
 
-        // 2. Reply 487 Request Terminated to original INVITE
-        if (_incomingInvite != null)
-        {
-            var resp487 = new SipMessage
-            {
-                IsRequest = false,
-                StatusCode = 487,
-                ReasonPhrase = "Request Terminated",
-                SipVersion = "SIP/2.0"
-            };
-            resp487.SetHeader("Via", _incomingInvite.GetHeader("Via") ?? string.Empty);
-            resp487.SetHeader("From", _incomingInvite.GetHeader("From") ?? string.Empty);
-            resp487.SetHeader("To", $"{_incomingInvite.GetHeader("To")};tag={_currentFromTag}");
-            resp487.SetHeader("Call-ID", _incomingInvite.GetHeader("Call-ID") ?? string.Empty);
-            resp487.SetHeader("CSeq", _incomingInvite.GetHeader("CSeq") ?? "1 INVITE");
-            resp487.SetHeader("Content-Length", "0");
-            await replySender(resp487).ConfigureAwait(false);
-        }
+        // A reply callback can finish this lifetime, accept a different request,
+        // or send the INVITE's final 200 while this await is suspended. Wire
+        // identity alone is not ownership of that new call/session.
+        bool StillOwnsPendingInvite() => ReferenceEquals(_incomingInvite, invite) &&
+            string.Equals(_currentFromTag, localTag, StringComparison.Ordinal) &&
+            State is CallState.Incoming or CallState.Ringing && !_incomingAnswerAwaitingAck;
+        if (!StillOwnsPendingInvite()) return;
+
+        // 2. Reply 487 only to the captured original INVITE, then recheck after
+        // the second externally supplied callback before touching call/media.
+        await replySender(resp487).ConfigureAwait(false);
+        if (!StillOwnsPendingInvite()) return;
 
         CancelSessionTimer();
         var old = State;
@@ -954,10 +1368,98 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         ActiveCall = null;
         _incomingInvite = null;
         _incomingReplySender = null;
+        _incomingAnswerAwaitingAck = false;
+        _incomingQosEarlyAnswer = false;
+        _incomingReliableOutstandingRseq = 0;
         State = CallState.Idle;
+        // Detach this call's media before observers can synchronously accept a
+        // new call. Releasing current media after notifications could tear down
+        // that observer-created replacement instead.
+        ReleaseRtpSession();
         NotifyCallStateChanged(old, CallState.Ended);
         NotifyCallEnded(ended, "CANCEL");
         EventBus?.Publish("call.ended", "ImsCallManager", ended);
+    }
+
+    private static bool MatchesIncomingCancelTransaction(SipMessage invite, SipMessage cancel)
+    {
+        // RFC 3261 9.1/9.2 and 17.2.3: CANCEL names the original INVITE
+        // transaction, not an early dialog. In particular To is the original
+        // request's value, never the tag we added to 180/183/200 responses.
+        if (!invite.IsRequest || !cancel.IsRequest || invite.Method != "INVITE" || cancel.Method != "CANCEL" ||
+            invite.SipVersion != "SIP/2.0" || cancel.SipVersion != "SIP/2.0" ||
+            string.IsNullOrWhiteSpace(invite.RequestUri) ||
+            !string.Equals(invite.RequestUri, cancel.RequestUri, StringComparison.Ordinal) ||
+            cancel.Headers.ContainsKey("Require") || cancel.Headers.ContainsKey("Proxy-Require"))
+            return false;
+        foreach (var name in new[] { "Call-ID", "From", "To" })
+            if (!TryReadCancelSingleton(invite, name, out var original) ||
+                !TryReadCancelSingleton(cancel, name, out var actual) ||
+                !string.Equals(original, actual, StringComparison.Ordinal))
+                return false;
+        if (!TryReadCancelCseq(invite, "INVITE", out var originalCseq) ||
+            !TryReadCancelCseq(cancel, "CANCEL", out var cancelCseq) || originalCseq != cancelCseq ||
+            !TryReadCancelVia(invite, out var originalVia, out var originalProtocol, out var originalSentBy, out var originalBranch) ||
+            !TryReadCancelVia(cancel, out var actualVia, out var actualProtocol, out var actualSentBy, out var actualBranch))
+            return false;
+        if (originalBranch.Length == 0 || actualBranch.Length == 0)
+            // RFC 2543 compatibility uses the original top Via, in addition
+            // to the complete identity already checked above. Never match two
+            // missing branches while ignoring different sent-by/parameters.
+            return originalBranch.Length == 0 && actualBranch.Length == 0 &&
+                string.Equals(originalVia, actualVia, StringComparison.Ordinal);
+        return string.Equals(originalBranch, actualBranch, StringComparison.Ordinal) &&
+            string.Equals(originalProtocol, actualProtocol, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(originalSentBy, actualSentBy, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryReadCancelSingleton(SipMessage message, string name, out string value)
+    {
+        value = string.Empty;
+        if (!message.Headers.TryGetValue(name, out var values) || values.Count != 1 || string.IsNullOrWhiteSpace(values[0]))
+            return false;
+        value = values[0].Trim();
+        return !value.Contains('\r') && !value.Contains('\n');
+    }
+
+    private static bool TryReadCancelCseq(SipMessage message, string method, out uint sequence)
+    {
+        sequence = 0;
+        if (!TryReadCancelSingleton(message, "CSeq", out var value)) return false;
+        var parts = value.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length == 2 && parts[1] == method &&
+            parts[0].All(c => c is >= '0' and <= '9') &&
+            uint.TryParse(parts[0], System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out sequence) && sequence < (1u << 31);
+    }
+
+    private static bool TryReadCancelVia(SipMessage message, out string topVia, out string protocol, out string sentBy, out string branch)
+    {
+        topVia = protocol = sentBy = branch = string.Empty;
+        var via = message.GetHeader("Via");
+        if (string.IsNullOrWhiteSpace(via)) return false;
+        topVia = via.Split(',')[0].Trim();
+        var match = Regex.Match(topVia,
+            @"^(?<protocol>SIP/2\.0/[A-Z]+)[ \t]+(?<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?<port>:[0-9]+)?(?<parameters>(?:[ \t]*;[^\r\n]*)?)$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (!match.Success) return false;
+        var port = match.Groups["port"].Value;
+        if (port.Length > 0 && (!ushort.TryParse(port.AsSpan(1), out var number) || number == 0)) return false;
+        protocol = match.Groups["protocol"].Value;
+        sentBy = match.Groups["host"].Value + port;
+        var sawBranch = false;
+        foreach (var parameter in match.Groups["parameters"].Value.Split(';'))
+        {
+            var part = parameter.Trim();
+            var equal = part.IndexOf('=');
+            var name = equal < 0 ? part : part[..equal].Trim();
+            if (!name.Equals("branch", StringComparison.OrdinalIgnoreCase)) continue;
+            if (sawBranch || equal < 0) return false;
+            sawBranch = true;
+            branch = part[(equal + 1)..].Trim();
+            if (!Regex.IsMatch(branch, @"^[A-Za-z0-9\-_.!%*+`'~]+$", RegexOptions.CultureInvariant)) return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -978,19 +1480,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             return;
         }
 
-        var bye200 = new SipMessage
-        {
-            IsRequest = false,
-            StatusCode = 200,
-            ReasonPhrase = "OK",
-            SipVersion = "SIP/2.0"
-        };
-        bye200.SetHeader("Via", bye.GetHeader("Via") ?? string.Empty);
-        bye200.SetHeader("From", bye.GetHeader("From") ?? string.Empty);
-        bye200.SetHeader("To", bye.GetHeader("To") ?? string.Empty);
-        bye200.SetHeader("Call-ID", bye.GetHeader("Call-ID") ?? string.Empty);
-        bye200.SetHeader("CSeq", bye.GetHeader("CSeq") ?? "1 BYE");
-        bye200.SetHeader("Content-Length", "0");
+        var bye200 = bye.CreateResponse(200, "OK");
         await replySender(bye200).ConfigureAwait(false);
 
         // Terminate call and save recording asynchronously
@@ -998,7 +1488,8 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         {
             var wavPath = ActiveCall.WavRecordingPath;
             var rtpToSave = _rtp;
-            _ = Task.Run(() => SaveRecordingAndPrune(wavPath, rtpToSave));
+            var pcmToSave = _audio.TakeRecording();
+            _ = Task.Run(() => SaveRecordingAndPrune(wavPath, rtpToSave, pcmToSave));
         }
 
         CancelSessionTimer();
@@ -1018,7 +1509,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
 
     public async Task<CallInfo?> HangupAsync(bool sendSignaling = true)
     {
-        if (ActiveCall == null || State == CallState.Idle)
+        if (ActiveCall == null || State is CallState.Idle or CallState.Ended)
             return null;
 
         CancelSessionTimer();
@@ -1031,10 +1522,13 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         {
             Volatile.Write(ref _outgoingInviteMaySignal, sendSignaling ? 1 : 0);
             Volatile.Write(ref _outgoingInviteCancelled, 1);
+            try { Volatile.Read(ref _outgoingInviteDrain)?.CancelAfter(TimeSpan.FromSeconds(32)); }
+            catch (ObjectDisposedException) { }
         }
 
         // If incoming and ringing, reject
-        if (sendSignaling && State == CallState.Ringing && !ActiveCall.IsOutgoing)
+        if (sendSignaling && (State is CallState.Incoming or CallState.Ringing) &&
+            !ActiveCall.IsOutgoing && !_incomingAnswerAwaitingAck)
         {
             return await RejectAsync().ConfigureAwait(false);
         }
@@ -1044,7 +1538,8 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             Volatile.Read(ref _outgoingInviteProvisionalReceived) != 0 &&
             _callTransport != null)
         {
-            await SendPendingCancelAsync(_callTransport).ConfigureAwait(false);
+            // Network cleanup must not hold the desktop in Dialing/Ringing.
+            _ = SendPendingCancelAsync(_callTransport);
         }
         else if (sendSignaling && (State is CallState.Active or CallState.Held) && _callTransport != null && _currentCallId != null)
         {
@@ -1064,7 +1559,8 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         {
             var wavPath = ActiveCall.WavRecordingPath;
             var rtpToSave = _rtp;
-            _ = Task.Run(() => SaveRecordingAndPrune(wavPath, rtpToSave));
+            var pcmToSave = _audio.TakeRecording();
+            _ = Task.Run(() => SaveRecordingAndPrune(wavPath, rtpToSave, pcmToSave));
         }
 
         if (ActiveCall != null)
@@ -1082,6 +1578,9 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         ActiveCall  = null;
         _incomingInvite = null;
         _incomingReplySender = null;
+        _incomingAnswerAwaitingAck = false;
+        _incomingQosEarlyAnswer = false;
+        _incomingReliableOutstandingRseq = 0;
         return result;
     }
 
@@ -1167,7 +1666,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
 
         // Contact is a SIP URI, not merely a host:port.  Preserve the address
         // that the registrar accepted: under ipsec-3gpp it is the protected
-        // server port, distinct from the client source port in Via.
+        // server port, distinct from the client source port on the wire.
         var match = Regex.Match(contact,
             @"<\s*sip:(?:[^@;>]+@)?(?<host>\[[^\]]+\]|[^;>:]+):(?<port>\d{1,5})(?:[;>])",
             RegexOptions.IgnoreCase);
@@ -1200,7 +1699,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         var to = provisional.GetHeader("To");
         if (!string.IsNullOrWhiteSpace(to)) _dialogTo = to;
         if (provisional.Headers.TryGetValue("Record-Route", out var recordRoutes) && recordRoutes.Count > 0)
-            _dialogRoutes = ParseAndReverseRecordRoute(recordRoutes);
+            _dialogRoutes = ParseRecordRoute(recordRoutes, reverse: true);
 
         var localIp = _currentLocalIp ?? "127.0.0.1";
         var branch = "z9hG4bK" + Guid.NewGuid().ToString("N")[..12];
@@ -1246,11 +1745,14 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         return Task.FromResult(true);
     }
 
+    /// <summary>Returns negotiated media metadata without exposing SDP or audio contents.</summary>
+    public RtpMediaConfiguration? GetMediaConfiguration() => _rtp?.GetMediaConfiguration();
+
     /// <summary>Sends one 8 kHz mono PCM frame to the active carrier RTP leg.</summary>
     public void SendExternalPcm(short[] samples)
     {
         ArgumentNullException.ThrowIfNull(samples);
-        _rtp?.SendAudioPcm(samples);
+        if (State == CallState.Active) _rtp?.SendAudioPcm(samples);
     }
 
     /// <summary>Places the active dialog on hold with an SDP re-INVITE.</summary>
@@ -1285,7 +1787,8 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
 
         await SendAckAsync(_callTransport, request, response, ct).ConfigureAwait(false);
         if (!string.IsNullOrWhiteSpace(response.Body))
-            SetRtpFromSdpAnswer(response.Body);
+            await SetRtpFromSdpAnswerAsync(response.Body, ct,
+                new HashSet<byte> { _rtp?.PayloadType ?? 8 }).ConfigureAwait(false);
 
         var old = State;
         State = hold ? CallState.Held : CallState.Active;
@@ -1516,6 +2019,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     public void Dispose()
     {
         CancelSessionTimer();
+        _incomingReliableOutstandingRseq = 0;
         ReleaseRtpSession();
         _audio.Dispose();
     }
@@ -1523,6 +2027,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
     private void ReleaseRtpSession()
     {
         var rtp = _rtp;
+        var hostIms = _currentHostIms;
         _rtp = null;
 
         if (rtp != null)
@@ -1531,6 +2036,17 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         _currentHostIms = null;
         _currentAccessNetworkInfo = null;
         rtp?.Dispose();
+        if (hostIms is not null)
+            _ = ClearHostImsMediaRoutesAfterCallAsync(hostIms);
+    }
+
+    private static async Task ClearHostImsMediaRoutesAfterCallAsync(HostImsRegistrationClient hostIms)
+    {
+        try { await hostIms.ClearMediaRoutesAsync().ConfigureAwait(false); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ImsCallManager] Host IMS media route cleanup failed: {ex.Message}");
+        }
     }
 
     private void AttachExternalMediaSink(RtpSession session)
@@ -1579,7 +2095,13 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         await transport.SendAsync(ack, ct).ConfigureAwait(false);
     }
 
-    private static List<string> ParseAndReverseRecordRoute(List<string> rawHeaders)
+    private static void CopyRecordRoute(SipMessage request, SipMessage response)
+    {
+        if (request.Headers.TryGetValue("Record-Route", out var values))
+            foreach (var value in values) response.AddHeader("Record-Route", value);
+    }
+
+    private static List<string> ParseRecordRoute(List<string> rawHeaders, bool reverse)
     {
         var entries = new List<string>();
         foreach (var headerVal in rawHeaders)
@@ -1598,7 +2120,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
                 entries.AddRange(parts);
             }
         }
-        entries.Reverse();
+        if (reverse) entries.Reverse();
         return entries;
     }
 
@@ -1661,8 +2183,25 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             Volatile.Read(ref _outgoingInviteProvisionalReceived) == 0 ||
             Interlocked.Exchange(ref _outgoingInviteCancelSent, 1) != 0)
             return;
-        try { await transport.SendAsync(BuildCancelRequest(), CancellationToken.None).ConfigureAwait(false); }
+        try
+        {
+            // CANCEL is a separate client transaction and needs retransmission
+            // on UDP; a one-shot send can leave the remote phone ringing.
+            _ = await transport.SendAndReceiveFinalAsync(BuildCancelRequest(), timeoutMs: 4000,
+                ct: CancellationToken.None).ConfigureAwait(false);
+        }
         catch { /* A late final INVITE response is still handled by the caller. */ }
+    }
+
+    private static Task SendRejectedInviteAckAsync(SipTransport transport, SipMessage invite, SipMessage response)
+    {
+        var ack = new SipMessage { IsRequest = true, Method = "ACK", RequestUri = invite.RequestUri };
+        foreach (var name in new[] { "Via", "From", "Call-ID", "Route", "Max-Forwards" })
+            if (invite.GetHeader(name) is { } value) ack.SetHeader(name, value);
+        ack.SetHeader("To", response.GetHeader("To") ?? invite.GetHeader("To") ?? string.Empty);
+        ack.SetHeader("CSeq", $"{invite.GetHeader("CSeq")?.Split(' ')[0]} ACK");
+        ack.SetHeader("Content-Length", "0");
+        return transport.SendAsync(ack, CancellationToken.None);
     }
 
     private string? CreateRecordingPath(string remoteNumber, bool isIncoming)
@@ -1687,14 +2226,14 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         }
     }
 
-    private void SaveRecordingAndPrune(string wavPath, RtpSession? rtpToSave)
+    private void SaveRecordingAndPrune(string wavPath, RtpSession? rtpToSave, byte[] pcmRecording)
     {
         try
         {
             if (rtpToSave != null)
-                rtpToSave.SaveAudioRecording(wavPath);
+                rtpToSave.SaveAudioRecording(wavPath, pcmRecording);
             else
-                _audio.SaveToWavFile(wavPath);
+                _audio.SavePcmToWavFile(wavPath, pcmRecording);
 
             PruneSavedRecordings(Path.GetDirectoryName(wavPath));
         }
@@ -1761,13 +2300,38 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             ? "IP6"
             : "IP4";
 
-    private void SetRtpFromSdpAnswer(string sdpBody)
+    private async Task SetRtpFromSdpAnswerAsync(string sdpBody, CancellationToken ct,
+        IReadOnlySet<byte>? locallyOfferedPayloads = null, bool startMediaSenders = true)
     {
         var mediaSession = _rtp
             ?? throw new InvalidOperationException("IMS audio media session is unavailable.");
-        var connectionMatch = Regex.Match(sdpBody, @"(?im)^c=IN\s+(IP[46])\s+(\S+)");
-        var mediaMatch = Regex.Match(sdpBody, @"(?im)^m=audio\s+(\d+)\s+(\S+)\s+([^\r\n]+)");
+        // SDP media-level values override the session defaults. Keep codec and
+        // RTCP attributes inside the selected audio block; a video block (or
+        // another audio block) must not change this call's RTP route.
+        var lines = sdpBody.Split('\n').Select(line => line.TrimEnd('\r')).ToArray();
+        var mediaStarts = Enumerable.Range(0, lines.Length)
+            .Where(index => lines[index].StartsWith("m=", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var sessionBody = string.Join('\n', lines[..(mediaStarts.Length == 0 ? lines.Length : mediaStarts[0])]);
+        var audioStart = -1;
+        Match mediaMatch = Match.Empty;
+        foreach (var start in mediaStarts)
+        {
+            var candidate = Regex.Match(lines[start], @"^m=audio\s+(\d+)\s+(\S+)\s+(.+)$",
+                RegexOptions.IgnoreCase);
+            if (!candidate.Success || !int.TryParse(candidate.Groups[1].Value, out var port) || port == 0)
+                continue;
+            audioStart = start;
+            mediaMatch = candidate;
+            break;
+        }
+        var audioEnd = mediaStarts.FirstOrDefault(start => start > audioStart, lines.Length);
+        var audioBody = audioStart >= 0 ? string.Join('\n', lines[audioStart..audioEnd]) : string.Empty;
+        var mediaConnection = Regex.Match(audioBody, @"(?im)^c=IN\s+(IP[46])\s+(\S+)");
+        var connectionMatch = mediaConnection.Success ? mediaConnection :
+            Regex.Match(sessionBody, @"(?im)^c=IN\s+(IP[46])\s+(\S+)");
         if (!connectionMatch.Success || !mediaMatch.Success ||
+            (Regex.IsMatch(audioBody, @"(?im)^c=") && !mediaConnection.Success) ||
             !mediaMatch.Groups[2].Value.Equals("RTP/AVP", StringComparison.OrdinalIgnoreCase) ||
             !IPAddress.TryParse(connectionMatch.Groups[2].Value, out var remoteIp) ||
             !int.TryParse(mediaMatch.Groups[1].Value, out var remotePort) ||
@@ -1777,39 +2341,58 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
             remoteIp.Equals(IPAddress.Any) || remoteIp.Equals(IPAddress.IPv6Any))
             throw new InvalidOperationException("IMS peer supplied no usable RTP/AVP audio endpoint.");
 
-        var rtpMappings = Regex.Matches(sdpBody, @"(?im)^a=rtpmap:(\d+)\s+([A-Za-z0-9\-]+)/(\d+)")
-            .Cast<Match>()
-            .Where(match => byte.TryParse(match.Groups[1].Value, out _) &&
-                int.TryParse(match.Groups[3].Value, out _))
-            .GroupBy(match => byte.Parse(match.Groups[1].Value))
-            .ToDictionary(
-                group => group.Key,
-                group => (Codec: group.First().Groups[2].Value.ToUpperInvariant(),
-                    ClockRate: int.Parse(group.First().Groups[3].Value)));
+        var rtpMappings = new Dictionary<byte, (string Codec, int ClockRate, int Channels)>();
+        foreach (var line in audioBody.Split('\n').Where(line => line.StartsWith("a=rtpmap:", StringComparison.OrdinalIgnoreCase)))
+        {
+            var match = Regex.Match(line, @"^a=rtpmap:(\d+)[ \t]+([A-Za-z0-9\-]+)/(\d+)(?:/(\d+))?[ \t]*$", RegexOptions.IgnoreCase);
+            if (!match.Success || !byte.TryParse(match.Groups[1].Value, out var payload) || payload > 127 ||
+                !int.TryParse(match.Groups[3].Value, out var rate) || rate <= 0)
+                throw new InvalidOperationException("IMS peer supplied an invalid RTP codec mapping.");
+            var channels = 1;
+            if (match.Groups[4].Success && (!int.TryParse(match.Groups[4].Value, out channels) || channels <= 0))
+                throw new InvalidOperationException("IMS peer supplied an invalid RTP channel count.");
+            var mapping = (match.Groups[2].Value.ToUpperInvariant(), rate, channels);
+            if (rtpMappings.TryGetValue(payload, out var previous) && previous != mapping)
+                throw new InvalidOperationException("IMS peer supplied conflicting RTP codec mappings.");
+            rtpMappings[payload] = mapping;
+        }
         var offeredPayloads = mediaMatch.Groups[3].Value
             .Split(' ', StringSplitOptions.RemoveEmptyEntries)
             .Select(value => byte.TryParse(value, out var parsed) ? (byte?)parsed : null)
             .OfType<byte>()
             .ToArray();
         var selectedPayload = offeredPayloads.Cast<byte?>().FirstOrDefault(candidate => candidate is { } value &&
+            (locallyOfferedPayloads is null || locallyOfferedPayloads.Contains(value)) &&
             (value switch
             {
                 8 => !rtpMappings.TryGetValue(8, out var mapping) ||
-                    mapping is { Codec: "PCMA", ClockRate: 8000 },
+                    mapping is { Codec: "PCMA", ClockRate: 8000, Channels: 1 },
                 0 => !rtpMappings.TryGetValue(0, out var mapping) ||
-                    mapping is { Codec: "PCMU", ClockRate: 8000 },
-                _ => rtpMappings.TryGetValue(value, out var mapping) &&
-                    mapping is { Codec: "AMR", ClockRate: 8000 }
+                    mapping is { Codec: "PCMU", ClockRate: 8000, Channels: 1 },
+                _ => value >= 96 && rtpMappings.TryGetValue(value, out var mapping) &&
+                    mapping is { Codec: "AMR" or "PCMA" or "PCMU", ClockRate: 8000, Channels: 1 }
             }));
         if (selectedPayload is not { } pt)
             throw new InvalidOperationException("IMS peer offered no supported two-way audio codec.");
         var codec = rtpMappings.TryGetValue(pt, out var selectedMapping)
             ? selectedMapping.Codec : pt == 0 ? "PCMU" : "PCMA";
-        var fmtp = Regex.Match(sdpBody, $@"(?im)^a=fmtp:{pt}\s+([^\r\n]+)").Groups[1].Value;
+        var fmtp = Regex.Match(audioBody, $@"(?im)^a=fmtp:{pt}\s+([^\r\n]+)").Groups[1].Value;
         var octetAligned = Regex.IsMatch(fmtp, @"(?:^|;)\s*octet-align\s*=\s*1(?:;|$)", RegexOptions.IgnoreCase);
-        var rtcpMatch = Regex.Match(sdpBody,
+        string? amrModeSet = null;
+        if (codec == "AMR")
+        {
+            foreach (var parameter in fmtp.Split(';', StringSplitOptions.TrimEntries))
+            {
+                if (!Regex.IsMatch(parameter, @"^mode-set\b", RegexOptions.IgnoreCase)) continue;
+                var modeSetMatch = Regex.Match(parameter, @"^mode-set\s*=\s*(.*)$", RegexOptions.IgnoreCase);
+                if (!modeSetMatch.Success || amrModeSet is not null)
+                    throw new InvalidOperationException("IMS peer supplied an invalid AMR mode-set.");
+                amrModeSet = modeSetMatch.Groups[1].Value.Trim();
+            }
+        }
+        var rtcpMatch = Regex.Match(audioBody,
             @"(?im)^a=rtcp:(\d+)(?:\s+IN\s+(IP[46])\s+(\S+))?\s*$");
-        if (Regex.IsMatch(sdpBody, @"(?im)^a=rtcp:") && !rtcpMatch.Success)
+        if (Regex.IsMatch(audioBody, @"(?im)^a=rtcp:") && !rtcpMatch.Success)
             throw new InvalidOperationException("IMS peer supplied an invalid RTCP endpoint.");
         var remoteRtcpPort = rtcpMatch.Success && int.TryParse(rtcpMatch.Groups[1].Value, out var advertisedRtcpPort)
             ? advertisedRtcpPort : remotePort + 1;
@@ -1821,21 +2404,25 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
                     (remoteRtcpIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork))
                 throw new InvalidOperationException("IMS peer supplied an invalid RTCP address family.");
         }
-        try
+        if (_currentHostIms is { } hostIms)
         {
-            mediaSession.SetRemoteEndpoint(remoteIp, remotePort, pt, codec, octetAligned,
-                remoteRtcpPort, remoteRtcpIp);
+            await hostIms.EnsureMediaRouteAsync(remoteIp, ct).ConfigureAwait(false);
+            if (!remoteRtcpIp.Equals(remoteIp))
+                await hostIms.EnsureMediaRouteAsync(remoteRtcpIp, ct).ConfigureAwait(false);
         }
-        catch (ArgumentException ex)
+        Func<byte[], Task>? protectedRtpSender = null;
+        Func<byte[], Task>? protectedRtcpSender = null;
+        // Disconnected managers are used by local SIP-only simulations. Once
+        // a real VoWiFi session has begun, never fall back to plaintext UDP.
+        if (_currentVoWifi is { State: not VoWifiState.Disconnected } voWifi)
         {
-            throw new InvalidOperationException("IMS peer supplied an RTCP endpoint outside the selected bearer.", ex);
-        }
-
-        if (_currentVoWifi?.EspTunnel != null && _currentVoWifi.Transport != null && IPAddress.TryParse(_currentVoWifi.AssignedIp, out var localIp))
-        {
-            var esp = _currentVoWifi.EspTunnel;
-            var tr = _currentVoWifi.Transport;
-            mediaSession.CustomSender = async rtpBytes =>
+            var esp = voWifi.EspTunnel
+                ?? throw new InvalidOperationException("VoWiFi media ESP tunnel is unavailable.");
+            var tr = voWifi.Transport
+                ?? throw new InvalidOperationException("VoWiFi media transport is unavailable.");
+            if (!IPAddress.TryParse(voWifi.AssignedIp, out var localIp))
+                throw new InvalidOperationException("VoWiFi media address is unavailable.");
+            protectedRtpSender = async rtpBytes =>
             {
                 var inner = VoWifi.IpPacketUtils.BuildUdpPacket(localIp, remoteIp,
                     (ushort)mediaSession.LocalPort, (ushort)remotePort, rtpBytes);
@@ -1843,7 +2430,7 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
                 var sealedEsp = esp.Seal(inner, nextHeader);
                 await tr.SendEspAsync(sealedEsp, CancellationToken.None).ConfigureAwait(false);
             };
-            mediaSession.CustomRtcpSender = async rtcpBytes =>
+            protectedRtcpSender = async rtcpBytes =>
             {
                 var inner = VoWifi.IpPacketUtils.BuildUdpPacket(localIp, remoteRtcpIp,
                     (ushort)mediaSession.LocalRtcpPort, (ushort)remoteRtcpPort, rtcpBytes);
@@ -1854,10 +2441,23 @@ public class ImsCallManager : IDisposable, ICallPcmMedia
         }
         try
         {
-            AudioStreamStateChanged?.Invoke(this, new AudioStreamStateChangedEventArgs(
-                true, true, 8000, codec));
+            mediaSession.SetRemoteEndpoint(remoteIp, remotePort, pt, codec, octetAligned,
+                remoteRtcpPort, remoteRtcpIp, amrModeSet, protectedRtpSender, protectedRtcpSender,
+                startSenders: startMediaSenders);
         }
-        catch { }
+        catch (ArgumentException ex)
+        {
+            throw new InvalidOperationException("IMS peer supplied invalid RTP/RTCP or AMR parameters.", ex);
+        }
+        if (startMediaSenders)
+        {
+            try
+            {
+                AudioStreamStateChanged?.Invoke(this, new AudioStreamStateChangedEventArgs(
+                    true, true, 8000, codec));
+            }
+            catch { }
+        }
     }
 
     /// <summary>Returns a human-readable codec string from the SDP answer.</summary>

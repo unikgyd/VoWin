@@ -12,12 +12,20 @@ internal sealed class SipDigestAuthenticator
 
     private readonly string _realm;
     private readonly IReadOnlyDictionary<string, string> _accounts;
+    private readonly string _algorithm;
+    private readonly bool _strictHeaders;
     private readonly ConcurrentDictionary<string, NonceState> _nonces = new(StringComparer.Ordinal);
 
-    public SipDigestAuthenticator(string realm, IReadOnlyDictionary<string, string> accounts)
+    public SipDigestAuthenticator(string realm, IReadOnlyDictionary<string, string> accounts,
+        string algorithm = "MD5", bool strictHeaders = false)
     {
+        if (!algorithm.Equals("MD5", StringComparison.OrdinalIgnoreCase) &&
+            !algorithm.Equals("SHA-256", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Unsupported SIP digest algorithm.", nameof(algorithm));
         _realm = realm;
         _accounts = accounts;
+        _algorithm = algorithm.ToUpperInvariant();
+        _strictHeaders = strictHeaders;
     }
 
     public string CreateChallenge()
@@ -25,23 +33,29 @@ internal sealed class SipDigestAuthenticator
         Cleanup();
         var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
         _nonces[nonce] = new NonceState(DateTimeOffset.UtcNow.AddMinutes(5), new(StringComparer.OrdinalIgnoreCase));
-        return $"Digest realm=\"{Escape(_realm)}\", nonce=\"{nonce}\", algorithm=MD5, qop=\"auth\"";
+        return $"Digest realm=\"{Escape(_realm)}\", nonce=\"{nonce}\", algorithm={_algorithm}, qop=\"auth\"";
     }
 
     public bool Validate(SipMessage request, out string username)
     {
         username = string.Empty;
-        var header = request.Method.Equals("REGISTER", StringComparison.OrdinalIgnoreCase)
-            ? request.GetHeader("Authorization") ?? request.GetHeader("Proxy-Authorization")
-            : request.GetHeader("Proxy-Authorization") ?? request.GetHeader("Authorization");
+        var preferred = request.Method.Equals("REGISTER", StringComparison.OrdinalIgnoreCase)
+            ? "Authorization" : "Proxy-Authorization";
+        var alternate = preferred == "Authorization" ? "Proxy-Authorization" : "Authorization";
+        var preferredHeaders = request.Headers.GetValueOrDefault(preferred)?.ToArray() ?? [];
+        var alternateHeaders = request.Headers.GetValueOrDefault(alternate)?.ToArray() ?? [];
+        // Local clients may keep a stale registrar Authorization next to their
+        // proxy proof. The fixed peer is stricter: exactly one proof, one role.
+        if (preferredHeaders.Length > 1 || alternateHeaders.Length > 1 ||
+            _strictHeaders && preferredHeaders.Length + alternateHeaders.Length != 1) return false;
+        var header = preferredHeaders.FirstOrDefault() ?? alternateHeaders.FirstOrDefault();
         if (string.IsNullOrWhiteSpace(header) || !header.StartsWith("Digest ", StringComparison.OrdinalIgnoreCase)) return false;
-        var values = ParseParameters(header[7..]);
+        if (!SipPeerDigest.TryParseParameters(header[7..], out var values)) return false;
         if (!values.TryGetValue("username", out var parsedUsername) || string.IsNullOrWhiteSpace(parsedUsername) ||
             !_accounts.TryGetValue(parsedUsername, out var password)) return false;
-        username = parsedUsername;
         if (!values.TryGetValue("realm", out var realm) || !FixedEquals(realm, _realm)) return false;
-        if (values.TryGetValue("algorithm", out var algorithm) &&
-            !string.Equals(algorithm, "MD5", StringComparison.OrdinalIgnoreCase)) return false;
+        var algorithm = values.GetValueOrDefault("algorithm", "MD5");
+        if (!string.Equals(algorithm, _algorithm, StringComparison.OrdinalIgnoreCase)) return false;
         if (!values.TryGetValue("nonce", out var nonce) || !_nonces.TryGetValue(nonce, out var nonceState) || nonceState.ExpiresAt <= DateTimeOffset.UtcNow) return false;
         if (!values.TryGetValue("uri", out var uri) || !FixedEquals(uri, request.RequestUri)) return false;
         if (!values.TryGetValue("response", out var supplied)) return false;
@@ -54,9 +68,9 @@ internal sealed class SipDigestAuthenticator
             !Regex.IsMatch(ncText, "^[0-9A-Fa-f]{8}$") ||
             !uint.TryParse(ncText, System.Globalization.NumberStyles.HexNumber, null, out var nc) || nc == 0) return false;
 
-        var ha1 = Md5Hex($"{username}:{_realm}:{password}");
-        var ha2 = Md5Hex($"{request.Method}:{uri}");
-        var expected = Md5Hex($"{ha1}:{nonce}:{ncText}:{cnonce}:auth:{ha2}");
+        var ha1 = HashHex($"{parsedUsername}:{_realm}:{password}");
+        var ha2 = HashHex($"{request.Method}:{uri}");
+        var expected = HashHex($"{ha1}:{nonce}:{ncText}:{cnonce}:auth:{ha2}");
         if (!FixedEquals(expected, supplied)) return false;
 
         // AddOrUpdate may invoke its update delegate more than once. A side
@@ -64,39 +78,23 @@ internal sealed class SipDigestAuthenticator
         // request has already committed an equal or higher nonce count.
         while (true)
         {
-            if (!nonceState.NonceCounts.TryGetValue(username, out var previous))
+            if (!nonceState.NonceCounts.TryGetValue(parsedUsername, out var previous))
             {
-                if (nonceState.NonceCounts.TryAdd(username, nc)) return true;
+                if (nonceState.NonceCounts.TryAdd(parsedUsername, nc)) { username = parsedUsername; return true; }
                 continue;
             }
             if (nc <= previous) return false;
-            if (nonceState.NonceCounts.TryUpdate(username, nc, previous)) return true;
+            if (nonceState.NonceCounts.TryUpdate(parsedUsername, nc, previous)) { username = parsedUsername; return true; }
         }
     }
 
     internal static Dictionary<string, string> ParseParameters(string input)
     {
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (Match match in Regex.Matches(input, "(?:^|,)\\s*([A-Za-z][A-Za-z0-9_-]*)\\s*=\\s*(?:\\\"((?:\\\\.|[^\\\"])*)\\\"|([^,\\s]+))"))
-        {
-            var value = match.Groups[2].Success
-                ? UnescapeQuotedPair(match.Groups[2].Value)
-                : match.Groups[3].Value;
-            result[match.Groups[1].Value] = value;
-        }
-        return result;
+        return SipPeerDigest.TryParseParameters(input, out var values) ? values : new(StringComparer.OrdinalIgnoreCase);
     }
 
-    private static string UnescapeQuotedPair(string input)
-    {
-        var output = new StringBuilder(input.Length);
-        for (var i = 0; i < input.Length; i++)
-        {
-            if (input[i] == '\\' && i + 1 < input.Length) i++;
-            output.Append(input[i]);
-        }
-        return output.ToString();
-    }
+    private string HashHex(string value) => _algorithm == "SHA-256"
+        ? Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant() : Md5Hex(value);
 
     internal static string Md5Hex(string value) =>
         Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();

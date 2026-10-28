@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.RegularExpressions;
@@ -12,8 +13,9 @@ namespace VoSharp.Kernel.SipGateway;
 /// remains owned by <see cref="ImsCallManager"/>; this class terminates a second,
 /// ordinary SIP/RTP dialog for phones reachable through WireGuard.
 /// </summary>
-public sealed class SipGateway : IAsyncDisposable
+public sealed partial class SipGateway : IAsyncDisposable
 {
+    private sealed class CarrierRelease { public int Started; }
     private sealed class Dialog : IDisposable
     {
         public required string LocalCallId { get; init; }
@@ -24,67 +26,92 @@ public sealed class SipGateway : IAsyncDisposable
         public string? SlotId { get; set; }
         public ICallPcmMedia? CarrierMedia { get; set; }
         public string? CarrierCallId { get; set; }
+        public string? PairedDialogId { get; set; }
         public string? RemoteTarget { get; set; }
         public string? From { get; set; }
         public string? To { get; set; }
         public SipMessage? OriginalInvite { get; set; }
-        public int InviteFinalSent;
-        public int CarrierHangupStarted;
+        public int InviteFinalSent; // 0 pending, 1 accepted, 2 terminated/rejected
+        public readonly object InviteFinalGate = new();
+        public CarrierRelease CarrierRelease { get; set; } = new();
+        public int ByeStarted;
+        public int PeerEnded;
         public TaskCompletionSource InviteAcknowledged { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int LocalCSeq { get; set; } = 2;
+        public int InviteCSeq { get; set; } = 1;
         public Action<short[]>? DownlinkHandler { get; set; }
+        private int _disposed;
+        public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
         public void Dispose()
         {
-            try { Cancellation.Cancel(); } catch { }
-            if (CarrierMedia != null && DownlinkHandler != null)
-                CarrierMedia.RemotePcmReceived -= DownlinkHandler;
-            if (CarrierMedia is ImsCallManager ims) ims.ExternalMediaBridgeEnabled = false;
-            Media.Dispose();
-            Cancellation.Dispose();
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            lock (this)
+            {
+                try { Cancellation.Cancel(); } catch { }
+                if (CarrierMedia != null && DownlinkHandler != null)
+                    CarrierMedia.RemotePcmReceived -= DownlinkHandler;
+                if (CarrierMedia is ImsCallManager ims) ims.ExternalMediaBridgeEnabled = false;
+                Media.Dispose();
+                Cancellation.Dispose();
+            }
         }
     }
 
-    private sealed record PendingTransaction(TaskCompletionSource<SipMessage> Completion, Action<SipMessage>? Provisional, IPEndPoint Remote, string ViaBranch)
+    private sealed record PendingTransaction(TaskCompletionSource<SipMessage> Completion, Action<SipMessage>? Provisional,
+        IPEndPoint Remote, string ViaBranch, string CallId, string FromTag, string ToTag)
     {
         public volatile bool ReceivedProvisional;
     }
     private sealed record CachedServerResponse(SipMessage Response, IPEndPoint Remote, DateTimeOffset CreatedAt);
-    private sealed class LateInvite(SipMessage invite, IPEndPoint remote)
-    {
-        public SipMessage Invite { get; } = invite;
-        public IPEndPoint Remote { get; } = remote;
-        public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
-        public SipMessage? FinalResponse { get; set; }
-        public bool Abandoned { get; set; }
-        public bool ByeSent { get; set; }
-    }
-
     private readonly SipGatewayOptions _options;
     private readonly ISipGatewayCallController _controller;
     private IDisposable? _ownedController;
     private readonly SipDigestAuthenticator _authenticator;
+    private readonly SipDigestAuthenticator? _peerAuthenticator;
     private readonly ConcurrentDictionary<string, SipGatewayRegistration> _registrations = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, PendingTransaction> _pending = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, LateInvite> _lateInvites = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, byte> _serverProcessing = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, CachedServerResponse> _serverResponses = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, Dialog> _dialogs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, PendingTransaction> _pending = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, LateInvite> _lateInvites = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _serverProcessing = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, CachedServerResponse> _serverResponses = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Dialog> _dialogs = new(StringComparer.Ordinal);
+    private sealed class IncomingFork(IncomingCallEventArgs call, CancellationToken lifetime)
+    {
+        public IncomingCallEventArgs Call { get; } = call;
+        public CarrierRelease CarrierRelease { get; } = new();
+        public CancellationTokenSource Cancellation { get; } = CancellationTokenSource.CreateLinkedTokenSource(lifetime);
+        public Task Task { get; set; } = Task.CompletedTask;
+        // Accessed under _forkGate: 0 = ringing, 1 = desktop, 2 = SIP, 3 = rejected.
+        public int PickupOwner;
+        public bool LocalPickupEverClaimed;
+        public TaskCompletionSource LocalPickup { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+    private readonly Dictionary<string, IncomingFork> _incomingForks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _forkGate = new();
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly CancellationTokenSource _receiveLifetime = new();
     private UdpClient? _udp;
+    private IPEndPoint? _localEndPoint;
     private Task? _receiveTask;
     private int _started;
     private int _disposed;
 
     internal TimeSpan InviteTransactionTimeout { get; set; } = TimeSpan.FromSeconds(30);
     internal TimeSpan InviteAckTimeout { get; set; } = TimeSpan.FromSeconds(32);
+    internal TimeSpan MessageTransactionTimeout { get; set; } = TimeSpan.FromSeconds(8);
 
     public SipGateway(SipGatewayOptions options, ISipGatewayCallController controller)
     {
-        _options = options ?? throw new ArgumentNullException(nameof(options));
+        ArgumentNullException.ThrowIfNull(options);
+        options.Validate();
+        _options = SipSmsRecipientAuthority.WithRuntimeEpochs(options.DeepClone());
         _options.Validate();
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
-        _authenticator = new SipDigestAuthenticator(options.Realm, options.Accounts);
+        _authenticator = new SipDigestAuthenticator(_options.Realm, _options.Accounts, _options.LocalRegistrarAlgorithm);
+        if (_options.Peer?.InboundAuth is { } inbound)
+            _peerAuthenticator = new SipDigestAuthenticator(_options.Realm,
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [inbound.Username] = inbound.Password },
+                inbound.Algorithm, strictHeaders: true);
     }
 
     public SipGateway(SipGatewayOptions options, IVoKernel kernel)
@@ -95,12 +122,108 @@ public sealed class SipGateway : IAsyncDisposable
 
     public event EventHandler<SipGatewayStatus>? StatusChanged;
     public event EventHandler<string>? Diagnostic;
+    public event EventHandler<SipIncomingCallClaimed>? IncomingCallClaimed;
 
     public SipGatewayStatus Status => new(
-        _udp != null,
-        _udp?.Client.LocalEndPoint as IPEndPoint,
+        Volatile.Read(ref _udp) != null && Volatile.Read(ref _disposed) == 0,
+        Volatile.Read(ref _localEndPoint), // UI polling must never touch a socket being disposed.
         GetActiveRegistrations(),
-        _dialogs.Count);
+        _dialogs.Values.Count(dialog => dialog.PairedDialogId == null ||
+            string.CompareOrdinal(dialog.LocalCallId, dialog.PairedDialogId) < 0))
+    {
+        PeerEndPoint = _options.Peer?.EndPoint,
+        IncomingTarget = _options.Peer?.IncomingTarget,
+        RequiresConfiguredLines = _options.UsesConfiguredLines,
+        PeerAllowsOutboundCalls = _options.Peer?.AllowOutboundCalls == true,
+        LocalIncomingEnabled = _options.LocalIncomingEnabled,
+        MessagesEnabled = _options.MessagesEnabled, OutgoingSmsEnabled = _options.MessagesEnabled && _options.AllowOutgoingSms,
+        MessagesForwarded = Interlocked.Read(ref _messagesDelivered), MessageFailures = Interlocked.Read(ref _messagesFailed),
+        LineRoutes = _options.LineRoutes.ToDictionary(pair => pair.Key, pair => pair.Value.DeepClone(), StringComparer.OrdinalIgnoreCase)
+    };
+
+    // This can be queried synchronously by desktop alerting, before event subscribers run.
+    public bool RoutesIncomingCalls => _options.UsesConfiguredLines
+        ? _options.LineRoutes.Keys.Any(RoutesIncomingCall) : RoutesIncomingCall(null);
+
+    public bool RoutesIncomingCall(string? slotId) => _udp != null && Volatile.Read(ref _disposed) == 0 &&
+        GetIncomingBindings(slotId).Count > 0;
+
+    private IReadOnlyList<SipGatewayRegistration> GetIncomingBindings(string? slotId)
+    {
+        if (_options.IncomingRoute(slotId) is not { } route) return [];
+        var bindings = GetActiveRegistrations().Where(binding => IsLocalIncomingRecipient(route, binding.Extension, sms: false)).ToList();
+        if (_options.Peer is { } peer && TryGetIncomingPeerTarget(route, sms: false, out var target))
+        {
+            bindings.Add(new(target, $"<sip:{target}@{FormatHost(peer.EndPoint.Address)}:{peer.EndPoint.Port}>",
+                peer.EndPoint, DateTimeOffset.MaxValue, "Fixed SIP peer"));
+        }
+        return bindings;
+    }
+
+    private bool IsLocalIncomingRecipient(SipGatewayLineRoute route, string username, bool sms)
+    {
+        var targets = sms ? route.LocalSmsRecipients : route.LocalIncomingExtensions;
+        if (targets != null) return targets.Contains(username, StringComparer.OrdinalIgnoreCase);
+        var scalar = sms ? route.LocalSmsTarget : route.LocalIncomingTarget;
+        scalar ??= _options.Peer == null ? (sms ? route.SmsTarget : route.IncomingTarget) : null;
+        return string.IsNullOrWhiteSpace(scalar) || username.Equals(scalar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool TryGetIncomingPeerTarget(SipGatewayLineRoute route, bool sms, out string target)
+    {
+        target = "";
+        if (_options.Peer is not { } peer ||
+            (sms ? peer.AllowIncomingMessages == false || route.ForwardSmsToPeer == false :
+                peer.AllowIncomingCalls == false || route.ForwardCallsToPeer == false)) return false;
+        var explicitTarget = sms ? route.SmsTarget : route.IncomingTarget;
+        target = string.IsNullOrWhiteSpace(explicitTarget) ? peer.IncomingTarget : explicitTarget;
+        return true;
+    }
+
+    public bool HasBridgedCalls
+    {
+        get { lock (_forkGate) return _incomingForks.Count > 0 || !_dialogs.IsEmpty; }
+    }
+
+    /// <summary>Claims only this carrier call; the caller then uses normal local AnswerAsync.</summary>
+    public bool TryClaimLocalIncomingCall(string callId, string? slotId)
+    {
+        lock (_forkGate)
+        {
+            if (!_options.LocalIncomingEnabled || Volatile.Read(ref _disposed) != 0 ||
+                !_incomingForks.TryGetValue(IncomingKey(callId, slotId), out var fork) ||
+                fork.Cancellation.IsCancellationRequested || fork.PickupOwner != 0) return false;
+            fork.PickupOwner = 1;
+            fork.LocalPickupEverClaimed = true;
+            fork.LocalPickup.TrySetResult();
+        }
+        RaiseIncomingClaimed(callId, slotId, isLocal: true);
+        return true;
+    }
+
+    private void RaiseIncomingClaimed(string callId, string? slotId, bool isLocal)
+    {
+        try { IncomingCallClaimed?.Invoke(this, new(callId, slotId, isLocal)); } catch { }
+    }
+
+    /// <summary>Allows a failed local answer attempt to be retried; cancelled SIP legs stay cancelled.</summary>
+    public void ReleaseLocalIncomingCallClaim(string callId, string? slotId)
+    {
+        lock (_forkGate)
+            if (_incomingForks.TryGetValue(IncomingKey(callId, slotId), out var fork) && fork.PickupOwner == 1)
+                fork.PickupOwner = 0;
+    }
+
+    /// <summary>Stops every ringing branch before the desktop rejects the carrier leg.</summary>
+    public void CancelIncomingCallRinging(string callId, string? slotId)
+    {
+        lock (_forkGate)
+            if (_incomingForks.TryGetValue(IncomingKey(callId, slotId), out var fork))
+            {
+                fork.PickupOwner = 3;
+                fork.LocalPickup.TrySetResult();
+            }
+    }
 
     public Task StartAsync(CancellationToken ct = default)
     {
@@ -110,9 +233,12 @@ public sealed class SipGateway : IAsyncDisposable
         try
         {
             _udp = new UdpClient(new IPEndPoint(_options.BindAddress, _options.SipPort));
+            _localEndPoint = _udp.Client.LocalEndPoint as IPEndPoint;
             _controller.IncomingCall += OnCarrierIncomingCall;
             _controller.CallEnded += OnCarrierCallEnded;
-            _receiveTask = Task.Run(() => ReceiveLoopAsync(_lifetime.Token));
+            if (_controller is ISipGatewayMessageController messages) messages.SmsReceived += OnCarrierSms;
+            _receiveTask = Task.Run(() => ReceiveLoopAsync(_receiveLifetime.Token));
+            StartSmsForwardWorker();
             RaiseStatus();
             Trace($"SIP gateway listening on {_options.BindAddress}:{_options.SipPort} (private/WireGuard mode).");
             return Task.CompletedTask;
@@ -122,6 +248,7 @@ public sealed class SipGateway : IAsyncDisposable
             Interlocked.Exchange(ref _started, 0);
             _udp?.Dispose();
             _udp = null;
+            _localEndPoint = null;
             throw;
         }
     }
@@ -133,6 +260,9 @@ public sealed class SipGateway : IAsyncDisposable
             try
             {
                 var packet = await _udp!.ReceiveAsync(ct).ConfigureAwait(false);
+                // Apply source policy before parsing, transaction-cache replies,
+                // challenges or unauthenticated OPTIONS can amplify a datagram.
+                if (!_options.IsTrustedSource(packet.RemoteEndPoint.Address)) continue;
                 SipMessage message;
                 try { message = SipMessage.Parse(packet.Buffer); }
                 catch (Exception ex) { Trace($"Dropped malformed SIP datagram from {packet.RemoteEndPoint}: {ex.Message}"); continue; }
@@ -141,25 +271,15 @@ public sealed class SipGateway : IAsyncDisposable
                 {
                     var transactionKey = TransactionKey(message);
                     if (_lateInvites.TryGetValue(transactionKey, out var late) &&
-                        late.Remote.Equals(packet.RemoteEndPoint) &&
-                        string.Equals(ViaBranch(late.Invite), ViaBranch(message), StringComparison.Ordinal) &&
-                        message.StatusCode >= 200)
-                    {
-                        bool acknowledge;
-                        bool sendBye;
-                        lock (late)
-                        {
-                            late.FinalResponse = message;
-                            acknowledge = late.Abandoned && message.StatusCode >= 200;
-                            sendBye = acknowledge && message.StatusCode < 300 && !late.ByeSent;
-                            if (sendBye) late.ByeSent = true;
-                        }
-                        if (acknowledge)
-                            _ = Task.Run(() => SendLateInviteAckByeAsync(late, message, sendBye));
-                    }
+                        late.Remote.Equals(packet.RemoteEndPoint) && ValidLateInviteResponse(late, message) &&
+                        ObserveLateInviteResponse(late, message, out var sendBye))
+                        // ACK sends do not wait for a peer response. BYE work is
+                        // separately bounded and never blocks this receive loop.
+                        await SendLateInviteAckByeAsync(late, message, sendBye).ConfigureAwait(false);
                     if (_pending.TryGetValue(transactionKey, out var pending) &&
                         pending.Remote.Equals(packet.RemoteEndPoint) &&
-                        string.Equals(pending.ViaBranch, ViaBranch(message), StringComparison.Ordinal))
+                        string.Equals(pending.ViaBranch, ViaBranch(message), StringComparison.Ordinal) &&
+                        ResponseMatchesIdentity(message, pending.CallId, pending.FromTag, pending.ToTag))
                     {
                         if (message.StatusCode < 200)
                         {
@@ -207,24 +327,39 @@ public sealed class SipGateway : IAsyncDisposable
 
     private async Task HandleRequestAsync(SipMessage request, IPEndPoint remote, CancellationToken ct)
     {
+        if (Volatile.Read(ref _disposed) != 0 && request.Method.ToUpperInvariant() is "INVITE" or "REGISTER")
+        {
+            await SendResponseAsync(request, remote, 503, "Gateway Stopping", ct).ConfigureAwait(false);
+            return;
+        }
         switch (request.Method.ToUpperInvariant())
         {
             case "REGISTER": await HandleRegisterAsync(request, remote, ct).ConfigureAwait(false); break;
-            case "OPTIONS": await SendResponseAsync(request, remote, 200, "OK", ct).ConfigureAwait(false); break;
+            case "OPTIONS": await SendResponseAsync(request, remote, 200, "OK", ct, response =>
+            {
+                response.SetHeader("Allow", "REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS, INFO" + (_options.MessagesEnabled ? ", MESSAGE" : ""));
+                response.SetHeader("Accept", "application/sdp" + (_options.MessagesEnabled ? ", text/plain" : ""));
+            }).ConfigureAwait(false); break;
             case "INVITE": await HandlePhoneInviteAsync(request, remote, ct).ConfigureAwait(false); break;
             case "ACK": HandleAck(request, remote); break;
             case "CANCEL": await HandleCancelAsync(request, remote, ct).ConfigureAwait(false); break;
             case "BYE": await HandleByeAsync(request, remote, ct).ConfigureAwait(false); break;
             case "INFO": await HandleInfoAsync(request, remote, ct).ConfigureAwait(false); break;
+            case "MESSAGE": await HandleMessageAsync(request, remote, ct).ConfigureAwait(false); break;
             default:
                 await SendResponseAsync(request, remote, 405, "Method Not Allowed", ct, response =>
-                    response.SetHeader("Allow", "REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS, INFO")).ConfigureAwait(false);
+                    response.SetHeader("Allow", "REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, MESSAGE")).ConfigureAwait(false);
                 break;
         }
     }
 
     private async Task HandleRegisterAsync(SipMessage request, IPEndPoint remote, CancellationToken ct)
     {
+        if (IsPeerSource(remote) || _options.Accounts.Count == 0)
+        {
+            await SendResponseAsync(request, remote, 403, "Fixed Trunk Does Not Accept Registrations", ct).ConfigureAwait(false);
+            return;
+        }
         if (!_authenticator.Validate(request, out var username))
         {
             await SendResponseAsync(request, remote, 401, "Unauthorized", ct, response =>
@@ -241,17 +376,43 @@ public sealed class SipGateway : IAsyncDisposable
         var contact = request.GetHeader("Contact")?.Trim();
         if (string.IsNullOrWhiteSpace(contact))
         {
-            await SendResponseAsync(request, remote, 400, "Missing Contact", ct).ConfigureAwait(false);
+            var contacts = GetActiveRegistrations().Where(binding => binding.Extension.Equals(username, StringComparison.OrdinalIgnoreCase)).ToArray();
+            await SendResponseAsync(request, remote, 200, "OK", ct, response =>
+            {
+                foreach (var binding in contacts)
+                    response.AddHeader("Contact", $"{binding.Contact};expires={Math.Max(0, (int)(binding.ExpiresAt - DateTimeOffset.UtcNow).TotalSeconds)}");
+            }).ConfigureAwait(false);
+            return;
+        }
+        if (contact.Length > 512 || contact != "*" && ExtractContactTarget(contact) == null)
+        {
+            await SendResponseAsync(request, remote, 400, "Invalid Contact", ct).ConfigureAwait(false);
             return;
         }
         var expires = ParseExpires(request, contact);
         var key = RegistrationKey(extension, remote);
-        if (expires == 0 || contact == "*")
+        if (contact == "*")
+        {
+            if (expires != 0)
+            {
+                await SendResponseAsync(request, remote, 400, "Wildcard Contact Requires Zero Expiry", ct).ConfigureAwait(false);
+                return;
+            }
+            foreach (var entry in _registrations.Where(pair => pair.Value.Extension.Equals(username, StringComparison.OrdinalIgnoreCase)))
+                _registrations.TryRemove(entry.Key, out _);
+        }
+        else if (expires == 0)
         {
             _registrations.TryRemove(key, out _);
         }
         else
         {
+            if (!_registrations.ContainsKey(key) && GetActiveRegistrations().Count(binding =>
+                binding.Extension.Equals(username, StringComparison.OrdinalIgnoreCase)) >= _options.MaximumContactsPerAccount)
+            {
+                await SendResponseAsync(request, remote, 403, "Registration Contact Limit", ct).ConfigureAwait(false);
+                return;
+            }
             expires = Math.Clamp(expires, _options.MinimumRegistrationSeconds, _options.MaximumRegistrationSeconds);
             _registrations[key] = new SipGatewayRegistration(extension, contact, remote,
                 DateTimeOffset.UtcNow.AddSeconds(expires), request.GetHeader("User-Agent") ?? string.Empty);
@@ -261,15 +422,23 @@ public sealed class SipGateway : IAsyncDisposable
             if (expires > 0) response.SetHeader("Contact", $"{contact};expires={expires}");
             response.SetHeader("Expires", expires.ToString());
         }).ConfigureAwait(false);
+        NotifySmsInboxCommitted();
         RaiseStatus();
     }
 
     private async Task HandlePhoneInviteAsync(SipMessage invite, IPEndPoint remote, CancellationToken serverCt)
     {
-        if (!_authenticator.Validate(invite, out var extension))
+        var fromPeer = IsPeerSource(remote);
+        if (fromPeer && _options.Peer?.AllowOutboundCalls != true || !fromPeer && _options.Accounts.Count == 0)
+        {
+            await SendResponseAsync(invite, remote, 403, "Outbound Carrier Calls Disabled Or Peer Not Allowed", serverCt).ConfigureAwait(false);
+            return;
+        }
+        var authenticator = fromPeer ? _peerAuthenticator! : _authenticator;
+        if (!authenticator.Validate(invite, out var extension))
         {
             await SendResponseAsync(invite, remote, 407, "Proxy Authentication Required", serverCt, response =>
-                response.SetHeader("Proxy-Authenticate", _authenticator.CreateChallenge())).ConfigureAwait(false);
+                response.SetHeader("Proxy-Authenticate", authenticator.CreateChallenge())).ConfigureAwait(false);
             return;
         }
         if (!SipGatewaySdp.TryParseAudioOffer(invite.Body, remote.Address, _options.TrustClientSdpAddress, out var phoneOffer))
@@ -278,14 +447,39 @@ public sealed class SipGateway : IAsyncDisposable
             return;
         }
 
+        var target = ExtractUriUser(invite.RequestUri);
+        if (_options.Accounts.ContainsKey(target))
+        {
+            if (fromPeer)
+            {
+                await SendResponseAsync(invite, remote, 403, "Peer Cannot Route To Local Account", serverCt).ConfigureAwait(false);
+                return;
+            }
+            if (_options.PolicyFor(extension)?.AllowInternalCalls == false || _options.PolicyFor(target)?.AllowInternalCalls == false)
+            {
+                await SendResponseAsync(invite, remote, 403, "Internal Calls Not Permitted", serverCt).ConfigureAwait(false);
+                return;
+            }
+            await HandleExtensionInviteAsync(invite, remote, extension, target, serverCt).ConfigureAwait(false);
+            return;
+        }
         var number = ExtractDialedNumber(invite.RequestUri);
         if (string.IsNullOrWhiteSpace(number))
         {
             await SendResponseAsync(invite, remote, 484, "Address Incomplete", serverCt).ConfigureAwait(false);
             return;
         }
+        string? line;
+        try { (number, line) = _options.ResolveDestination(number, invite.GetHeader("X-VoWin-Line"), extension, fromPeer: fromPeer); }
+        catch (SipGatewayLineRoutingException ex)
+        {
+            await SendResponseAsync(invite, remote, ex.StatusCode, ex.Message, serverCt).ConfigureAwait(false);
+            return;
+        }
         var callId = invite.GetHeader("Call-ID") ?? Guid.NewGuid().ToString("N");
         var linked = CancellationTokenSource.CreateLinkedTokenSource(serverCt, _lifetime.Token);
+        var dialToken = linked.Token;
+        var setupClock = Stopwatch.StartNew();
         var media = new RtpSession(null, localAddress: _options.BindAddress);
         media.SetRemoteEndpoint(phoneOffer!.Address, phoneOffer.Port, phoneOffer.PayloadType, phoneOffer.Codec);
         var dialog = new Dialog
@@ -296,8 +490,10 @@ public sealed class SipGateway : IAsyncDisposable
             Media = media,
             Cancellation = linked,
             OriginalInvite = invite,
+            SlotId = line,
+            RemoteTarget = ExtractContactTarget(invite.GetHeader("Contact")) ?? invite.RequestUri,
             From = invite.GetHeader("From"),
-            To = EnsureTag(invite.GetHeader("To") ?? $"<sip:{number}@{_options.Realm}>")
+            To = EnsureTag(invite.GetHeader("To") ?? $"<sip:{number}@{_options.IdentityHost}>")
         };
         if (!_dialogs.TryAdd(callId, dialog))
         {
@@ -306,18 +502,30 @@ public sealed class SipGateway : IAsyncDisposable
             return;
         }
 
-        await SendResponseAsync(invite, remote, 100, "Trying", serverCt).ConfigureAwait(false);
-        await SendResponseAsync(invite, remote, 180, "Ringing", serverCt, response => response.SetHeader("To", dialog.To!)).ConfigureAwait(false);
         try
         {
-            var line = invite.GetHeader("X-VoWin-Line");
-            var carrier = await _controller.DialCarrierAsync(number, line, linked.Token).ConfigureAwait(false);
+            await SendResponseAsync(invite, remote, 100, "Trying", serverCt).ConfigureAwait(false);
+            await SendResponseAsync(invite, remote, 180, "Ringing", serverCt, response => response.SetHeader("To", dialog.To!)).ConfigureAwait(false);
+            Trace($"Outbound setup accepted; line={line ?? "default"}; elapsed={setupClock.ElapsedMilliseconds}ms; identities omitted.");
+            var carrier = await _controller.DialCarrierAsync(number, line, dialToken, (id, slot) =>
+            {
+                dialog.CarrierCallId = id;
+                dialog.SlotId = slot;
+                Trace($"Outbound carrier INVITE ready; line={slot ?? "default"}; elapsed={setupClock.ElapsedMilliseconds}ms.");
+            }).ConfigureAwait(false);
             dialog.SlotId = carrier.SlotId;
             dialog.CarrierCallId = carrier.Call.CallId;
-            linked.Token.ThrowIfCancellationRequested();
+            if (line is not null && !string.Equals(line, carrier.SlotId, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Carrier controller changed the explicitly selected module.");
+            dialToken.ThrowIfCancellationRequested();
             AttachMedia(dialog, carrier.Media);
             var sdp = SipGatewaySdp.BuildOffer(_options.BindAddress, media.LocalPort, media.LocalRtcpPort, phoneOffer.PayloadType);
-            Volatile.Write(ref dialog.InviteFinalSent, 1);
+            lock (dialog.InviteFinalGate)
+            {
+                dialToken.ThrowIfCancellationRequested();
+                if (Interlocked.CompareExchange(ref dialog.InviteFinalSent, 1, 0) != 0)
+                    throw new OperationCanceledException("Phone INVITE already terminated.");
+            }
             await SendResponseAsync(invite, remote, 200, "OK", serverCt, response =>
             {
                 response.SetHeader("To", dialog.To!);
@@ -333,20 +541,26 @@ public sealed class SipGateway : IAsyncDisposable
         {
             try { await HangupDialogCarrierOnceAsync(dialog).ConfigureAwait(false); }
             catch (Exception ex) { Trace($"Carrier hangup after CANCEL failed: {ex.Message}"); }
-            Volatile.Write(ref dialog.InviteFinalSent, 1);
-            await SendResponseAsync(invite, remote, 487, "Request Terminated", CancellationToken.None,
-                response => response.SetHeader("To", dialog.To!)).ConfigureAwait(false);
-            RemoveDialog(callId);
+            try
+            {
+                if (Interlocked.CompareExchange(ref dialog.InviteFinalSent, 2, 0) == 0)
+                    await SendResponseAsync(invite, remote, 487, "Request Terminated", CancellationToken.None,
+                        response => response.SetHeader("To", dialog.To!)).ConfigureAwait(false);
+            }
+            finally { RemoveDialog(callId); }
         }
         catch (Exception ex)
         {
             try { await HangupDialogCarrierOnceAsync(dialog).ConfigureAwait(false); }
             catch (Exception hangupError) { Trace($"Carrier hangup after bridge failure failed: {hangupError.Message}"); }
             Trace($"Outbound bridge call failed: {ex.Message}");
-            Volatile.Write(ref dialog.InviteFinalSent, 1);
-            await SendResponseAsync(invite, remote, 503, "Carrier Line Unavailable", CancellationToken.None,
-                response => response.SetHeader("To", dialog.To!)).ConfigureAwait(false);
-            RemoveDialog(callId);
+            try
+            {
+                if (Interlocked.CompareExchange(ref dialog.InviteFinalSent, 2, 0) == 0)
+                    await SendResponseAsync(invite, remote, 503, "Carrier Line Unavailable", CancellationToken.None,
+                        response => response.SetHeader("To", dialog.To!)).ConfigureAwait(false);
+            }
+            finally { RemoveDialog(callId); }
         }
     }
 
@@ -355,7 +569,6 @@ public sealed class SipGateway : IAsyncDisposable
         var callId = cancel.GetHeader("Call-ID");
         if (callId == null || !_dialogs.TryGetValue(callId, out var dialog) ||
             dialog.OriginalInvite == null ||
-            Volatile.Read(ref dialog.InviteFinalSent) != 0 ||
             !MatchesCancelTransaction(dialog.OriginalInvite, dialog.PhoneEndPoint, cancel, remote))
         {
             await SendResponseAsync(cancel, remote, 481, "Call/Transaction Does Not Exist", ct).ConfigureAwait(false);
@@ -363,11 +576,31 @@ public sealed class SipGateway : IAsyncDisposable
         }
 
         await SendResponseAsync(cancel, remote, 200, "OK", ct).ConfigureAwait(false);
-        dialog.Cancellation.Cancel();
-        // Before DialCarrierAsync returns, SlotId is unknown. Its cancellation
-        // cleanup owns that carrier leg; null must never fall back to another slot.
-        try { await HangupDialogCarrierOnceAsync(dialog).ConfigureAwait(false); }
-        catch (Exception ex) { Trace($"Carrier hangup after SIP CANCEL failed: {ex.Message}"); }
+        bool terminate;
+        lock (dialog.InviteFinalGate)
+        {
+            terminate = Interlocked.CompareExchange(ref dialog.InviteFinalSent, 2, 0) == 0;
+        }
+        if (!terminate) return; // A final response won: CANCEL has no effect.
+        // End local ownership before publishing the final response. A slow
+        // carrier hangup must not leave a dead dialling dialog visible after
+        // the phone has received 487. The captured dialog still owns cleanup;
+        // a late successful Dial is released through its same once-only guard.
+        RemoveDialog(callId);
+        // Do not wait for carrier cleanup to terminate the phone transaction.
+        try
+        {
+            await SendResponseAsync(dialog.OriginalInvite, remote, 487, "Request Terminated", ct,
+                response => response.SetHeader("To", dialog.To!)).ConfigureAwait(false);
+        }
+        finally
+        {
+            // A failed phone response must not skip carrier cleanup. Before
+            // Dial returns, its cancellation path owns any still-unknown leg;
+            // null must never fall back to another modem.
+            try { await HangupDialogCarrierOnceAsync(dialog).ConfigureAwait(false); }
+            catch (Exception ex) { Trace($"Carrier hangup after SIP CANCEL failed: {ex.Message}"); }
+        }
     }
 
     private void HandleAck(SipMessage ack, IPEndPoint remote)
@@ -375,7 +608,7 @@ public sealed class SipGateway : IAsyncDisposable
         var callId = ack.GetHeader("Call-ID");
         if (callId == null || !_dialogs.TryGetValue(callId, out var dialog) ||
             dialog.OriginalInvite == null || !dialog.PhoneEndPoint.Equals(remote) ||
-            Volatile.Read(ref dialog.InviteFinalSent) == 0 ||
+            Volatile.Read(ref dialog.InviteFinalSent) != 1 ||
             !MatchesDialogTags(dialog.From, dialog.To, true, ack)) return;
         var inviteSequence = dialog.OriginalInvite.GetHeader("CSeq")?.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
         var ackParts = ack.GetHeader("CSeq")?.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -413,21 +646,39 @@ public sealed class SipGateway : IAsyncDisposable
         if (dialogToken.IsCancellationRequested || dialog.InviteAcknowledged.Task.IsCompleted) return;
         if (!_dialogs.TryGetValue(dialog.LocalCallId, out var active) || !ReferenceEquals(active, dialog)) return;
         Trace($"SIP INVITE ACK timed out for {dialog.LocalCallId}; clearing carrier call.");
+        // As in the Rust call actor, local state/media must be idle before a
+        // slow carrier cleanup can complete or re-enter through CallEnded.
+        RemoveDialog(dialog.LocalCallId);
         try { await HangupDialogCarrierOnceAsync(dialog).ConfigureAwait(false); }
         catch (Exception ex) { Trace($"Carrier hangup after SIP ACK timeout failed: {ex.Message}"); }
-        RemoveDialog(dialog.LocalCallId);
     }
 
     private async Task HangupDialogCarrierOnceAsync(Dialog dialog)
     {
-        if (dialog.CarrierCallId == null || Interlocked.Exchange(ref dialog.CarrierHangupStarted, 1) != 0) return;
+        if (dialog.PairedDialogId is { } pairedId && _dialogs.TryGetValue(pairedId, out var paired))
+        {
+            try
+            {
+                if (paired.OriginalInvite == null) await SendAckAsync(paired, CancellationToken.None).ConfigureAwait(false);
+                await SendByeAsync(paired, CancellationToken.None).ConfigureAwait(false);
+            }
+            finally { RemoveDialog(pairedId); }
+            return;
+        }
+        if (dialog.CarrierCallId == null) return;
+        await HangupCarrierOnceAsync(dialog.CarrierCallId, dialog.SlotId, dialog.CarrierRelease).ConfigureAwait(false);
+    }
+
+    private async Task HangupCarrierOnceAsync(string callId, string? slotId, CarrierRelease release)
+    {
+        if (Interlocked.Exchange(ref release.Started, 1) != 0) return;
         try
         {
-            await _controller.HangupAsync(dialog.SlotId, CancellationToken.None).ConfigureAwait(false);
+            await _controller.HangupCarrierCallAsync(callId, slotId, CancellationToken.None).ConfigureAwait(false);
         }
         catch
         {
-            Volatile.Write(ref dialog.CarrierHangupStarted, 0);
+            Volatile.Write(ref release.Started, 0);
             throw;
         }
     }
@@ -454,13 +705,14 @@ public sealed class SipGateway : IAsyncDisposable
     {
         var callId = bye.GetHeader("Call-ID");
         if (callId == null || !_dialogs.TryGetValue(callId, out var dialog) ||
-            !dialog.PhoneEndPoint.Equals(remote) || dialog.CarrierCallId == null ||
+            !dialog.PhoneEndPoint.Equals(remote) || dialog.CarrierCallId == null && dialog.PairedDialogId == null ||
             (dialog.OriginalInvite != null && Volatile.Read(ref dialog.InviteFinalSent) == 0) ||
             !MatchesDialogTags(dialog.From, dialog.To, dialog.OriginalInvite != null, bye))
         {
             await SendResponseAsync(bye, remote, 481, "Call/Transaction Does Not Exist", ct).ConfigureAwait(false);
             return;
         }
+        Volatile.Write(ref dialog.PeerEnded, 1);
         await SendResponseAsync(bye, remote, 200, "OK", ct).ConfigureAwait(false);
         RemoveDialog(callId);
         await HangupDialogCarrierOnceAsync(dialog).ConfigureAwait(false);
@@ -500,55 +752,133 @@ public sealed class SipGateway : IAsyncDisposable
 
     private void OnCarrierIncomingCall(object? sender, IncomingCallEventArgs e)
     {
-        _ = Task.Run(() => ForkIncomingCallAsync(e, _lifetime.Token));
+        if (!RoutesIncomingCall(e.SlotId)) return;
+        var key = IncomingKey(e.CallId, e.SlotId);
+        lock (_forkGate)
+        {
+            if (Volatile.Read(ref _disposed) != 0 || _incomingForks.ContainsKey(key) ||
+                _dialogs.Values.Any(dialog => dialog.CarrierCallId == e.CallId && dialog.SlotId == e.SlotId)) return;
+            var fork = new IncomingFork(e, _lifetime.Token);
+            _incomingForks.Add(key, fork);
+            fork.Task = Task.Run(async () =>
+            {
+                try { await ForkIncomingCallAsync(fork, fork.Cancellation.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) { }
+                catch (Exception ex) { Trace($"Incoming SIP bridge failed: {ex.GetType().Name}."); }
+                finally
+                {
+                    lock (_forkGate) { _incomingForks.Remove(key); fork.Cancellation.Dispose(); }
+                }
+            });
+        }
     }
 
-    private async Task ForkIncomingCallAsync(IncomingCallEventArgs incoming, CancellationToken ct)
+    private static string IncomingKey(string callId, string? slotId) => $"{slotId}\0{callId}";
+
+    private async Task ForkIncomingCallAsync(IncomingFork fork, CancellationToken ct)
     {
-        var bindings = GetActiveRegistrations();
+        var incoming = fork.Call;
+        var bindings = GetIncomingBindings(incoming.SlotId);
         if (bindings.Count == 0) { Trace($"Incoming carrier call from {incoming.CallerNumber}: no SIP extensions are registered."); return; }
 
         using var race = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var branches = bindings.Select(binding => InviteBindingAsync(binding, incoming, race.Token)).ToList();
         while (branches.Count > 0)
         {
-            var completed = await Task.WhenAny(branches).ConfigureAwait(false);
-            branches.Remove(completed);
-            var winner = await completed.ConfigureAwait(false);
+            var completed = await Task.WhenAny(branches.Cast<Task>().Append(fork.LocalPickup.Task)).ConfigureAwait(false);
+            if (completed == fork.LocalPickup.Task)
+            {
+                race.Cancel();
+                await CleanupLosingBranchesAsync(branches).ConfigureAwait(false);
+                // Keep the ownership record through the local call. A duplicate
+                // incoming event must not start a new fork after desktop pickup.
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
+                return;
+            }
+            var completedBranch = (Task<Dialog?>)completed;
+            branches.Remove(completedBranch);
+            var winner = await completedBranch.ConfigureAwait(false);
             if (winner == null) continue;
+            var sipWon = false;
+            lock (_forkGate)
+            {
+                if (fork.PickupOwner == 0 && !fork.LocalPickupEverClaimed && !ct.IsCancellationRequested)
+                {
+                    fork.PickupOwner = 2;
+                    sipWon = true;
+                }
+            }
+            if (!sipWon)
+            {
+                race.Cancel();
+                await CleanupLosingBranchesAsync(branches.Prepend(Task.FromResult<Dialog?>(winner))).ConfigureAwait(false);
+                if (!ct.IsCancellationRequested)
+                    await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
+                return;
+            }
             race.Cancel();
             _ = CleanupLosingBranchesAsync(branches);
             var ackSent = false;
+            // A fork and its promoted dialog can coexist during shutdown. Both
+            // must share the same carrier-release owner, including failure cleanup.
+            winner.CarrierRelease = fork.CarrierRelease;
+            winner.SlotId = incoming.SlotId;
+            winner.CarrierCallId = incoming.CallId;
+            // The peer dialog already exists after its 200. Accept BYE even while
+            // the operator-side 200/ACK handshake is still in flight.
+            using var answering = CancellationTokenSource.CreateLinkedTokenSource(ct, winner.Cancellation.Token);
+            _dialogs[winner.LocalCallId] = winner;
+            RaiseIncomingClaimed(incoming.CallId, incoming.SlotId, isLocal: false);
             try
             {
-                await SendAckAsync(winner, ct).ConfigureAwait(false);
+                answering.Token.ThrowIfCancellationRequested();
+                await SendAckAsync(winner, answering.Token).ConfigureAwait(false);
                 ackSent = true;
-                var carrier = await _controller.AnswerCarrierAsync(incoming.SlotId, ct).ConfigureAwait(false);
+                var carrier = await _controller.AnswerCarrierCallAsync(incoming.CallId, incoming.SlotId, answering.Token).ConfigureAwait(false);
+                answering.Token.ThrowIfCancellationRequested();
                 winner.SlotId = carrier.SlotId;
                 winner.CarrierCallId = carrier.Call.CallId;
                 AttachMedia(winner, carrier.Media);
-                _dialogs[winner.LocalCallId] = winner;
                 RaiseStatus();
                 return;
             }
             catch (Exception ex)
             {
                 Trace($"Could not answer incoming carrier call through SIP endpoint: {ex.Message}");
-                if (ackSent)
-                    try { await SendByeAsync(winner, CancellationToken.None).ConfigureAwait(false); }
-                    catch (Exception byeError) { Trace($"Could not terminate accepted SIP fork: {byeError.Message}"); }
-                winner.Dispose();
-                await _controller.HangupAsync(incoming.SlotId, CancellationToken.None).ConfigureAwait(false);
+                try
+                {
+                    if (!ackSent) await SendAckAsync(winner, CancellationToken.None).ConfigureAwait(false);
+                    if (Volatile.Read(ref winner.PeerEnded) == 0) await SendByeAsync(winner, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception byeError) { Trace($"Could not terminate accepted SIP fork: {byeError.Message}"); }
+                try
+                {
+                    if (!ct.IsCancellationRequested)
+                        await HangupDialogCarrierOnceAsync(winner).ConfigureAwait(false);
+                }
+                finally { RemoveDialog(winner.LocalCallId); }
                 return;
             }
         }
-        await _controller.HangupAsync(incoming.SlotId, CancellationToken.None).ConfigureAwait(false);
+        if (_options.LocalIncomingEnabled && !ct.IsCancellationRequested)
+        {
+            Trace($"SIP incoming branches ended on line {incoming.SlotId ?? "fallback"}; desktop is still ringing.");
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);
+            return;
+        }
+        if (!ct.IsCancellationRequested)
+            await HangupCarrierOnceAsync(incoming.CallId, incoming.SlotId, fork.CarrierRelease).ConfigureAwait(false);
     }
 
     private async Task<Dialog?> InviteBindingAsync(SipGatewayRegistration binding, IncomingCallEventArgs incoming, CancellationToken ct)
     {
+        // The whole logical branch has one budget, including challenge ACK and
+        // authenticated retry. A peer cannot renew it by returning a late 407.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        deadline.CancelAfter(InviteTransactionTimeout);
+        var branchToken = deadline.Token;
         var media = new RtpSession(null, localAddress: _options.BindAddress);
-        var callId = Guid.NewGuid().ToString("N") + "@" + _options.Realm;
+        var callId = Guid.NewGuid().ToString("N") + "@" + _options.IdentityHost;
         var fromTag = Guid.NewGuid().ToString("N")[..10];
         var invite = new SipMessage
         {
@@ -559,21 +889,47 @@ public sealed class SipGateway : IAsyncDisposable
         };
         invite.SetHeader("Via", $"SIP/2.0/UDP {FormatHost(_options.BindAddress)}:{_options.SipPort};branch=z9hG4bK{Guid.NewGuid():N};rport");
         invite.SetHeader("Max-Forwards", "70");
-        invite.SetHeader("From", $"\"{incoming.DisplayName}\" <sip:{SanitizeUser(incoming.CallerNumber)}@{_options.Realm}>;tag={fromTag}");
-        invite.SetHeader("To", $"<sip:{binding.Extension}@{_options.Realm}>");
+        invite.SetHeader("From", $"<sip:{SanitizeUser(incoming.CallerNumber)}@{_options.IdentityHost}>;tag={fromTag}");
+        invite.SetHeader("To", $"<sip:{binding.Extension}@{_options.IdentityHost}>");
         invite.SetHeader("Call-ID", callId);
         invite.SetHeader("CSeq", "1 INVITE");
         invite.SetHeader("Contact", $"<sip:gateway@{FormatHost(_options.BindAddress)}:{_options.SipPort};transport=udp>");
         invite.SetHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO");
+        if (_options.Peer is not null && incoming.SlotId is { } incomingLine &&
+            Regex.IsMatch(incomingLine, @"^[A-Za-z0-9_.:-]{1,128}$"))
+            invite.SetHeader("X-VoWin-Line", incomingLine);
         invite.SetHeader("Content-Type", "application/sdp");
-        invite.Body = SipGatewaySdp.BuildOffer(_options.BindAddress, media.LocalPort, media.LocalRtcpPort);
+        invite.Body = SipGatewaySdp.BuildOffer(_options.BindAddress, media.LocalPort, media.LocalRtcpPort, offerBoth: true);
         var transactionKey = TransactionKey(invite);
-        var late = new LateInvite(invite, binding.RemoteEndPoint);
-        _lateInvites[transactionKey] = late;
+        LateInvite? late = null;
 
         try
         {
-            var response = await SendRequestFinalAsync(invite, binding.RemoteEndPoint, ct, InviteTransactionTimeout).ConfigureAwait(false);
+            branchToken.ThrowIfCancellationRequested();
+            late = TrackLateInvite(invite, binding.RemoteEndPoint, previous: null);
+            var response = await SendRequestFinalAsync(invite, binding.RemoteEndPoint, branchToken, InviteTransactionTimeout).ConfigureAwait(false);
+            // One authenticated retry only. Credentials never follow redirects or another source endpoint.
+            if (response.StatusCode is 401 or 407 && _options.Peer is { } authPeer && authPeer.EndPoint.Equals(binding.RemoteEndPoint))
+            {
+                await SendLateInviteAckByeAsync(late, response, false).ConfigureAwait(false);
+                branchToken.ThrowIfCancellationRequested();
+                var authorizationName = response.StatusCode == 401 ? "Authorization" : "Proxy-Authorization";
+                var authorization = SipPeerDigest.CreatePreferred(response, invite, authPeer);
+                if (authorization != null)
+                {
+                    // Retain the rejected transaction to ACK retransmitted challenges.
+                    RetireLateInvite(late);
+                    invite = SipMessage.Parse(invite.ToBytes());
+                    invite.SetHeader("Via", $"SIP/2.0/UDP {FormatHost(_options.BindAddress)}:{_options.SipPort};branch=z9hG4bK{Guid.NewGuid():N};rport");
+                    invite.SetHeader("CSeq", "2 INVITE");
+                    invite.SetHeader(authorizationName, authorization);
+                    transactionKey = TransactionKey(invite);
+                    branchToken.ThrowIfCancellationRequested();
+                    late = TrackLateInvite(invite, binding.RemoteEndPoint, previous: late);
+                    response = await SendRequestFinalAsync(invite, binding.RemoteEndPoint, branchToken, InviteTransactionTimeout).ConfigureAwait(false);
+                }
+                else Trace("SIP peer returned an unsupported Digest challenge.");
+            }
             if (response.StatusCode is < 200 or >= 300 ||
                 !SipGatewaySdp.TryParseAudioOffer(response.Body, binding.RemoteEndPoint.Address, _options.TrustClientSdpAddress, out var answer))
             {
@@ -584,6 +940,7 @@ public sealed class SipGateway : IAsyncDisposable
                 media.Dispose();
                 return null;
             }
+            branchToken.ThrowIfCancellationRequested();
             media.SetRemoteEndpoint(answer!.Address, answer.Port, answer.PayloadType, answer.Codec);
             var dialog = new Dialog
             {
@@ -594,109 +951,65 @@ public sealed class SipGateway : IAsyncDisposable
                 Cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token),
                 RemoteTarget = ExtractContactTarget(response.GetHeader("Contact")) ?? invite.RequestUri,
                 From = invite.GetHeader("From"),
-                To = response.GetHeader("To") ?? invite.GetHeader("To")
+                To = response.GetHeader("To") ?? invite.GetHeader("To"),
+                InviteCSeq = int.Parse(invite.GetHeader("CSeq")!.Split(' ')[0]),
+                LocalCSeq = int.Parse(invite.GetHeader("CSeq")!.Split(' ')[0]) + 1
             };
-            _lateInvites.TryRemove(transactionKey, out _);
+            // Acceptance is irreversible for this dialog family: commit only
+            // after all media/dialog construction that can fail has succeeded.
+            if (branchToken.IsCancellationRequested || !TryAcceptLateInvite(late, response))
+            {
+                dialog.Dispose();
+                AbandonLateInvite(transactionKey, late);
+                return null;
+            }
             return dialog;
         }
         catch (OperationCanceledException)
         {
-            AbandonLateInvite(transactionKey, late);
-            await SendCancelForInviteAsync(invite, binding.RemoteEndPoint).ConfigureAwait(false);
+            if (late != null)
+            {
+                AbandonLateInvite(transactionKey, late);
+                await SendCancelForInviteAsync(invite, binding.RemoteEndPoint).ConfigureAwait(false);
+            }
             media.Dispose();
             return null;
         }
         catch (TimeoutException)
         {
-            AbandonLateInvite(transactionKey, late);
-            await SendCancelForInviteAsync(invite, binding.RemoteEndPoint).ConfigureAwait(false);
+            if (late != null)
+            {
+                AbandonLateInvite(transactionKey, late);
+                await SendCancelForInviteAsync(invite, binding.RemoteEndPoint).ConfigureAwait(false);
+            }
             media.Dispose();
             return null;
         }
         catch (Exception ex)
         {
-            AbandonLateInvite(transactionKey, late);
+            if (late != null) AbandonLateInvite(transactionKey, late);
             Trace($"SIP fork branch to {binding.RemoteEndPoint} failed: {ex.Message}");
             media.Dispose();
             return null;
         }
     }
 
-    private void AbandonLateInvite(string transactionKey, LateInvite late)
-    {
-        SipMessage? final;
-        bool sendBye;
-        lock (late)
-        {
-            late.Abandoned = true;
-            final = late.FinalResponse;
-            sendBye = final?.StatusCode is >= 200 and < 300 && !late.ByeSent;
-            if (sendBye) late.ByeSent = true;
-        }
-        if (final?.StatusCode >= 200)
-            _ = Task.Run(() => SendLateInviteAckByeAsync(late, final, sendBye));
-    }
-
-    private async Task SendLateInviteAckByeAsync(LateInvite late, SipMessage response, bool sendBye)
-    {
-        try
-        {
-            var accepted = response.StatusCode is >= 200 and < 300;
-            var target = accepted
-                ? ExtractContactTarget(response.GetHeader("Contact")) ?? late.Invite.RequestUri
-                : late.Invite.RequestUri;
-            var inviteCseq = int.TryParse(late.Invite.GetHeader("CSeq")?.Split(' ')[0], out var parsed)
-                ? parsed : 1;
-            SipMessage MakeRequest(string method, int cseq)
-            {
-                var request = new SipMessage { IsRequest = true, Method = method, RequestUri = target };
-                request.SetHeader("Via", method == "ACK" && !accepted
-                    ? late.Invite.GetHeader("Via") ?? string.Empty
-                    : $"SIP/2.0/UDP {FormatHost(_options.BindAddress)}:{_options.SipPort};branch=z9hG4bK{Guid.NewGuid():N};rport");
-                request.SetHeader("Max-Forwards", "70");
-                request.SetHeader("From", late.Invite.GetHeader("From") ?? string.Empty);
-                request.SetHeader("To", response.GetHeader("To") ?? string.Empty);
-                request.SetHeader("Call-ID", late.Invite.GetHeader("Call-ID") ?? string.Empty);
-                request.SetHeader("CSeq", $"{cseq} {method}");
-                request.SetHeader("Content-Length", "0");
-                return request;
-            }
-
-            await SendAsync(MakeRequest("ACK", inviteCseq), late.Remote, CancellationToken.None).ConfigureAwait(false);
-            if (sendBye)
-                _ = await SendRequestFinalAsync(MakeRequest("BYE", inviteCseq + 1), late.Remote,
-                    CancellationToken.None, TimeSpan.FromSeconds(4)).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            if (sendBye)
-                lock (late) late.ByeSent = false;
-            Trace($"Late SIP INVITE cleanup failed: {ex.Message}");
-        }
-    }
-
-    private void CleanupLateInvites()
-    {
-        var cutoff = DateTimeOffset.UtcNow.AddMinutes(-2);
-        foreach (var entry in _lateInvites)
-            if (entry.Value.CreatedAt < cutoff) _lateInvites.TryRemove(entry.Key, out _);
-    }
-
     private async Task CleanupLosingBranchesAsync(IEnumerable<Task<Dialog?>> branches)
     {
         foreach (var task in branches)
         {
+            Dialog? dialog = null;
             try
             {
-                var dialog = await task.ConfigureAwait(false);
+                dialog = await task.ConfigureAwait(false);
                 if (dialog == null) continue;
                 // A simultaneous 200 OK must be ACKed before the losing dialog is
                 // terminated; CANCEL cannot tear down an already accepted branch.
                 await SendAckAsync(dialog, CancellationToken.None).ConfigureAwait(false);
                 await SendByeAsync(dialog, CancellationToken.None).ConfigureAwait(false);
-                dialog.Dispose();
             }
             catch { }
+            finally { dialog?.Dispose(); }
         }
     }
 
@@ -719,38 +1032,62 @@ public sealed class SipGateway : IAsyncDisposable
 
     private void AttachMedia(Dialog dialog, ICallPcmMedia carrier)
     {
-        dialog.CarrierMedia = carrier;
-        dialog.DownlinkHandler = dialog.Media.SendAudioPcm;
-        carrier.RemotePcmReceived += dialog.DownlinkHandler;
-        dialog.Media.OnAudioDecoded = carrier.SendExternalPcm;
-        dialog.Media.OnDtmfReceived = (digit, durationMs) =>
+        lock (dialog)
         {
-            _ = durationMs;
-            _ = _controller.SendDtmfAsync(digit, dialog.SlotId, CancellationToken.None);
-        };
+            ObjectDisposedException.ThrowIf(dialog.IsDisposed, dialog);
+            dialog.CarrierMedia = carrier;
+            dialog.DownlinkHandler = dialog.Media.SendAudioPcm;
+            carrier.RemotePcmReceived += dialog.DownlinkHandler;
+            dialog.Media.OnAudioDecoded = carrier.SendExternalPcm;
+            dialog.Media.OnDtmfReceived = (digit, durationMs) =>
+            {
+                _ = durationMs;
+                _ = _controller.SendDtmfAsync(digit, dialog.SlotId, CancellationToken.None);
+            };
+        }
     }
 
     private async Task SendAckAsync(Dialog dialog, CancellationToken ct)
     {
-        var ack = new SipMessage { IsRequest = true, Method = "ACK", RequestUri = dialog.RemoteTarget ?? $"sip:{dialog.Extension}@{_options.Realm}" };
-        FillDialogHeaders(ack, dialog, 1, "ACK");
+        var ack = new SipMessage { IsRequest = true, Method = "ACK", RequestUri = dialog.RemoteTarget ?? $"sip:{dialog.Extension}@{_options.IdentityHost}" };
+        FillDialogHeaders(ack, dialog, dialog.InviteCSeq, "ACK");
         await SendAsync(ack, dialog.PhoneEndPoint, ct).ConfigureAwait(false);
     }
 
     private async Task SendByeAsync(Dialog dialog, CancellationToken ct)
     {
-        var bye = new SipMessage { IsRequest = true, Method = "BYE", RequestUri = dialog.RemoteTarget ?? $"sip:{dialog.Extension}@{_options.Realm}" };
+        if (Volatile.Read(ref dialog.PeerEnded) != 0 || Interlocked.Exchange(ref dialog.ByeStarted, 1) != 0) return;
+        var bye = new SipMessage { IsRequest = true, Method = "BYE", RequestUri = dialog.RemoteTarget ?? $"sip:{dialog.Extension}@{_options.IdentityHost}" };
         FillDialogHeaders(bye, dialog, dialog.LocalCSeq++, "BYE");
-        try { _ = await SendRequestFinalAsync(bye, dialog.PhoneEndPoint, ct, TimeSpan.FromSeconds(4)).ConfigureAwait(false); }
+        try { await SendByeRequestWithAuthAsync(bye, dialog.PhoneEndPoint, ct).ConfigureAwait(false); }
         catch { }
+    }
+
+    private async Task SendByeRequestWithAuthAsync(SipMessage bye, IPEndPoint remote, CancellationToken ct)
+    {
+        // Keep the original four-second total cleanup budget; an authentication
+        // challenge must not double shutdown/hangup latency or replay a call.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(TimeSpan.FromSeconds(4));
+        var response = await SendRequestFinalAsync(bye, remote, deadline.Token, TimeSpan.FromSeconds(4)).ConfigureAwait(false);
+        if (_options.Peer is not { } peer || !peer.EndPoint.Equals(remote)) return;
+        var authorization = SipPeerDigest.CreatePreferred(response, bye, peer);
+        if (authorization == null) return;
+        var sequence = int.Parse(bye.GetHeader("CSeq")!.Split(' ')[0]);
+        bye = SipMessage.Parse(bye.ToBytes());
+        bye.SetHeader("Via", $"SIP/2.0/UDP {FormatHost(_options.BindAddress)}:{_options.SipPort};branch=z9hG4bK{Guid.NewGuid():N};rport");
+        bye.SetHeader("CSeq", $"{sequence + 1} BYE");
+        bye.SetHeader(response.StatusCode == 401 ? "Authorization" : "Proxy-Authorization", authorization);
+        _ = await SendRequestFinalAsync(bye, remote, deadline.Token, TimeSpan.FromSeconds(4)).ConfigureAwait(false);
     }
 
     private void FillDialogHeaders(SipMessage request, Dialog dialog, int cseq, string method)
     {
         request.SetHeader("Via", $"SIP/2.0/UDP {FormatHost(_options.BindAddress)}:{_options.SipPort};branch=z9hG4bK{Guid.NewGuid():N};rport");
         request.SetHeader("Max-Forwards", "70");
-        request.SetHeader("From", dialog.From ?? $"<sip:gateway@{_options.Realm}>");
-        request.SetHeader("To", dialog.To ?? $"<sip:{dialog.Extension}@{_options.Realm}>");
+        // For a peer-originated dialog the local tag is in the original To.
+        request.SetHeader("From", (dialog.OriginalInvite == null ? dialog.From : dialog.To) ?? $"<sip:gateway@{_options.IdentityHost}>");
+        request.SetHeader("To", (dialog.OriginalInvite == null ? dialog.To : dialog.From) ?? $"<sip:{dialog.Extension}@{_options.IdentityHost}>");
         request.SetHeader("Call-ID", dialog.LocalCallId);
         request.SetHeader("CSeq", $"{cseq} {method}");
         request.SetHeader("Content-Length", "0");
@@ -758,13 +1095,28 @@ public sealed class SipGateway : IAsyncDisposable
 
     private void OnCarrierCallEnded(object? sender, CallEndedEventArgs e)
     {
+        lock (_forkGate)
+            if (_incomingForks.TryGetValue(IncomingKey(e.CallId, e.SlotId), out var fork)) fork.Cancellation.Cancel();
         foreach (var entry in _dialogs.Where(pair =>
                      MatchesCarrierCallEnd(pair.Value.CarrierCallId, pair.Value.SlotId, e)).ToArray())
         {
             _ = Task.Run(async () =>
             {
-                await SendByeAsync(entry.Value, CancellationToken.None).ConfigureAwait(false);
-                RemoveDialog(entry.Key);
+                var dialog = entry.Value;
+                if (dialog.OriginalInvite != null &&
+                    Interlocked.CompareExchange(ref dialog.InviteFinalSent, 2, 0) == 0)
+                {
+                    RemoveDialog(entry.Key);
+                    await SendResponseAsync(dialog.OriginalInvite, dialog.PhoneEndPoint, 487, "Request Terminated",
+                        CancellationToken.None, response => response.SetHeader("To", dialog.To!)).ConfigureAwait(false);
+                }
+                else
+                {
+                    var needsBye = (dialog.OriginalInvite == null || Volatile.Read(ref dialog.InviteFinalSent) == 1) &&
+                        !dialog.Cancellation.IsCancellationRequested;
+                    RemoveDialog(entry.Key);
+                    if (needsBye) await SendByeAsync(dialog, CancellationToken.None).ConfigureAwait(false);
+                }
             });
         }
     }
@@ -774,11 +1126,13 @@ public sealed class SipGateway : IAsyncDisposable
         string.Equals(carrierCallId, ended.CallId, StringComparison.OrdinalIgnoreCase) &&
         (slotId == null || ended.SlotId == null || string.Equals(slotId, ended.SlotId, StringComparison.OrdinalIgnoreCase));
 
-    private async Task<SipMessage> SendRequestFinalAsync(SipMessage request, IPEndPoint remote, CancellationToken ct, TimeSpan? timeout = null)
+    private async Task<SipMessage> SendRequestFinalAsync(SipMessage request, IPEndPoint remote, CancellationToken ct, TimeSpan? timeout = null,
+        Func<CancellationToken, Task<bool>>? beforeSend = null)
     {
+        ct.ThrowIfCancellationRequested();
         var key = TransactionKey(request);
         var tcs = new TaskCompletionSource<SipMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pending = new PendingTransaction(tcs, null, remote, ViaBranch(request));
+        var pending = new PendingTransaction(tcs, null, remote, ViaBranch(request), request.GetHeader("Call-ID") ?? "", HeaderTag(request.GetHeader("From")), HeaderTag(request.GetHeader("To")));
         if (!_pending.TryAdd(key, pending)) throw new InvalidOperationException("Duplicate SIP client transaction.");
         try
         {
@@ -788,13 +1142,31 @@ public sealed class SipGateway : IAsyncDisposable
             foreach (var delay in delays)
             {
                 if (delay > 0) await Task.Delay(delay, timer.Token).ConfigureAwait(false);
+                timer.Token.ThrowIfCancellationRequested();
                 if (tcs.Task.IsCompleted) return await tcs.Task.ConfigureAwait(false);
                 if (!pending.ReceivedProvisional || !request.Method.Equals("INVITE", StringComparison.OrdinalIgnoreCase))
+                {
+                    // MT payloads supply this guard; OPTIONS/voice/dialog
+                    // requests retain their existing transport behavior. Check
+                    // every datagram, including after the retransmission wait.
+                    if (beforeSend != null)
+                    {
+                        var allowed = await beforeSend(timer.Token).ConfigureAwait(false);
+                        timer.Token.ThrowIfCancellationRequested();
+                        // A legitimate final reply may arrive while SQLite was
+                        // awaited. Do not retransmit an already completed send.
+                        if (tcs.Task.IsCompleted) return await tcs.Task.ConfigureAwait(false);
+                        if (!allowed) throw new InvalidOperationException("The original SMS source is no longer available for transmission.");
+                    }
                     await SendAsync(request, remote, timer.Token).ConfigureAwait(false);
+                }
                 var won = await Task.WhenAny(tcs.Task, Task.Delay(delay == 0 ? 500 : delay, timer.Token)).ConfigureAwait(false);
+                timer.Token.ThrowIfCancellationRequested();
                 if (won == tcs.Task) return await tcs.Task.ConfigureAwait(false);
             }
-            return await tcs.Task.WaitAsync(timer.Token).ConfigureAwait(false);
+            var final = await tcs.Task.WaitAsync(timer.Token).ConfigureAwait(false);
+            timer.Token.ThrowIfCancellationRequested();
+            return final;
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new TimeoutException("SIP transaction timed out."); }
         finally { _pending.TryRemove(key, out _); }
@@ -831,12 +1203,47 @@ public sealed class SipGateway : IAsyncDisposable
     private static string TransactionKey(SipMessage message)
     {
         var cseq = message.GetHeader("CSeq")?.Split(' ', StringSplitOptions.RemoveEmptyEntries) ?? [];
-        return $"{message.GetHeader("Call-ID")}|{(cseq.Length > 0 ? cseq[0] : "0")}|{(cseq.Length > 1 ? cseq[1] : message.Method)}";
+        // Distinct fork dialogs can legitimately use the same Call-ID/CSeq
+        // for their BYEs. A client transaction is also scoped to its Via
+        // branch; otherwise one tag's cleanup can suppress another's BYE.
+        return $"{message.GetHeader("Call-ID")}|{(cseq.Length > 0 ? cseq[0] : "0")}|{(cseq.Length > 1 ? cseq[1] : message.Method)}|{ViaBranch(message)}";
     }
 
     private static string ViaBranch(SipMessage message) => Regex.Match(
         message.GetHeader("Via") ?? string.Empty,
         @"(?:^|;)\s*branch\s*=\s*([^;\s,]+)", RegexOptions.IgnoreCase).Groups[1].Value;
+
+    internal static bool ResponseMatchesRequestIdentity(SipMessage request, SipMessage response) =>
+        ResponseMatchesIdentity(response, request.GetHeader("Call-ID") ?? "", HeaderTag(request.GetHeader("From")), HeaderTag(request.GetHeader("To")));
+
+    private static bool ResponseMatchesIdentity(SipMessage response, string callId, string fromTag, string toTag)
+    {
+        if (response.IsRequest || response.StatusCode is < 100 or > 699) return false;
+        foreach (var name in new[] { "From", "To", "Call-ID", "CSeq" })
+            if (!response.Headers.TryGetValue(name, out var values) || values.Count != 1) return false;
+        if (fromTag.Length == 0 || !TryHeaderTag(response.GetHeader("From"), out var responseFromTag) ||
+            !TryHeaderTag(response.GetHeader("To"), out var responseToTag)) return false;
+        // Call-ID and tags are case-sensitive opaque identifiers, not domains.
+        // A matching socket/branch alone must not complete a different dialog.
+        return string.Equals(callId, response.GetHeader("Call-ID"), StringComparison.Ordinal) &&
+            string.Equals(fromTag, responseFromTag, StringComparison.Ordinal) &&
+            (toTag.Length == 0 || string.Equals(toTag, responseToTag, StringComparison.Ordinal));
+    }
+
+    private static string HeaderTag(string? value) => TryHeaderTag(value, out var tag) ? tag : "";
+
+    private static bool TryHeaderTag(string? value, out string tag)
+    {
+        tag = "";
+        value ??= "";
+        var addressEnd = value.LastIndexOf('>');
+        if (addressEnd >= 0) value = value[(addressEnd + 1)..]; // exclude quoted display names and URI parameters
+        var count = Regex.Matches(value, @"(?:^|;)\s*tag\s*=", RegexOptions.IgnoreCase).Count;
+        if (count == 0) return true; // an initial transaction may establish a new To tag
+        if (count != 1) return false;
+        tag = Regex.Match(value, @"(?:^|;)\s*tag\s*=\s*([^;\s,]+)", RegexOptions.IgnoreCase).Groups[1].Value;
+        return tag.Length != 0;
+    }
 
     private static string ServerTransactionKey(SipMessage request, IPEndPoint remote)
     {
@@ -866,10 +1273,10 @@ public sealed class SipGateway : IAsyncDisposable
         return match.Success ? match.Groups[1].Value : string.Empty;
     }
 
-    private static string ExtractDialedNumber(string value)
+    private string ExtractDialedNumber(string value)
     {
         var user = ExtractUriUser(value).Trim();
-        return Regex.IsMatch(user, @"^\+?[0-9*#]{2,20}$") ? user : string.Empty;
+        return _options.IsPlausibleCarrierDestination(user) ? user : string.Empty;
     }
 
     private static string? ExtractContactTarget(string? value)
@@ -895,7 +1302,21 @@ public sealed class SipGateway : IAsyncDisposable
         Interlocked.Exchange(ref _started, 0);
         _controller.IncomingCall -= OnCarrierIncomingCall;
         _controller.CallEnded -= OnCarrierCallEnded;
+        if (_controller is ISipGatewayMessageController messages) messages.SmsReceived -= OnCarrierSms;
+        IncomingFork[] forks;
+        lock (_forkGate) forks = _incomingForks.Values.ToArray();
         _lifetime.Cancel();
+        if (_smsForwardTask != null) try { await _smsForwardTask.ConfigureAwait(false); } catch { }
+        try { await Task.WhenAll(forks.Select(fork => fork.Task)).ConfigureAwait(false); } catch { }
+        foreach (var fork in forks)
+            if (!_options.LocalIncomingEnabled || fork.PickupOwner == 2)
+                try { await HangupCarrierOnceAsync(fork.Call.CallId, fork.Call.SlotId, fork.CarrierRelease).ConfigureAwait(false); } catch { }
+        foreach (var dialog in _dialogs.Values.ToArray())
+        {
+            await SendByeAsync(dialog, CancellationToken.None).ConfigureAwait(false);
+            try { await HangupDialogCarrierOnceAsync(dialog).ConfigureAwait(false); } catch { }
+        }
+        _receiveLifetime.Cancel(); // Keep receiving transaction responses through BYE cleanup.
         _udp?.Dispose();
         if (_receiveTask != null) try { await _receiveTask.ConfigureAwait(false); } catch { }
         foreach (var callId in _dialogs.Keys.ToArray()) RemoveDialog(callId);
@@ -905,8 +1326,10 @@ public sealed class SipGateway : IAsyncDisposable
         _serverResponses.Clear();
         _registrations.Clear();
         _udp = null;
+        _localEndPoint = null;
         Interlocked.Exchange(ref _ownedController, null)?.Dispose();
         _lifetime.Dispose();
+        _receiveLifetime.Dispose();
         RaiseStatus();
     }
 }

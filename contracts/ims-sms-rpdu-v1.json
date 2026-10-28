@@ -1,0 +1,233 @@
+{
+  "schema": 1,
+  "source": "3GPP TS 24.011 7.3, 8.2; synthetic envelopes, not valid TPDU payload fixtures",
+  "parse": [
+    {
+      "id": "mo-data",
+      "hex": "002a0003912143020123",
+      "accepted": true,
+      "type": 0,
+      "reference": 42,
+      "tpdu": "0123",
+      "cause": null
+    },
+    {
+      "id": "mt-data",
+      "hex": "012a0391214300020123",
+      "accepted": true,
+      "type": 1,
+      "reference": 42,
+      "tpdu": "0123",
+      "cause": null
+    },
+    {
+      "id": "both-addresses",
+      "hex": "012a0391214303916587020123",
+      "accepted": true,
+      "type": 1,
+      "reference": 42,
+      "tpdu": "0123",
+      "cause": null
+    },
+    {
+      "id": "ack-minimal",
+      "hex": "032a",
+      "accepted": true,
+      "type": 3,
+      "reference": 42,
+      "tpdu": null,
+      "cause": null
+    },
+    {
+      "id": "ack-user-data",
+      "hex": "032a41020000",
+      "accepted": true,
+      "type": 3,
+      "reference": 42,
+      "tpdu": "0000",
+      "cause": null
+    },
+    {
+      "id": "ue-ack",
+      "hex": "022a",
+      "accepted": true,
+      "type": 2,
+      "reference": 42,
+      "tpdu": null,
+      "cause": null
+    },
+    {
+      "id": "spare-bits-ignored",
+      "hex": "fb2a",
+      "accepted": true,
+      "type": 3,
+      "reference": 42,
+      "tpdu": null,
+      "cause": null
+    },
+    {
+      "id": "error",
+      "hex": "052a015f",
+      "accepted": true,
+      "type": 5,
+      "reference": 42,
+      "tpdu": null,
+      "cause": 95
+    },
+    {
+      "id": "error-diagnostic",
+      "hex": "052a025f01",
+      "accepted": true,
+      "type": 5,
+      "reference": 42,
+      "tpdu": null,
+      "cause": 95
+    },
+    {
+      "id": "error-with-user-data",
+      "hex": "052a015f41020000",
+      "accepted": true,
+      "type": 5,
+      "reference": 42,
+      "tpdu": "0000",
+      "cause": 95
+    },
+    {
+      "id": "ue-error",
+      "hex": "042a017f",
+      "accepted": true,
+      "type": 4,
+      "reference": 42,
+      "tpdu": null,
+      "cause": 127
+    },
+    {
+      "id": "smma",
+      "hex": "062a",
+      "accepted": true,
+      "type": 6,
+      "reference": 42,
+      "tpdu": null,
+      "cause": null
+    },
+    {
+      "id": "empty",
+      "hex": "",
+      "accepted": false
+    },
+    {
+      "id": "one-byte",
+      "hex": "03",
+      "accepted": false
+    },
+    {
+      "id": "reserved-type",
+      "hex": "072a",
+      "accepted": false
+    },
+    {
+      "id": "data-omitted",
+      "hex": "012a",
+      "accepted": false
+    },
+    {
+      "id": "data-empty",
+      "hex": "012a000000",
+      "accepted": false
+    },
+    {
+      "id": "address-truncated",
+      "hex": "012a039121",
+      "accepted": false
+    },
+    {
+      "id": "address-toa-only",
+      "hex": "012a019100020123",
+      "accepted": false
+    },
+    {
+      "id": "tpdu-truncated",
+      "hex": "012a0000030123",
+      "accepted": false
+    },
+    {
+      "id": "data-trailing",
+      "hex": "012a000002012300",
+      "accepted": false
+    },
+    {
+      "id": "ack-truncated-ie",
+      "hex": "032a41",
+      "accepted": false
+    },
+    {
+      "id": "ack-missing-tpdu",
+      "hex": "032a4102",
+      "accepted": false
+    },
+    {
+      "id": "ack-empty-tpdu",
+      "hex": "032a4100",
+      "accepted": false
+    },
+    {
+      "id": "ack-bad-ie",
+      "hex": "032a42020000",
+      "accepted": false
+    },
+    {
+      "id": "ack-extra",
+      "hex": "032a4102000000",
+      "accepted": false
+    },
+    {
+      "id": "ack-duplicate",
+      "hex": "032a4102000041020000",
+      "accepted": false
+    },
+    {
+      "id": "error-missing-cause",
+      "hex": "052a",
+      "accepted": false
+    },
+    {
+      "id": "error-empty-cause",
+      "hex": "052a00",
+      "accepted": false
+    },
+    {
+      "id": "error-truncated-cause",
+      "hex": "052a025f",
+      "accepted": false
+    },
+    {
+      "id": "error-too-long-cause",
+      "hex": "052a035f0102",
+      "accepted": false
+    },
+    {
+      "id": "error-truncated-user-data",
+      "hex": "052a015f410200",
+      "accepted": false
+    },
+    {
+      "id": "smma-extra",
+      "hex": "062a00",
+      "accepted": false
+    }
+  ],
+  "build": [
+    {
+      "reference": 42,
+      "smsc": "+1234",
+      "tpdu": "0123",
+      "expected": "002a0003912143020123"
+    },
+    {
+      "reference": 0,
+      "smsc": "1",
+      "tpdu": "00",
+      "expected": "0000000281f10100"
+    }
+  ]
+}

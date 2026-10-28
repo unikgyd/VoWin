@@ -5,155 +5,170 @@
   xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
   xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
   xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+  xmlns:controls="clr-namespace:VoWin.Views.Controls"
   xmlns:vm="clr-namespace:VoWin.ViewModels.Pages"
-  Title="远程控制"
+  Title="控制和提醒" UseLayoutRounding="True" SnapsToDevicePixels="True"
+  TextOptions.TextFormattingMode="Display" TextOptions.TextRenderingMode="ClearType"
   d:DataContext="{d:DesignInstance vm:RemoteControlViewModel, IsDesignTimeCreatable=False}"
-  Background="{DynamicResource AppSurfaceBrush}"
-  Foreground="{DynamicResource AppTextPrimaryBrush}"
-  PreviewMouseWheel="OnPreviewMouseWheel"
-  mc:Ignorable="d">
+  Background="{DynamicResource AppSurfaceBrush}" Foreground="{DynamicResource AppTextPrimaryBrush}"
+  PreviewMouseWheel="OnPreviewMouseWheel" mc:Ignorable="d">
   <Page.Resources>
     <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+    <Style x:Key="FieldLabel" TargetType="TextBlock">
+      <Setter Property="Margin" Value="0,12,0,5" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Foreground" Value="{DynamicResource AppTextSecondaryBrush}" />
+    </Style>
+    <Style x:Key="Card" TargetType="Border">
+      <Setter Property="Padding" Value="18" /><Setter Property="CornerRadius" Value="12" />
+      <Setter Property="Background" Value="{DynamicResource AppCardBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AppCardBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="Margin" Value="0,0,0,14" />
+    </Style>
   </Page.Resources>
-
   <Grid Margin="24,18,24,24">
-    <Grid.RowDefinitions>
-      <RowDefinition Height="Auto" />
-      <RowDefinition Height="*" />
-    </Grid.RowDefinitions>
-    <Grid Grid.Row="0" Margin="0,0,0,20">
-      <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="*" />
-        <ColumnDefinition Width="Auto" />
-      </Grid.ColumnDefinitions>
-      <StackPanel>
-        <TextBlock Style="{DynamicResource AppPageTitleStyle}" Text="远程控制" />
-        <TextBlock Style="{DynamicResource AppPageSubtitleStyle}"
-                   Text="直接连接腾讯微信 iLink 与 QQ 官方机器人协议；后台运行，不阻塞电话和短信界面。" />
-      </StackPanel>
-      <ui:Button Grid.Column="1" VerticalAlignment="Center" Appearance="Primary" Content="保存并重连"
-                 Command="{Binding ViewModel.SaveCommand}" />
+    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+    <Grid Margin="0,0,0,18">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+      <TextBlock Style="{DynamicResource AppPageTitleStyle}" Text="控制和提醒" VerticalAlignment="Center" />
+      <ui:Button Grid.Column="1" Appearance="Primary" Content="保存并应用"
+                 Command="{Binding ViewModel.SaveCommand}" IsEnabled="{Binding ViewModel.CanEdit}" />
     </Grid>
-
-    <ScrollViewer x:Name="RemoteScrollViewer" Grid.Row="1" HorizontalContentAlignment="Stretch" VerticalScrollBarVisibility="Auto">
-      <StackPanel MaxWidth="960" HorizontalAlignment="Center">
-        <Grid>
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*" />
-            <ColumnDefinition Width="16" />
-            <ColumnDefinition Width="*" />
-          </Grid.ColumnDefinitions>
-
-          <Border Grid.Column="0" Padding="18" CornerRadius="12" Background="{DynamicResource AppCardBrush}"
-                  BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
-            <StackPanel>
-              <DockPanel>
-                <ui:ToggleSwitch DockPanel.Dock="Right" IsChecked="{Binding ViewModel.WeixinEnabled}" Content="启用" />
-                <StackPanel>
-                  <TextBlock FontSize="19" FontWeight="SemiBold" Text="微信 ClawBot" />
-                  <TextBlock Margin="0,3,0,0" Foreground="{DynamicResource AppSuccessBrush}" Text="腾讯官方 iLink 协议" />
-                </StackPanel>
-              </DockPanel>
-              <Border Margin="0,14,0,14" Padding="10" CornerRadius="8" Background="{DynamicResource AppSuccessSoftBrush}">
-                <StackPanel>
-                  <TextBlock FontWeight="SemiBold" Text="{Binding ViewModel.WeixinStatus}" TextWrapping="Wrap" />
-                  <TextBlock Margin="0,3,0,0" FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding ViewModel.WeixinAccount}" />
-                </StackPanel>
-              </Border>
-              <TextBlock Margin="0,0,0,6" Text="API 地址" />
-              <TextBox Margin="0,0,0,12" Text="{Binding ViewModel.WeixinBaseUrl, UpdateSourceTrigger=PropertyChanged}" />
-              <TextBlock Margin="0,0,0,6" Text="授权用户 ID（逗号分隔）" />
-              <TextBox Margin="0,0,0,14" MinHeight="54" AcceptsReturn="True" TextWrapping="Wrap"
-                       Text="{Binding ViewModel.WeixinAllowedUsers, UpdateSourceTrigger=PropertyChanged}" />
-              <ui:Button HorizontalAlignment="Left" Appearance="Primary" Content="微信扫码登录"
-                         Command="{Binding ViewModel.LoginWeixinCommand}" />
-              <Image Margin="0,14,0,0" Width="260" Height="260" Stretch="None" HorizontalAlignment="Left"
-                     Source="{Binding ViewModel.WeixinQrImage}">
-                <Image.Style>
-                  <Style TargetType="Image">
-                    <Setter Property="Visibility" Value="Visible" />
-                    <Style.Triggers>
-                      <Trigger Property="Source" Value="{x:Null}">
-                        <Setter Property="Visibility" Value="Collapsed" />
-                      </Trigger>
-                    </Style.Triggers>
-                  </Style>
-                </Image.Style>
-              </Image>
-              <StackPanel Margin="0,12,0,0" Visibility="{Binding ViewModel.WeixinNeedsVerificationCode, Converter={StaticResource BoolToVisibility}}">
-                <TextBlock Margin="0,0,0,6" Text="微信显示的配对码" />
-                <DockPanel>
-                  <ui:Button DockPanel.Dock="Right" Margin="8,0,0,0" Content="提交并继续"
-                             Command="{Binding ViewModel.ContinueWeixinLoginCommand}" />
-                  <TextBox Text="{Binding ViewModel.WeixinVerificationCode, UpdateSourceTrigger=PropertyChanged}" />
-                </DockPanel>
-              </StackPanel>
-            </StackPanel>
-          </Border>
-
-          <Border Grid.Column="2" Padding="18" CornerRadius="12" Background="{DynamicResource AppCardBrush}"
-                  BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
-            <StackPanel>
-              <DockPanel>
-                <ui:ToggleSwitch DockPanel.Dock="Right" IsChecked="{Binding ViewModel.QqEnabled}" Content="启用" />
-                <StackPanel>
-                  <TextBlock FontSize="19" FontWeight="SemiBold" Text="QQ 机器人" />
-                  <TextBlock Margin="0,3,0,0" Foreground="{DynamicResource AppSuccessBrush}" Text="腾讯官方 Bot API / Gateway" />
-                </StackPanel>
-              </DockPanel>
-              <Border Margin="0,14,0,14" Padding="10" CornerRadius="8" Background="{DynamicResource AppSuccessSoftBrush}">
-                <TextBlock FontWeight="SemiBold" Text="{Binding ViewModel.QqStatus}" TextWrapping="Wrap" />
-              </Border>
-              <TextBlock Margin="0,0,0,6" Text="机器人 AppID" />
-              <TextBox Margin="0,0,0,12" Text="{Binding ViewModel.QqAppId, UpdateSourceTrigger=PropertyChanged}" />
-              <TextBlock Margin="0,0,0,6" Text="机器人 AppSecret" />
-              <PasswordBox x:Name="QqSecretBox" Margin="0,0,0,12" PasswordChanged="OnQqSecretChanged" />
-              <TextBlock Margin="0,0,0,6" Text="授权 QQ 用户 OpenID（逗号分隔）" />
-              <TextBox Margin="0,0,0,14" MinHeight="54" AcceptsReturn="True" TextWrapping="Wrap"
-                       Text="{Binding ViewModel.QqAllowedUsers, UpdateSourceTrigger=PropertyChanged}" />
-              <ui:Button HorizontalAlignment="Left" Content="验证官方凭据" Command="{Binding ViewModel.TestQqCommand}" />
-              <TextBlock Margin="0,12,0,0" FontSize="12" TextWrapping="Wrap"
-                         Foreground="{DynamicResource AppTextSecondaryBrush}"
-                         Text="在 QQ 开放平台创建机器人并开通 C2C/群消息事件。VoWin 主动连接官方 Gateway，无需公网回调地址。" />
-            </StackPanel>
-          </Border>
-        </Grid>
-
-        <Border Margin="0,16,0,0" Padding="18" CornerRadius="12" Background="{DynamicResource AppCardBrush}"
-                BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
-          <Grid>
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="*" />
-              <ColumnDefinition Width="24" />
-              <ColumnDefinition Width="*" />
-            </Grid.ColumnDefinitions>
-            <StackPanel Grid.Column="0">
-              <TextBlock FontSize="18" FontWeight="SemiBold" Text="授权与通知" />
-              <TextBlock Margin="0,4,0,14" TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}"
-                         Text="未授权用户无法查询短信、拨号或更改设备状态。可生成一次性配对码绑定新用户。" />
-              <ui:Button HorizontalAlignment="Left" Content="生成一次性配对码" Command="{Binding ViewModel.CreatePairingCodeCommand}" />
-              <TextBlock Margin="0,10,0,0" FontWeight="SemiBold" Foreground="{DynamicResource AppSuccessBrush}" Text="{Binding ViewModel.PairingStatus}" />
-              <ui:ToggleSwitch Margin="0,16,0,0" IsChecked="{Binding ViewModel.NotifyIncomingSms}" Content="推送收到的短信" />
-              <ui:ToggleSwitch Margin="0,10,0,0" IsChecked="{Binding ViewModel.NotifyOtpOnly}" Content="只推送含验证码的短信" />
-              <ui:ToggleSwitch Margin="0,10,0,0" IsChecked="{Binding ViewModel.NotifyIncomingCalls}" Content="推送来电提醒" />
-            </StackPanel>
-            <StackPanel Grid.Column="2">
-              <TextBlock FontSize="18" FontWeight="SemiBold" Text="支持的命令" />
-              <TextBlock Margin="0,8,0,0" FontFamily="Consolas" LineHeight="22" TextWrapping="Wrap"
-                         Text="状态&#x0a;验证码 [数量]&#x0a;短信 &lt;号码&gt; &lt;内容&gt;&#x0a;拨号 &lt;号码&gt;&#x0a;接听 / 拒接 / 挂断&#x0a;卡片 / 切卡 &lt;序号或ID&gt;&#x0a;VoWiFi 开|关&#x0a;飞行模式 开|关&#x0a;刷新" />
-            </StackPanel>
-          </Grid>
-        </Border>
-
-        <Border Margin="0,16,0,0" Padding="16" CornerRadius="10" Background="{DynamicResource AppSuccessSoftBrush}"
-                BorderBrush="{DynamicResource AppSuccessBrush}" BorderThickness="1">
+    <ScrollViewer x:Name="RemoteScrollViewer" Grid.Row="1" HorizontalContentAlignment="Stretch"
+                  VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel MaxWidth="960" HorizontalAlignment="Stretch">
+        <Border Style="{StaticResource Card}">
           <StackPanel>
-            <TextBlock FontWeight="SemiBold" Text="运行状态" />
-            <TextBlock Margin="0,6,0,0" TextWrapping="Wrap" Text="{Binding ViewModel.LastActivity}" />
-            <TextBlock Margin="0,6,0,0" TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}"
-                       Text="{Binding ViewModel.OperationStatus}" />
+            <TextBlock Text="通知通道" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12" />
+            <TabControl x:Name="ChannelTabs" IsEnabled="{Binding ViewModel.CanEdit}" Background="Transparent" BorderThickness="0">
+              <TabItem Header="Telegram · 可交互">
+                <StackPanel Margin="0,14,0,0">
+                  <DockPanel>
+                    <ui:ToggleSwitch DockPanel.Dock="Right" Content="启用 Telegram" IsChecked="{Binding ViewModel.TelegramEnabled}" />
+                    <controls:StatusIndicator Item="{Binding ViewModel.TelegramIndicator}" VerticalAlignment="Center" />
+                  </DockPanel>
+                  <TextBlock Style="{StaticResource FieldLabel}" Text="Bot Token" />
+                  <ui:PasswordBox Password="{Binding ViewModel.TelegramBotToken, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Telegram Bot Token" />
+                  <TextBlock Style="{StaticResource FieldLabel}" Text="授权用户 ID（数字，多个用逗号分隔）" />
+                  <TextBox Text="{Binding ViewModel.TelegramAllowedUsers, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Telegram 授权用户 ID" />
+                  <TextBlock Margin="0,8,0,12" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}"
+                             Text="从 BotFather 获取 Token，私聊机器人后填写用户 ID，或使用下方配对码。无需公网回调。" />
+                  <ui:Button Content="验证 Token" Command="{Binding ViewModel.TestTelegramCommand}" HorizontalAlignment="Left" />
+                  <Expander Header="连接详情与 API 地址" Margin="0,12,0,0">
+                    <StackPanel Margin="0,8,0,0">
+                      <TextBlock Text="{Binding ViewModel.TelegramStatus}" TextWrapping="Wrap" />
+                      <TextBox Margin="0,8,0,0" Text="{Binding ViewModel.TelegramApiBaseUrl, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Telegram API 地址" />
+                      <TextBlock Text="仅处理授权私聊；启动时跳过积压命令，不自动覆盖已有 Webhook。" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                    </StackPanel>
+                  </Expander>
+                </StackPanel>
+              </TabItem>
+              <TabItem Header="微信 · 可交互">
+                <StackPanel Margin="0,14,0,0">
+                  <DockPanel>
+                    <ui:ToggleSwitch DockPanel.Dock="Right" Content="启用微信" IsChecked="{Binding ViewModel.WeixinEnabled}" />
+                    <controls:StatusIndicator Item="{Binding ViewModel.WeixinIndicator}" VerticalAlignment="Center" />
+                  </DockPanel>
+                  <TextBlock Text="{Binding ViewModel.WeixinAccount}" Margin="0,10,0,0" FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                  <TextBlock Style="{StaticResource FieldLabel}" Text="授权用户 ID（逗号分隔）" />
+                  <TextBox Text="{Binding ViewModel.WeixinAllowedUsers, UpdateSourceTrigger=PropertyChanged}" />
+                  <ui:Button Margin="0,12,0,0" Content="微信扫码登录" Command="{Binding ViewModel.LoginWeixinCommand}" HorizontalAlignment="Left" />
+                  <Image Source="{Binding ViewModel.WeixinQrImage}" Width="260" Height="260" Margin="0,12,0,0" HorizontalAlignment="Left" Stretch="None">
+                    <Image.Style><Style TargetType="Image"><Style.Triggers>
+                      <Trigger Property="Source" Value="{x:Null}"><Setter Property="Visibility" Value="Collapsed" /></Trigger>
+                    </Style.Triggers></Style></Image.Style>
+                  </Image>
+                  <StackPanel Visibility="{Binding ViewModel.WeixinNeedsVerificationCode, Converter={StaticResource BoolToVisibility}}" Margin="0,12,0,0">
+                    <TextBlock Text="微信显示的配对码" Style="{StaticResource FieldLabel}" />
+                    <DockPanel>
+                      <ui:Button DockPanel.Dock="Right" Content="提交并继续" Command="{Binding ViewModel.ContinueWeixinLoginCommand}" Margin="8,0,0,0" />
+                      <TextBox Text="{Binding ViewModel.WeixinVerificationCode, UpdateSourceTrigger=PropertyChanged}" />
+                    </DockPanel>
+                  </StackPanel>
+                  <Expander Header="连接详情与 API 地址" Margin="0,12,0,0">
+                    <StackPanel Margin="0,8,0,0">
+                      <TextBlock Text="{Binding ViewModel.WeixinStatus}" TextWrapping="Wrap" />
+                      <TextBox Text="{Binding ViewModel.WeixinBaseUrl, UpdateSourceTrigger=PropertyChanged}" Margin="0,8,0,0" />
+                    </StackPanel>
+                  </Expander>
+                </StackPanel>
+              </TabItem>
+              <TabItem Header="QQ · 可交互">
+                <StackPanel Margin="0,14,0,0">
+                  <DockPanel>
+                    <ui:ToggleSwitch DockPanel.Dock="Right" Content="启用 QQ" IsChecked="{Binding ViewModel.QqEnabled}" />
+                    <controls:StatusIndicator Item="{Binding ViewModel.QqIndicator}" VerticalAlignment="Center" />
+                  </DockPanel>
+                  <TextBlock Style="{StaticResource FieldLabel}" Text="机器人 AppID" />
+                  <TextBox Text="{Binding ViewModel.QqAppId, UpdateSourceTrigger=PropertyChanged}" />
+                  <TextBlock Style="{StaticResource FieldLabel}" Text="AppSecret" />
+                  <ui:PasswordBox Password="{Binding ViewModel.QqClientSecret, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="QQ AppSecret" />
+                  <TextBlock Style="{StaticResource FieldLabel}" Text="授权 QQ 用户 OpenID（逗号分隔）" />
+                  <TextBox Text="{Binding ViewModel.QqAllowedUsers, UpdateSourceTrigger=PropertyChanged}" />
+                  <ui:Button Content="验证凭据" Command="{Binding ViewModel.TestQqCommand}" HorizontalAlignment="Left" Margin="0,12,0,0" />
+                  <TextBlock Text="QQ 开放平台需开通机器人消息事件；通过官方 Gateway 连接，无需公网回调。" FontSize="12" TextWrapping="Wrap" Margin="0,8,0,0" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                  <Expander Header="连接详情" Margin="0,12,0,0"><TextBlock Text="{Binding ViewModel.QqStatus}" TextWrapping="Wrap" Margin="0,8,0,0" /></Expander>
+                </StackPanel>
+              </TabItem>
+              <TabItem Header="Bark · 仅提醒">
+                <StackPanel Margin="0,14,0,0">
+                  <DockPanel>
+                    <ui:ToggleSwitch DockPanel.Dock="Right" Content="启用 Bark" IsChecked="{Binding ViewModel.BarkEnabled}" />
+                    <controls:StatusIndicator Item="{Binding ViewModel.BarkIndicator}" VerticalAlignment="Center" />
+                  </DockPanel>
+                  <TextBlock Style="{StaticResource FieldLabel}" Text="服务器地址" />
+                  <TextBox Text="{Binding ViewModel.BarkServerUrl, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Bark 服务器地址" />
+                  <TextBlock Style="{StaticResource FieldLabel}" Text="设备 Key（不是完整推送网址）" />
+                  <ui:PasswordBox Password="{Binding ViewModel.BarkDeviceKey, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Bark 设备 Key" />
+                  <CheckBox Content="在 Bark 中显示短信正文／验证码" IsChecked="{Binding ViewModel.BarkIncludeSmsContent}" Margin="0,12,0,0" />
+                  <TextBlock Text="默认隐藏短信内容。开启后可能出现在锁屏，并经 Bark 服务器与 APNs 传递。" FontSize="12" TextWrapping="Wrap" Margin="0,6,0,12" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                  <ui:Button Content="发送测试提醒" Command="{Binding ViewModel.TestBarkCommand}" HorizontalAlignment="Left" />
+                  <TextBlock Text="Bark 仅发通知，不能接听、回复短信或执行命令。服务器接受不等于手机送达。" FontSize="12" TextWrapping="Wrap" Margin="0,10,0,0" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                  <Expander Header="投递详情" Margin="0,12,0,0"><TextBlock Text="{Binding ViewModel.BarkStatus}" TextWrapping="Wrap" Margin="0,8,0,0" /></Expander>
+                </StackPanel>
+              </TabItem>
+            </TabControl>
           </StackPanel>
         </Border>
+        <Border Style="{StaticResource Card}">
+          <StackPanel IsEnabled="{Binding ViewModel.CanEdit}">
+            <TextBlock Text="提醒内容" FontSize="16" FontWeight="SemiBold" />
+            <WrapPanel Margin="0,12,0,0">
+              <CheckBox Content="收到短信" IsChecked="{Binding ViewModel.NotifyIncomingSms}" Margin="0,0,24,8" />
+              <CheckBox Content="只提醒验证码短信" IsChecked="{Binding ViewModel.NotifyOtpOnly}" Margin="0,0,24,8" />
+              <CheckBox Content="来电提醒" IsChecked="{Binding ViewModel.NotifyIncomingCalls}" Margin="0,0,0,8" />
+            </WrapPanel>
+            <TextBlock Text="微信、QQ、Telegram 会向授权私聊用户转发短信内容；请谨慎添加用户。Bark 的正文开关独立。" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+          </StackPanel>
+        </Border>
+        <Border Style="{StaticResource Card}">
+          <StackPanel IsEnabled="{Binding ViewModel.CanEdit}">
+            <TextBlock Text="交互权限" FontSize="16" FontWeight="SemiBold" />
+            <TextBlock Text="仅授权用户可交互。以下权限默认关闭，不影响本机操作。" Margin="0,6,0,12" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+            <WrapPanel>
+              <CheckBox Content="通话控制（拨号可能收费）" IsChecked="{Binding ViewModel.AllowRemoteCalls}" Margin="0,0,24,10" />
+              <CheckBox Content="发短信（可能收费）" IsChecked="{Binding ViewModel.AllowRemoteSms}" Margin="0,0,24,10" />
+              <CheckBox Content="查询历史验证码" IsChecked="{Binding ViewModel.AllowRemoteReadSms}" Margin="0,0,24,10" />
+              <CheckBox Content="修改 IMS／VoWiFi／射频与默认线路" IsChecked="{Binding ViewModel.AllowRemoteLineChanges}" Margin="0,0,0,10" />
+            </WrapPanel>
+            <DockPanel Margin="0,4,0,0">
+              <ui:Button DockPanel.Dock="Left" Content="生成配对码" Command="{Binding ViewModel.CreatePairingCodeCommand}" Margin="0,0,12,0" />
+              <TextBlock Text="{Binding ViewModel.PairingStatus}" TextWrapping="Wrap" VerticalAlignment="Center" />
+            </DockPanel>
+          </StackPanel>
+        </Border>
+        <Expander Header="命令帮助" Margin="0,0,0,12">
+          <TextBlock Text="{Binding ViewModel.CommandHelp}" Margin="0,10,0,0" TextWrapping="Wrap" FontSize="12" LineHeight="21" />
+        </Expander>
+        <Expander Header="最近活动" Margin="0,0,0,12">
+          <TextBlock Text="{Binding ViewModel.LastActivity}" Margin="0,10,0,0" TextWrapping="Wrap" />
+        </Expander>
+        <TextBlock Text="{Binding ViewModel.OperationStatus}" TextWrapping="Wrap" FontSize="12" Margin="0,0,0,14">
+          <TextBlock.Style><Style TargetType="TextBlock"><Style.Triggers>
+            <DataTrigger Binding="{Binding ViewModel.OperationStatus}" Value=""><Setter Property="Visibility" Value="Collapsed" /></DataTrigger>
+          </Style.Triggers></Style></TextBlock.Style>
+        </TextBlock>
       </StackPanel>
     </ScrollViewer>
   </Grid>

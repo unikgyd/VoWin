@@ -28,6 +28,12 @@ public readonly record struct WdsCurrentSettings(
     System.Net.IPAddress? PrimaryDns,
     System.Net.IPAddress? SecondaryDns)
 {
+    public System.Net.IPAddress? Ipv6Address { get; init; }
+    public byte? Ipv6PrefixLength { get; init; }
+    public System.Net.IPAddress? Ipv6Gateway { get; init; }
+    public System.Net.IPAddress? Ipv6PrimaryDns { get; init; }
+    public System.Net.IPAddress? Ipv6SecondaryDns { get; init; }
+    public byte? IpFamily { get; init; }
     public string? ApnName { get; init; }
     public byte? ProfileType { get; init; }
     public byte? ProfileIndex { get; init; }
@@ -53,6 +59,43 @@ public readonly record struct WdsPacketStatistics(
     uint RxPacketsOk,
     uint TxPacketErrors,
     uint RxPacketErrors);
+
+/// <summary>Preserves the network/modem rejection details from WDS StartNetwork.</summary>
+public sealed class WdsStartNetworkException : QmiException
+{
+    public ushort? CallEndReason { get; }
+    public ushort? VerboseType { get; }
+    public short? VerboseReason { get; }
+
+    internal WdsStartNetworkException(QmiPacket response, QmiResultCode result, QmiErrorCode error)
+        : base(BuildMessage(response, result, error, out var basic, out var type, out var reason),
+            new QmiException(QmiServiceType.WDS, response.MessageId, result, error))
+    {
+        CallEndReason = basic;
+        VerboseType = type;
+        VerboseReason = reason;
+    }
+
+    private static string BuildMessage(QmiPacket response, QmiResultCode result, QmiErrorCode error,
+        out ushort? basic, out ushort? type, out short? reason)
+    {
+        basic = null;
+        type = null;
+        reason = null;
+        var basicTlv = response.GetTlv(0x10);
+        if (basicTlv?.Value.Length == 2)
+            basic = BinaryPrimitives.ReadUInt16LittleEndian(basicTlv.Value.Span);
+        var verboseTlv = response.GetTlv(0x11);
+        if (verboseTlv?.Value.Length == 4)
+        {
+            type = BinaryPrimitives.ReadUInt16LittleEndian(verboseTlv.Value.Span[..2]);
+            reason = BinaryPrimitives.ReadInt16LittleEndian(verboseTlv.Value.Span[2..]);
+        }
+        return $"WDS StartNetwork failed: {result}/{error}; call-end reason " +
+            (basic?.ToString() ?? "unavailable") + "; verbose type/reason " +
+            (type is null ? "unavailable" : $"{type}/{reason}") + ".";
+    }
+}
 
 public sealed class WdsService : IAsyncDisposable
 {
@@ -174,6 +217,9 @@ public sealed class WdsService : IAsyncDisposable
                 }
                 throw;
             }
+            if (resp.TryGetResult(out var startResult, out var startError) &&
+                startResult != QmiResultCode.Success)
+                throw new WdsStartNetworkException(resp, startResult, startError);
             resp.CheckResult();
 
             var handleTlv = resp.GetTlv(0x01);
@@ -234,8 +280,8 @@ public sealed class WdsService : IAsyncDisposable
 
         var req = new QmiPacket(QmiServiceType.WDS, _clientId, 0, (ushort)WdsMessageId.GetCurrentSettings, new[]
         {
-            // Profile ID, APN, DNS, IPv4 address, gateway, P-CSCF address/list.
-            QmiTlv.FromUInt32(0x10, 0x00000F19)
+            // Profile ID, APN, DNS, IPv4/IPv6 address, gateway and P-CSCF lists.
+            QmiTlv.FromUInt32(0x10, 0x00008F19)
         });
         var resp = await _client.SendRequestAsync(req, cancellationToken).ConfigureAwait(false);
         resp.CheckResult();
@@ -246,6 +292,10 @@ public sealed class WdsService : IAsyncDisposable
     internal static WdsCurrentSettings ParseCurrentSettings(QmiPacket resp)
     {
         ArgumentNullException.ThrowIfNull(resp);
+        // Current-settings fields are singletons. Choosing the first duplicate
+        // could bind an IMS bearer to an ambiguous APN/address/P-CSCF proof.
+        if (resp.TLVs.GroupBy(tlv => tlv.Type).Any(group => group.Skip(1).Any()))
+            throw new FormatException("WDS current-settings contains duplicate fields.");
 
         System.Net.IPAddress? ip = ParseIp(resp.GetTlv(0x1E));
         System.Net.IPAddress? subnet = ParseIp(resp.GetTlv(0x21));
@@ -266,12 +316,29 @@ public sealed class WdsService : IAsyncDisposable
             for (var offset = 1; offset < value.Length; offset += 4)
                 pcscfServers.Add(ParseIp(new QmiTlv(0x23, value.Slice(offset, 4).ToArray()))!);
         }
+        // Qualcomm Gobi WDS GetCurrentSettings TLV 0x2E is a separate IPv6
+        // P-CSCF list: one count byte followed by 16 network-order bytes each.
+        var ipv6Pcscf = resp.GetTlv(0x2E);
+        if (ipv6Pcscf is not null)
+        {
+            var value = ipv6Pcscf.Value.Span;
+            if (value.Length < 1 || value.Length != 1 + value[0] * 16)
+                throw new FormatException("WDS current-settings IPv6 P-CSCF list is malformed.");
+            for (var offset = 1; offset < value.Length; offset += 16)
+                pcscfServers.Add(new System.Net.IPAddress(value.Slice(offset, 16)));
+        }
         return new WdsCurrentSettings(ip, subnet, gw, dns1, dns2)
         {
+            Ipv6Address = ParseIpv6WithPrefix(resp.GetTlv(0x25), out var prefix),
+            Ipv6PrefixLength = prefix,
+            Ipv6Gateway = ParseIpv6WithPrefix(resp.GetTlv(0x26), out _),
+            Ipv6PrimaryDns = ParseIpv6(resp.GetTlv(0x27)),
+            Ipv6SecondaryDns = ParseIpv6(resp.GetTlv(0x28)),
+            IpFamily = resp.GetTlv(0x2B)?.AsByte(),
             ApnName = resp.GetTlv(0x14)?.AsString(),
             ProfileType = profile?.AsByte(0),
             ProfileIndex = profile?.AsByte(1),
-            PcscfServers = pcscfServers
+            PcscfServers = pcscfServers.Distinct().ToArray()
         };
     }
 
@@ -496,7 +563,9 @@ public sealed class WdsService : IAsyncDisposable
 
     private static System.Net.IPAddress? ParseIp(QmiTlv? tlv)
     {
-        if (tlv == null || tlv.Value.Length < 4) return null;
+        if (tlv is null) return null;
+        if (tlv.Value.Length != 4)
+            throw new FormatException("WDS IPv4 address TLV is malformed.");
         // QMI encodes IPv4 addresses as a little-endian guint32. IPAddress expects
         // bytes in network order.
         uint value = BinaryPrimitives.ReadUInt32LittleEndian(tlv.Value.Span[..4]);
@@ -504,6 +573,24 @@ public sealed class WdsService : IAsyncDisposable
         {
             (byte)(value >> 24), (byte)(value >> 16), (byte)(value >> 8), (byte)value
         });
+    }
+
+    private static System.Net.IPAddress? ParseIpv6WithPrefix(QmiTlv? tlv, out byte? prefix)
+    {
+        prefix = null;
+        if (tlv is null) return null;
+        if (tlv.Value.Length != 17 || tlv.Value.Span[16] > 128)
+            throw new FormatException("WDS IPv6 address/prefix TLV is malformed.");
+        prefix = tlv.Value.Span[16];
+        return new System.Net.IPAddress(tlv.Value.Span[..16]);
+    }
+
+    private static System.Net.IPAddress? ParseIpv6(QmiTlv? tlv)
+    {
+        if (tlv is null) return null;
+        if (tlv.Value.Length != 16)
+            throw new FormatException("WDS IPv6 DNS TLV is malformed.");
+        return new System.Net.IPAddress(tlv.Value.Span);
     }
 
     public async ValueTask DisposeAsync()

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "source": "VoSharp full-scale signed PCM regression vectors; no audio recordings",
+  "columns": ["pcm", "alaw", "decodedAlaw", "ulaw", "decodedUlaw"],
+  "cases": [
+    [0, 213, 8, 255, 0],
+    [1000, 250, 1008, 206, 988],
+    [-1000, 122, -1008, 78, -988],
+    [2000, 234, 2016, 191, 1980],
+    [-2000, 106, -2016, 63, -1980],
+    [16000, 186, 16128, 144, 15996],
+    [32767, 170, 32256, 128, 32124],
+    [-32768, 42, -32256, 0, -32124]
+  ]
+}

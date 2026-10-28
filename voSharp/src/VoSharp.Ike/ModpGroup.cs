@@ -59,6 +59,8 @@ public sealed class ModpGroup : IIkeDhKeyExchange
     public byte[] ComputeSharedSecret(ReadOnlySpan<byte> peerPublic)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (peerPublic.Length != _keyLength)
+            throw new IkeFormatException("Peer DH public value has the wrong group width.");
         var peer = new BigInteger(peerPublic, isUnsigned: true, isBigEndian: true);
 
         if (peer <= BigInteger.One || peer >= _prime - 1)
@@ -117,7 +119,7 @@ public sealed class ModpGroup : IIkeDhKeyExchange
 
     private static readonly BigInteger Generator = 2;
 
-    /// <summary>RFC 3526 §2 — 1024-bit MODP group ("group 2").</summary>
+    /// <summary>RFC 2409 §6.2 — 1024-bit MODP group ("group 2").</summary>
     private static readonly BigInteger Prime1024 = ParseHex(
         "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1" +
         "29024E088A67CC74020BBEA63B139B22514A08798E3404DD" +

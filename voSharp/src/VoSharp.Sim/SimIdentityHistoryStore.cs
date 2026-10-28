@@ -12,7 +12,7 @@ namespace VoSharp.Sim;
 /// </summary>
 public sealed class SimIdentityHistoryStore
 {
-    private const int FormatVersion = 1;
+    private const int FormatVersion = 2;
     private static readonly object FileGate = new();
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private readonly string _path;
@@ -22,7 +22,8 @@ public sealed class SimIdentityHistoryStore
         int MncLength,
         string[] HomePlmns,
         DateTime LastSeenUtc,
-        DateTime? LastSucceededUtc);
+        DateTime? LastSucceededUtc,
+        bool HomePlmnVerified = false);
 
     private sealed record Snapshot(int Version, Dictionary<string, List<Entry>> Cards);
 
@@ -38,7 +39,19 @@ public sealed class SimIdentityHistoryStore
 
     public void MarkSuccessful(SimIdentity identity) => Update(identity, succeeded: true);
 
-    public IReadOnlyList<SimIdentity> GetCandidates(SimIdentity liveIdentity)
+    public void ObserveProfileIdentities(SimIdentity identity)
+    {
+        Observe(identity);
+        // Both reads belong to the verified current ICCID. Never transplant
+        // the selected EF_AD MNC length onto a different reported IMSI.
+        foreach (var imsi in new[] { identity.ReportedImsi, identity.PermanentImsi }.Distinct())
+            if (IsValidImsi(imsi) && imsi != identity.Imsi)
+                Observe(SimIdentity.FromImsiAndIccid(imsi!, identity.Iccid,
+                    identity.OperatorName, identity.PhoneNumber, homePlmns: identity.HomePlmns,
+                    imsiSource: "same-profile alternate read"));
+    }
+
+    public IReadOnlyList<SimIdentity> GetCandidates(SimIdentity liveIdentity, bool successfulOnly = false)
     {
         ArgumentNullException.ThrowIfNull(liveIdentity);
         lock (FileGate)
@@ -48,17 +61,21 @@ public sealed class SimIdentityHistoryStore
                 return Array.Empty<SimIdentity>();
 
             return entries
+                .Where(entry => !successfulOnly || entry.LastSucceededUtc.HasValue)
                 .OrderByDescending(entry => entry.LastSucceededUtc.HasValue)
                 .ThenByDescending(entry => entry.LastSucceededUtc)
                 .ThenByDescending(entry => entry.LastSeenUtc)
                 .Where(entry => IsValidImsi(entry.Imsi) && entry.MncLength is 2 or 3)
-                .Select(entry => SimIdentity.FromImsiAndIccid(
-                    entry.Imsi,
-                    liveIdentity.Iccid,
-                    liveIdentity.OperatorName,
-                    liveIdentity.PhoneNumber,
-                    entry.MncLength,
-                    entry.HomePlmns.Concat(liveIdentity.HomePlmns ?? Array.Empty<string>()).Distinct().ToArray()))
+                .Select(entry => entry.Imsi == liveIdentity.Imsi && liveIdentity.IsHomePlmnAuthoritative
+                    ? liveIdentity // Current EF_AD outranks stale history for the same IMSI.
+                    : SimIdentity.FromImsiAndIccid(
+                        entry.Imsi,
+                        liveIdentity.Iccid,
+                        liveIdentity.OperatorName,
+                        liveIdentity.PhoneNumber,
+                        entry.MncLength,
+                        entry.HomePlmns.Concat(liveIdentity.HomePlmns ?? Array.Empty<string>()).Distinct().ToArray())
+                        with { IsHomePlmnAuthoritative = entry.HomePlmnVerified, ImsiSource = "same-profile history" })
                 .ToArray();
         }
     }
@@ -81,12 +98,15 @@ public sealed class SimIdentityHistoryStore
 
             var existing = entries.FirstOrDefault(entry => entry.Imsi == identity.Imsi);
             var now = DateTime.UtcNow;
+            var keepSuccessfulHint = !succeeded && !identity.IsHomePlmnAuthoritative &&
+                (existing?.LastSucceededUtc != null || existing?.HomePlmnVerified == true);
             var updated = new Entry(
                 identity.Imsi,
-                identity.Mnc.Length,
+                keepSuccessfulHint ? existing!.MncLength : identity.Mnc.Length,
                 (identity.HomePlmns ?? Array.Empty<string>()).Distinct().ToArray(),
                 now,
-                succeeded ? now : existing?.LastSucceededUtc);
+                succeeded ? now : existing?.LastSucceededUtc,
+                keepSuccessfulHint ? existing!.HomePlmnVerified : identity.IsHomePlmnAuthoritative);
             if (existing != null)
                 entries.Remove(existing);
             entries.Add(updated);
@@ -110,7 +130,10 @@ public sealed class SimIdentityHistoryStore
             if (!File.Exists(_path))
                 return Empty();
             var snapshot = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(_path), JsonOptions);
-            return snapshot is { Version: FormatVersion, Cards: not null } ? snapshot : Empty();
+            // V1 did not distinguish EF_AD from inferred lengths. Preserve IMSI
+            // history (important for multi-IMSI cards), but migrate it as hints.
+            return snapshot is { Version: 1 or FormatVersion, Cards: not null }
+                ? snapshot with { Version = FormatVersion } : Empty();
         }
         catch (IOException) { return Empty(); }
         catch (UnauthorizedAccessException) { return Empty(); }

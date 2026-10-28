@@ -31,14 +31,25 @@ internal sealed class CellularAudioWorker : IDisposable
     public bool IsRunning { get; private set; }
     public string DeviceSummary { get; private set; } = string.Empty;
 
-    public void Start(string? messagePath = null)
+    /// <summary>Read-only WinMM enumeration used by the actual USB PCM bridge.</summary>
+    internal static (bool Capture, bool Playback) ProbeModemEndpoints(string atPort)
+    {
+        var container = UsbAudioModemBinding.RequireSelected(qmiSharp.Transport.WindowsUsbTopology.EnumeratePresent(), atPort, true);
+        var pair = WindowsUsbAudioEndpoints.Select(WindowsUsbAudioEndpoints.Enumerate(), container);
+        return (pair.Capture.DeviceNumber >= 0, pair.Playback.DeviceNumber >= 0);
+    }
+
+    internal static int FindHostInputDevice() => FindHostDevice(capture: true);
+
+    public void Start(Guid containerId, string? messagePath = null)
     {
         Stop();
 
-        var modemInput = FindInputDevice(isModem: true);
-        var hostInput = FindInputDevice(isModem: false);
-        var modemOutput = FindOutputDevice(isModem: true);
-        var hostOutput = FindOutputDevice(isModem: false);
+        var endpoints = WindowsUsbAudioEndpoints.Select(WindowsUsbAudioEndpoints.Enumerate(), containerId);
+        var modemInput = endpoints.Capture.DeviceNumber;
+        var hostInput = FindHostDevice(capture: true);
+        var modemOutput = endpoints.Playback.DeviceNumber;
+        var hostOutput = FindHostDevice(capture: false);
         if (modemInput < 0 || modemOutput < 0)
             throw new InvalidOperationException("Windows did not expose the modem AC Interface input/output endpoints.");
         if (hostInput < 0 || hostOutput < 0)
@@ -92,14 +103,15 @@ internal sealed class CellularAudioWorker : IDisposable
     /// SIP gateway and captured modem PCM is returned over the second pipe.
     /// No Windows microphone or speaker is opened in this mode.
     /// </summary>
-    public void StartExternal(Stream uplinkSource, Stream downlinkDestination, string? messagePath = null)
+    public void StartExternal(Guid containerId, Stream uplinkSource, Stream downlinkDestination, string? messagePath = null)
     {
         ArgumentNullException.ThrowIfNull(uplinkSource);
         ArgumentNullException.ThrowIfNull(downlinkDestination);
         Stop();
 
-        var modemInput = FindInputDevice(isModem: true);
-        var modemOutput = FindOutputDevice(isModem: true);
+        var endpoints = WindowsUsbAudioEndpoints.Select(WindowsUsbAudioEndpoints.Enumerate(), containerId);
+        var modemInput = endpoints.Capture.DeviceNumber;
+        var modemOutput = endpoints.Playback.DeviceNumber;
         if (modemInput < 0 || modemOutput < 0)
             throw new InvalidOperationException("Windows did not expose the modem AC Interface input/output endpoints.");
 
@@ -241,29 +253,14 @@ internal sealed class CellularAudioWorker : IDisposable
         return capture;
     }
 
-    private static int FindInputDevice(bool isModem)
+    private static int FindHostDevice(bool capture)
     {
-        for (var i = 0; i < WaveIn.DeviceCount; i++)
-        {
-            var modem = IsModemEndpoint(WaveIn.GetCapabilities(i).ProductName);
-            if (modem == isModem) return i;
-        }
-        return -1;
+        var containers = qmiSharp.Transport.WindowsUsbTopology.EnumeratePresent()
+            .Where(f => f.ClassId == qmiSharp.Transport.WindowsUsbTopology.ModemClass &&
+                f.InstanceId.StartsWith(@"USB\VID_2C7C&", StringComparison.OrdinalIgnoreCase))
+            .Select(f => f.ContainerId).ToHashSet();
+        return WindowsUsbAudioEndpoints.SelectHost(WindowsUsbAudioEndpoints.Enumerate(), containers, capture);
     }
-
-    private static int FindOutputDevice(bool isModem)
-    {
-        for (var i = 0; i < WaveOut.DeviceCount; i++)
-        {
-            var modem = IsModemEndpoint(WaveOut.GetCapabilities(i).ProductName);
-            if (modem == isModem) return i;
-        }
-        return -1;
-    }
-
-    private static bool IsModemEndpoint(string name) =>
-        name.Contains("AC Interface", StringComparison.OrdinalIgnoreCase) ||
-        name.Contains("Quectel", StringComparison.OrdinalIgnoreCase);
 
     private static void StopCapture(ref WaveIn? capture)
     {
@@ -289,7 +286,7 @@ internal sealed class CellularAudioWorker : IDisposable
 /// republishes UAC. A long-lived WPF process otherwise keeps the pre-route
 /// WinMM device mapping and receives a successful but permanent zero stream.
 /// </summary>
-internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable, ICallPcmMedia
+internal sealed class CellularAudioBridge(string? executablePath = null) : IAsyncDisposable, IDisposable, ICallPcmMedia
 {
     private Process? _process;
     private EventWaitHandle? _stopEvent;
@@ -309,6 +306,8 @@ internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable, ICall
     public event Action<short[]>? RemotePcmReceived;
 
     public async Task StartAsync(
+        string atPort,
+        Guid containerId,
         string? messagePath = null,
         CancellationToken cancellationToken = default,
         bool externalPcm = false)
@@ -321,7 +320,7 @@ internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable, ICall
             _stopEvent = new EventWaitHandle(false, EventResetMode.ManualReset, eventName);
             var ready = _ready = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            var executable = Environment.ProcessPath;
+            var executable = executablePath ?? Environment.ProcessPath;
             if (string.IsNullOrWhiteSpace(executable) || !File.Exists(executable))
                 throw new FileNotFoundException("VoWin executable path is unavailable for the cellular-audio helper.", executable);
             var startInfo = new ProcessStartInfo(executable)
@@ -333,6 +332,10 @@ internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable, ICall
                 WindowStyle = ProcessWindowStyle.Hidden
             };
             startInfo.ArgumentList.Add("--cellular-audio-helper");
+            startInfo.ArgumentList.Add("--at-port");
+            startInfo.ArgumentList.Add(atPort);
+            startInfo.ArgumentList.Add("--usb-container");
+            startInfo.ArgumentList.Add(containerId.ToString("D"));
             startInfo.ArgumentList.Add("--stop-event");
             startInfo.ArgumentList.Add(eventName);
             startInfo.ArgumentList.Add("--parent-pid");
@@ -371,10 +374,15 @@ internal sealed class CellularAudioBridge : IAsyncDisposable, IDisposable, ICall
                     StartPcmPumps();
                 }
             }
-            catch
+            catch (OperationCanceledException)
             {
                 await StopCoreAsync();
-                throw new InvalidOperationException("Cellular audio helper did not become ready within 12 seconds.");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                await StopCoreAsync();
+                throw new InvalidOperationException($"Cellular audio helper failed: {ex.Message}", ex);
             }
         }
         finally
@@ -541,6 +549,10 @@ internal static class CellularAudioWorkerHost
             using var stopEvent = EventWaitHandle.OpenExisting(eventName);
             using var parent = Process.GetProcessById(parentId);
             var messagePath = ReadOptionalArgument(args, "--message-file");
+            var port = ReadArgument(args, "--at-port");
+            var container = Guid.Parse(ReadArgument(args, "--usb-container"));
+            var actualContainer = UsbAudioModemBinding.RequireSelected(qmiSharp.Transport.WindowsUsbTopology.EnumeratePresent(), port, true);
+            if (actualContainer != container) throw new InvalidOperationException("USB 模组身份在启动音频前已变化。");
             using var worker = new CellularAudioWorker();
             NamedPipeClientStream? uplinkPipe = null;
             NamedPipeClientStream? downlinkPipe = null;
@@ -551,11 +563,11 @@ internal static class CellularAudioWorkerHost
                 await Task.WhenAll(
                     uplinkPipe.ConnectAsync(10000),
                     downlinkPipe.ConnectAsync(10000)).ConfigureAwait(false);
-                worker.StartExternal(uplinkPipe, downlinkPipe, messagePath);
+                worker.StartExternal(container, uplinkPipe, downlinkPipe, messagePath);
             }
             else
             {
-                worker.Start(messagePath);
+                worker.Start(container, messagePath);
             }
             Console.WriteLine("READY|" + worker.DeviceSummary);
             Console.Out.Flush();

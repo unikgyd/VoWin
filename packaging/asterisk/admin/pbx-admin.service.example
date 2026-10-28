@@ -1,0 +1,27 @@
+[Unit]
+Description=VoWin VoCat optional Asterisk extension administration
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vowin-asterisk
+Environment=PBX_ADMIN_LISTEN=127.0.0.1:9088
+EnvironmentFile=-/opt/vowin-asterisk/admin/listen.local.env
+ExecStart=/opt/vowin-asterisk/admin/pbx-admin -base /opt/vowin-asterisk -generator /opt/vowin-asterisk/configure.py -container vowin-asterisk -listen ${PBX_ADMIN_LISTEN}
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/vowin-asterisk
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

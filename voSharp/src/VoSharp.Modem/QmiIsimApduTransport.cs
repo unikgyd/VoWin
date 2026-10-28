@@ -38,8 +38,12 @@ internal sealed class QmiIsimApduTransport : IIsimApduTransport
             status.SelectedApplicationIndex is null || !status.HasSubscriptionApplication)
             throw new NotSupportedException("QMI ISIM APDUs require one unambiguous selected GW subscription.");
         var slots = await uim.GetSlotStatusAsync(ct).ConfigureAwait(false);
-        if (slots.Count != 1 || !slots[0].IsActive || !slots[0].CardPresent ||
-            slots[0].PhysicalSlotNumber != 1)
+        // Many single-SIM modems report a second *empty* physical socket.
+        // It is unambiguous only when slot 1 is the sole active/present card;
+        // never target APDUs if another slot is active or contains a card.
+        if (slots.Count == 0 || slots[0].PhysicalSlotNumber != 1 ||
+            !slots[0].IsActive || !slots[0].CardPresent ||
+            slots.Skip(1).Any(slot => slot.IsActive || slot.CardPresent))
             throw new NotSupportedException("QMI UIM physical-slot mapping is not unambiguous.");
         return new QmiIsimApduTransport(uim, slots[0].PhysicalSlotNumber, status);
     }

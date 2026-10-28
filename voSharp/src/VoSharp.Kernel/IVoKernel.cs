@@ -9,6 +9,7 @@ using VoSharp.Modem;
 using VoSharp.Modem.At;
 using VoSharp.Sim;
 using VoSharp.StateMachine;
+using VoSharp.Telephony;
 using VoSharp.Telephony.Calls;
 using VoSharp.Telephony.Sms;
 using VoSharp.Telephony.VoWifi;
@@ -59,10 +60,19 @@ public interface IVoKernel : IAsyncDisposable
     Task StopSipGatewayAsync();
     HostImsRegistrationStatus GetHostImsRegistrationStatus(string? slotId = null);
     Task<HostImsRegistrationStatus> StartHostImsRegistrationAsync(
-        string? slotId = null, HostImsEndpointCandidate? endpoint = null, CancellationToken ct = default);
+        string? slotId = null, HostImsEndpointCandidate? endpoint = null, CancellationToken ct = default,
+        IHostImsSecurityBackend? securityBackend = null, bool enableSmsReceiver = false);
     Task StopHostImsRegistrationAsync(string? slotId = null);
+    HostImsPppBearerStatus GetHostImsPppBearerStatus(string? slotId = null);
+    Task<HostImsPppBearerStatus> StartHostImsPppBearerAsync(
+        string handoffScript, string rasProbeExecutable, string? slotId = null,
+        int maxLeaseSeconds = 3600, CancellationToken ct = default);
+    Task StopHostImsPppBearerAsync(string? slotId = null);
 
     // ── Direct SMS Operations ────────────────────────────────────────────────
+    string? GetSmsSimBinding(string slotId) => null;
+    Task<SmsSubmitResult> SendSmsForSimAsync(string recipient, string text, string slotId, string expectedBinding, CancellationToken ct = default) =>
+        Task.FromException<SmsSubmitResult>(new NotSupportedException("This kernel does not support SIM-bound SMS submission."));
     Task<SmsSubmitResult> SendSmsAsync(
         string recipient,
         string text,
@@ -111,6 +121,7 @@ public interface IVoKernel : IAsyncDisposable
     event EventHandler<CallStateChangedEventArgs>? CallStateChanged;
     event EventHandler<IncomingCallEventArgs>? IncomingCall;
     event EventHandler<CallConnectedEventArgs>? CallConnected;
+    event EventHandler<SipIncomingCallClaimed>? SipIncomingCallClaimed;
     event EventHandler<CallEndedEventArgs>? CallEnded;
     event EventHandler<DtmfReceivedEventArgs>? DtmfReceived;
 

@@ -1,5 +1,6 @@
-using VoSharp.Telephony.Sms;
+using CommunityToolkit.Mvvm.ComponentModel;
 using VoWin.Helpers;
+using System.Text.Json.Serialization;
 
 namespace VoWin.Models
 {
@@ -9,10 +10,11 @@ namespace VoWin.Models
         Sending,
         Sent,
         Delivered,
-        Failed
+        Failed,
+        PartiallySent
     }
 
-    public class SmsMessageModel
+    public class SmsMessageModel : ObservableObject
     {
         public string Id { get; set; } = Guid.NewGuid().ToString("N");
         public int Index { get; set; }
@@ -20,11 +22,33 @@ namespace VoWin.Models
         public string Text { get; set; } = string.Empty;
         public DateTime Timestamp { get; set; } = DateTime.UtcNow;
         public bool IsOutgoing { get; set; }
-        public SmsDeliveryState DeliveryState { get; set; } = SmsDeliveryState.Received;
-        public string? DeliveryStatus { get; set; }
+        private SmsDeliveryState _deliveryState = SmsDeliveryState.Received;
+        public SmsDeliveryState DeliveryState
+        {
+            get => _deliveryState;
+            set
+            {
+                if (!SetProperty(ref _deliveryState, value)) return;
+                OnPropertyChanged(nameof(StatusDisplay));
+                OnPropertyChanged(nameof(DeliveryStatusText));
+                OnPropertyChanged(nameof(IsFailed));
+            }
+        }
+        private string? _deliveryStatus;
+        public string? DeliveryStatus
+        {
+            get => _deliveryStatus;
+            set => SetProperty(ref _deliveryStatus, value);
+        }
         public int? MessageReference { get; set; }
         public string? SlotId { get; set; }
         public string? RawPdu { get; set; }
+        /// <summary>Receive-session snapshot, never inferred later from the currently inserted card.</summary>
+        [JsonIgnore] public string? SimBinding { get; set; }
+        /// <summary>The originating SMS identity, distinct from this persisted row's UI ID.</summary>
+        [JsonIgnore] public string? SourceMessageId { get; set; }
+        /// <summary>Receive-time canonical reply: null is legacy; empty is intentionally read-only. Never backfill it.</summary>
+        [JsonIgnore] public string? SipReplyNumberSnapshot { get; set; }
 
         private DateTime LocalTimestamp => TimestampDisplayHelper.ToLocalDisplayTime(Timestamp);
 
@@ -42,6 +66,7 @@ namespace VoWin.Models
             SmsDeliveryState.Sent => "已发送",
             SmsDeliveryState.Delivered => "已送达",
             SmsDeliveryState.Failed => "发送失败",
+            SmsDeliveryState.PartiallySent => "部分提交，请勿整条重发",
             _ => string.Empty
         };
 
@@ -49,25 +74,7 @@ namespace VoWin.Models
 
         public bool IsFailed => DeliveryState == SmsDeliveryState.Failed;
 
-        public string? ExtractedOtpCode
-        {
-            get
-            {
-                if (string.IsNullOrWhiteSpace(Text)) return null;
-                var match = System.Text.RegularExpressions.Regex.Match(Text, @"(?<!\d)(\d{4,8})(?!\d)");
-                if (match.Success)
-                {
-                    string lower = Text.ToLowerInvariant();
-                    if (lower.Contains("验证码") || lower.Contains("校验码") || lower.Contains("动态码") ||
-                        lower.Contains("code") || lower.Contains("otp") || lower.Contains("pin") ||
-                        (match.Length == 6 && Text.Length < 120))
-                    {
-                        return match.Groups[1].Value;
-                    }
-                }
-                return null;
-            }
-        }
+        public string? ExtractedOtpCode => SmsVerificationCodeExtractor.Extract(Text);
 
         public bool HasOtpCode => !string.IsNullOrEmpty(ExtractedOtpCode);
     }

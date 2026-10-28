@@ -190,6 +190,32 @@ public class SecurityAgreementTests
         Assert.Equal(2001u, agreement.PcscfClientSpi);
     }
 
+    [Theory]
+    [InlineData("NaN")]
+    [InlineData("Infinity")]
+    [InlineData("-0.1")]
+    [InlineData("1.1")]
+    [InlineData("not-a-number")]
+    public void RejectsInvalidSecurityServerPreferenceBeforeAka(string quality)
+    {
+        var header = $"ipsec-3gpp;q={quality};alg=hmac-sha-1-96;prot=esp;mod=trans;" +
+            "ealg=aes-cbc;spi-c=2001;spi-s=2002;port-c=50601;port-s=50600";
+
+        Assert.Null(SecurityAgreementBuilder.ParseSecurityServer(header, Proposal));
+    }
+
+    [Theory]
+    [InlineData("alg=hmac-md5-96")]
+    [InlineData("spi-c=3001")]
+    [InlineData("port-c=50701")]
+    public void RejectsDuplicateSecurityServerParametersBeforeAka(string duplicate)
+    {
+        var header = "ipsec-3gpp;q=1.000;alg=hmac-sha-1-96;prot=esp;mod=trans;" +
+            $"ealg=aes-cbc;spi-c=2001;spi-s=2002;port-c=50601;port-s=50600;{duplicate}";
+
+        Assert.Null(SecurityAgreementBuilder.ParseSecurityServer(header, Proposal));
+    }
+
     // ── Key expansion (voCore security_test.go:168-189) ──────────────────────
 
     [Theory]

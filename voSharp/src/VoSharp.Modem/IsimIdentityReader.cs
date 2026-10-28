@@ -42,6 +42,7 @@ public sealed class IsimIdentityReader
     private const string IsimAid = "A0000000871004";
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly IIsimApduTransport _transport;
+    private int _channelUncertain;
 
     public IsimIdentityReader(IAtSession session) : this(new AtIsimApduTransport(session)) { }
 
@@ -50,7 +51,7 @@ public sealed class IsimIdentityReader
 
     public async Task<IsimIdentityProbeResult> ReadAsync(CancellationToken ct = default)
     {
-        if (!_transport.IsOpen)
+        if (!_transport.IsOpen || Volatile.Read(ref _channelUncertain) != 0)
             return new(IsimIdentityReadiness.ReadFailed, null, "UICC channel is not open.");
 
         var pin = await _transport.CheckReadyAsync(ct).ConfigureAwait(false);
@@ -70,33 +71,40 @@ public sealed class IsimIdentityReader
                 : new(IsimIdentityReadiness.ApplicationUnavailable, null,
                     "ADF.ISIM could not be opened on a logical UICC channel.");
 
+        IsimIdentityProbeResult result;
+        bool closed;
         try
         {
             var impi = await ReadIdentityFileAsync(channelId, 0x02, record: false, ct).ConfigureAwait(false);
             var domain = await ReadIdentityFileAsync(channelId, 0x03, record: false, ct).ConfigureAwait(false);
             var impu = await ReadIdentityFileAsync(channelId, 0x04, record: true, ct).ConfigureAwait(false);
             if (!IsValidPrivateIdentity(impi) || !IsValidDomain(domain) || !IsValidPublicIdentity(impu))
-                return new(IsimIdentityReadiness.ReadFailed, null,
+                result = new(IsimIdentityReadiness.ReadFailed, null,
                     "ADF.ISIM opened, but its mandatory IMS identity files were missing or invalid.");
-            return new(IsimIdentityReadiness.Available, new(impi!, domain!, impu!),
-                "ISIM private identity, home domain and default public identity were read from the card.");
+            else
+                result = new(IsimIdentityReadiness.Available, new(impi!, domain!, impu!),
+                    "ISIM private identity, home domain and default public identity were read from the card.");
         }
         finally
         {
-            using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-            try { await _transport.CloseApplicationAsync(channelId, cleanup.Token).ConfigureAwait(false); }
-            catch { /* Best-effort channel cleanup; preserve the read result or original error. */ }
+            closed = await TryCloseChannelAsync(channelId).ConfigureAwait(false);
         }
+        ct.ThrowIfCancellationRequested();
+        return closed ? result : new(IsimIdentityReadiness.ReadFailed, null,
+            "ISIM channel cleanup was not confirmed; card identity is unavailable.");
     }
 
     /// <summary>Runs IMS AKA on ADF.ISIM, not on a potentially different USIM key.</summary>
     public async Task<AkaResult> AuthenticateAsync(AkaChallenge challenge, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(challenge);
-        if (!_transport.IsOpen) return AkaResult.Failed("UICC channel is not open.");
+        if (!_transport.IsOpen || Volatile.Read(ref _channelUncertain) != 0)
+            return AkaResult.Failed("UICC channel is not open or its cleanup is uncertain.");
         var channelId = (await OpenIsimChannelAsync(ct).ConfigureAwait(false)).ChannelId;
         if (channelId == 0) return AkaResult.Failed("ADF.ISIM is unavailable for IMS AKA.");
 
+        AkaResult result;
+        bool closed;
         try
         {
             var apdu = HardwareAka.BuildAuthenticateApdu(challenge.Rand, challenge.Autn);
@@ -104,11 +112,12 @@ public sealed class IsimIdentityReader
             byte[]? response;
             try { response = await ExchangeAsync(channelId, apdu, ct).ConfigureAwait(false); }
             finally { CryptographicOperations.ZeroMemory(apdu); }
-            if (response is null) return AkaResult.Failed("ISIM AUTHENTICATE returned no APDU response.");
-            try
+            if (response is null)
+                result = AkaResult.Failed("ISIM AUTHENTICATE returned no APDU response.");
+            else try
             {
                 var parsed = HardwareAka.ParseAuthenticateResponse(response);
-                return parsed.Success
+                result = parsed.Success
                     ? AkaResult.Succeeded(parsed.Res!, parsed.Ck!, parsed.Ik!)
                     : parsed.SyncFailure
                         ? AkaResult.SyncFailed(parsed.Auts!)
@@ -118,9 +127,29 @@ public sealed class IsimIdentityReader
         }
         finally
         {
-            using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-            try { await _transport.CloseApplicationAsync(channelId, cleanup.Token).ConfigureAwait(false); }
-            catch { }
+            closed = await TryCloseChannelAsync(channelId).ConfigureAwait(false);
+        }
+        if (!closed || ct.IsCancellationRequested)
+        {
+            result.Clear();
+            ct.ThrowIfCancellationRequested();
+            return AkaResult.Failed("ISIM channel cleanup was not confirmed; authentication material was discarded.");
+        }
+        return result;
+    }
+
+    private async Task<bool> TryCloseChannelAsync(int channelId)
+    {
+        using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        try
+        {
+            await _transport.CloseApplicationAsync(channelId, cleanup.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _channelUncertain, 1);
+            return false;
         }
     }
 
@@ -145,9 +174,7 @@ public sealed class IsimIdentityReader
             if (channelId < 1) continue;
             if (channelId <= 19) return (channelId, false);
 
-            using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-            try { await _transport.CloseApplicationAsync(channelId, cleanup.Token).ConfigureAwait(false); }
-            catch { }
+            if (!await TryCloseChannelAsync(channelId).ConfigureAwait(false)) return (0, false);
         }
         // Only a readable application directory with another valid AID can
         // distinguish an absent ISIM from a transient AT/CCHO failure.
@@ -195,7 +222,7 @@ public sealed class IsimIdentityReader
 
     internal static string? DecodeIdentityTlv(ReadOnlySpan<byte> fileData)
     {
-        if (fileData.Length < 2 || fileData[0] != 0x80) return null;
+        if (fileData.Length < 2 || fileData.Length > 1024 || fileData[0] != 0x80) return null;
         var offset = 2;
         var length = (int)fileData[1];
         if (length == 0x81)
@@ -211,11 +238,13 @@ public sealed class IsimIdentityReader
             offset = 4;
         }
         else if (length > 0x7F) return null;
-        if (length == 0 || length > fileData.Length - offset) return null;
+        if (length == 0 || length > 512 || length > fileData.Length - offset) return null;
+        foreach (var padding in fileData[(offset + length)..])
+            if (padding != 0xFF) return null;
         try
         {
-            var value = StrictUtf8.GetString(fileData.Slice(offset, length)).Trim();
-            return value.Length > 0 && !value.Any(char.IsControl) ? value : null;
+            var value = StrictUtf8.GetString(fileData.Slice(offset, length));
+            return value.Length > 0 && !value.Any(c => char.IsControl(c) || char.IsWhiteSpace(c)) ? value : null;
         }
         catch (DecoderFallbackException) { return null; }
     }
@@ -298,6 +327,8 @@ internal sealed class AtIsimApduTransport : IIsimApduTransport
 
     public async Task CloseApplicationAsync(int channelId, CancellationToken ct)
     {
-        await _session.ExecuteCommandAsync($"AT+CCHC={channelId}", 2000, ct).ConfigureAwait(false);
+        var response = await _session.ExecuteCommandAsync($"AT+CCHC={channelId}", 2000, ct).ConfigureAwait(false);
+        if (!response.Success)
+            throw new InvalidOperationException("UICC logical-channel close was not confirmed.");
     }
 }

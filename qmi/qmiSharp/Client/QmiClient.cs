@@ -39,7 +39,7 @@ public sealed class QmiClient : IAsyncDisposable, IDisposable
         var client = new QmiClient(transport, options);
         try
         {
-            if (client._options.SyncOnOpen)
+            if (client._options.SyncOnOpen && transport is not IDriverManagedQmiTransport)
                 await client.SyncAsync(cancellationToken).ConfigureAwait(false);
             return client;
         }
@@ -160,6 +160,8 @@ public sealed class QmiClient : IAsyncDisposable, IDisposable
 
     private async Task<byte> AllocateRawClientIdAsync(ushort serviceId, CancellationToken cancellationToken)
     {
+        if (_transport is IDriverManagedQmiTransport managed)
+            return await managed.AllocateClientIdAsync(serviceId, cancellationToken).ConfigureAwait(false);
         bool qrtrService = serviceId > byte.MaxValue;
         ushort messageId = qrtrService ? (ushort)0xFF22 : (ushort)0x0022;
         QmiTlv serviceTlv = qrtrService ? QmiTlv.FromUInt16(0x01, serviceId) : QmiTlv.FromByte(0x01, (byte)serviceId);
@@ -216,6 +218,11 @@ public sealed class QmiClient : IAsyncDisposable, IDisposable
     private async Task ReleaseRawClientIdAsync(ushort serviceId, byte clientId,
         CancellationToken cancellationToken)
     {
+        if (_transport is IDriverManagedQmiTransport managed)
+        {
+            await managed.ReleaseClientIdAsync(serviceId, clientId, cancellationToken).ConfigureAwait(false);
+            return;
+        }
         bool qrtrService = serviceId > byte.MaxValue;
         ushort messageId = qrtrService ? (ushort)0xFF23 : (ushort)0x0023;
         byte[] releaseInfo = qrtrService

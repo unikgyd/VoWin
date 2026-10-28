@@ -7,7 +7,7 @@
     <ApplicationIcon>vowin.ico</ApplicationIcon>
     <UseWPF>true</UseWPF>
     <PublishSingleFile>true</PublishSingleFile>
-    <!-- Framework-dependent single-file build: the host supplies .NET Desktop Runtime. -->
+    <!-- Use the installed .NET 10 Desktop Runtime; bundle only communication dependencies. -->
     <SelfContained>false</SelfContained>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
@@ -39,7 +39,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="VoWin.Tests" />
     <ProjectReference Include="..\voSharp\src\VoSharp.Kernel\VoSharp.Kernel.csproj" />
+    <ProjectReference Include="..\voSharp\src\VoSharp.HostIms\VoSharp.HostIms.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 3.6 KiB read-only modem identity helper; source/build instructions beside it. -->
+    <EmbeddedResource Include="..\qmi\tools\qdc-identity\vowin-qdc-identity.armv7" LogicalName="VoWin.QdcIdentity.armv7" />
   </ItemGroup>
 
   <!-- Old releases placed the removed Go LPA helper in the normal output folder.
@@ -55,7 +62,20 @@
     <Delete Files="@(SingleFileSymbols)" />
   </Target>
 
-
+  <!-- The archive is an assembly resource, not a sidecar or an arbitrary PATH dependency. -->
+  <PropertyGroup>
+    <!-- Debug/source launches need the same protected, versioned owner as releases.
+         Do not silently fall back to a stale executable saved by an old release. -->
+    <VoWinRuntimeBundle Condition="'$(VoWinRuntimeBundle)' == '' And Exists('$(MSBuildProjectDirectory)/../packaging/runtime.zip')">$(MSBuildProjectDirectory)/../packaging/runtime.zip</VoWinRuntimeBundle>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(VoWinRuntimeBundle)' != ''">
+    <EmbeddedResource Include="$(VoWinRuntimeBundle)" LogicalName="VoWin.Runtime.zip" />
+  </ItemGroup>
+  <Target Name="ValidateRuntimeBundle" BeforeTargets="PrepareForPublish" Condition="'$(RuntimeIdentifier)' == 'win-x64'">
+    <Error Condition="'$(VoWinRuntimeBundle)' == '' Or !Exists('$(VoWinRuntimeBundle)')"
+           Text="Prepare packaging/runtime.zip first, then supply -p:VoWinRuntimeBundle=absolute-path-to-runtime.zip. Incomplete release packages are not supported." />
+    <Error Condition="'$(SelfContained)' == 'true'" Text="VoWin releases use the installed .NET Desktop Runtime; use --self-contained false." />
+  </Target>
   <ItemGroup>
     <None Remove="Assets\*.png" />
     <None Remove="Assets\*.jpg" />

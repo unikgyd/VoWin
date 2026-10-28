@@ -12,6 +12,53 @@ namespace VoSharp.Tests;
 
 public class IncomingCallTests
 {
+    [Theory]
+    [InlineData("answer")]
+    [InlineData("reject")]
+    [InlineData("dtmf")]
+    [InlineData("hangup")]
+    public async Task MissingExplicitCallTargetNeverFallsBackToAnotherModule(string operation)
+    {
+        await using var kernel = new VoKernel();
+        var slot = new ModemSlot("other-module", "OFFLINE_TEST", eventBus: kernel.EventBus);
+        Assert.True(kernel.Pool.TryAddSlot(slot));
+        await slot.Calls.HandleIncomingInviteAsync(CreateMockInvite(), slot.VoWifi, _ => Task.CompletedTask);
+        var original = slot.Calls.ActiveCall;
+        Assert.NotNull(original);
+
+        await Assert.ThrowsAsync<KeyNotFoundException>(async () =>
+        {
+            switch (operation)
+            {
+                case "answer": await kernel.AnswerAsync("disconnected-module"); break;
+                case "reject": await kernel.RejectAsync("disconnected-module"); break;
+                case "dtmf": await kernel.SendDtmfAsync('1', "disconnected-module"); break;
+                case "hangup": await kernel.HangupAsync("disconnected-module"); break;
+            }
+        });
+        Assert.Equal(original.CallId, slot.Calls.ActiveCall?.CallId);
+        Assert.True(slot.Calls.IsIncoming);
+    }
+
+    [Fact]
+    public async Task ImplicitRejectTargetsPresentedCallNotNewlySelectedModule()
+    {
+        await using var kernel = new VoKernel();
+        var calling = new ModemSlot("calling-module", "OFFLINE_A", eventBus: kernel.EventBus);
+        var selected = new ModemSlot("selected-module", "OFFLINE_B", eventBus: kernel.EventBus);
+        Assert.True(kernel.Pool.TryAddSlot(calling));
+        Assert.True(kernel.Pool.TryAddSlot(selected));
+        await calling.Calls.HandleIncomingInviteAsync(CreateMockInvite(), calling.VoWifi, _ => Task.CompletedTask);
+        Assert.True(kernel.SelectSlot(selected.Id));
+        Assert.Equal(calling.Id, kernel.ActiveCallSlotId);
+
+        Assert.NotNull(await kernel.RejectAsync());
+        Assert.Null(calling.Calls.ActiveCall);
+        Assert.Null(selected.Calls.ActiveCall);
+        Assert.Null(kernel.ActiveCall);
+        Assert.Equal(selected.Id, kernel.Pool.ActiveSlotId);
+    }
+
     [Fact]
     public async Task CellularRingAndClipAreForwardedThroughKernel()
     {
@@ -182,11 +229,13 @@ public class IncomingCallTests
     }
 
     [Fact]
-    public async Task AnswerAsync_Sends200OkWithSdp_SetsActiveState()
+    public async Task AnswerAsync_WaitsForMatchingAckBeforeConnectedState()
     {
         var bus = new AsyncEventBus();
         var callMgr = new ImsCallManager(bus);
         var voWifi = new VoWifiManager(bus);
+        var mediaStarted = 0;
+        callMgr.AudioStreamStateChanged += (_, _) => Interlocked.Increment(ref mediaStarted);
 
         var replies = new List<SipMessage>();
         Func<SipMessage, Task> replySender = msg =>
@@ -201,10 +250,11 @@ public class IncomingCallTests
         // Answer the call
         var answered = await callMgr.AnswerAsync();
 
-        Assert.Equal(CallState.Active, callMgr.State);
+        Assert.Equal(CallState.Ringing, callMgr.State);
         Assert.NotNull(answered);
-        Assert.Equal(CallState.Active, answered.State);
-        Assert.NotNull(answered.ConnectedAt);
+        Assert.Equal(CallState.Ringing, answered.State);
+        Assert.Null(answered.ConnectedAt);
+        Assert.Equal(0, mediaStarted);
 
         // Third reply should be 200 OK
         Assert.Equal(3, replies.Count);
@@ -213,9 +263,259 @@ public class IncomingCallTests
         Assert.Equal("application/sdp", okResp.GetHeader("Content-Type"));
         Assert.Contains("m=audio", okResp.Body);
 
+        var wrongAck = new SipMessage { IsRequest = true, Method = "ACK" };
+        wrongAck.SetHeader("Call-ID", "different-call");
+        callMgr.HandleIncomingAck(wrongAck);
+        Assert.Equal(CallState.Ringing, callMgr.State);
+
+        var ack = new SipMessage { IsRequest = true, Method = "ACK" };
+        ack.SetHeader("From", invite.GetHeader("From")!);
+        ack.SetHeader("To", okResp.GetHeader("To")!);
+        ack.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        ack.SetHeader("CSeq", "101 ACK");
+        callMgr.HandleIncomingAck(ack);
+        Assert.Equal(CallState.Active, callMgr.State);
+        Assert.NotNull(callMgr.ActiveCall?.ConnectedAt);
+        Assert.Equal(1, mediaStarted);
+
         // Teardown
         await callMgr.HangupAsync();
         Assert.Equal(CallState.Idle, callMgr.State);
+    }
+
+    [Fact]
+    public async Task AnsweredInviteWithoutAck_CancelAndLocalHangupDoNotSendSecondInviteFinal()
+    {
+        using var callMgr = new ImsCallManager();
+        using var voWifi = new VoWifiManager();
+        var replies = new List<SipMessage>();
+        Task Reply(SipMessage response)
+        {
+            replies.Add(response);
+            return Task.CompletedTask;
+        }
+
+        var invite = CreateMockInvite();
+        await callMgr.HandleIncomingInviteAsync(invite, voWifi, Reply);
+        await callMgr.AnswerAsync();
+        Assert.Equal(CallState.Ringing, callMgr.State);
+
+        var cancel = new SipMessage { IsRequest = true, Method = "CANCEL", RequestUri = invite.RequestUri };
+        foreach (var header in new[] { "Via", "From", "To" }) cancel.SetHeader(header, invite.GetHeader(header)!);
+        cancel.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        cancel.SetHeader("CSeq", "101 CANCEL");
+        await callMgr.HandleIncomingCancelAsync(cancel, Reply);
+        Assert.Equal(CallState.Ringing, callMgr.State);
+        Assert.Equal(200, replies[^1].StatusCode);
+        Assert.Equal("101 CANCEL", replies[^1].GetHeader("CSeq"));
+
+        await callMgr.HangupAsync();
+        Assert.Equal(CallState.Idle, callMgr.State);
+        Assert.DoesNotContain(replies, response => response.StatusCode is 487 or 603);
+    }
+
+    [Fact]
+    public async Task MandatoryOriginatorQos_UsesReliable183AndWaitsForPrackAndUpdateBeforeRinging()
+    {
+        using var calls = new ImsCallManager();
+        using var voWifi = new VoWifiManager();
+        var replies = new List<SipMessage>();
+        Task Reply(SipMessage response)
+        {
+            replies.Add(response);
+            return Task.CompletedTask;
+        }
+        var invite = CreateMockInvite();
+        invite.SetHeader("Supported", "timer,precondition,100rel");
+        invite.Body += "a=curr:qos local none\r\na=curr:qos remote none\r\n" +
+            "a=des:qos mandatory local sendrecv\r\na=des:qos optional remote sendrecv\r\n";
+
+        await calls.HandleIncomingInviteAsync(invite, voWifi, Reply);
+        Assert.Equal([100, 183], replies.Select(response => response.StatusCode));
+        Assert.Equal(CallState.Incoming, calls.State);
+        Assert.Equal("100rel", replies[^1].GetHeader("Require"));
+        Assert.Contains("precondition", replies[^1].GetHeader("Supported"));
+        Assert.Contains("100rel", replies[^1].GetHeader("Supported"));
+        Assert.Contains("UPDATE", replies[^1].GetHeader("Allow"));
+        Assert.Equal("1", replies[^1].GetHeader("RSeq"));
+        Assert.Contains("RTP/AVP 102", replies[^1].Body);
+        Assert.Contains("a=rtpmap:102 AMR/8000", replies[^1].Body);
+        Assert.Contains("a=des:qos mandatory remote sendrecv", replies[^1].Body);
+        Assert.Contains("a=des:qos optional local sendrecv", replies[^1].Body);
+        Assert.Contains("a=conf:qos remote sendrecv", replies[^1].Body);
+
+        var prack = new SipMessage { IsRequest = true, Method = "PRACK" };
+        prack.SetHeader("From", invite.GetHeader("From")!);
+        prack.SetHeader("To", replies[1].GetHeader("To")!);
+        prack.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        prack.SetHeader("CSeq", "102 PRACK");
+        prack.SetHeader("RAck", "1 101 INVITE");
+        await calls.HandleIncomingPrackAsync(prack, Reply);
+        Assert.Equal(200, replies[^1].StatusCode);
+        Assert.Equal(CallState.Incoming, calls.State);
+
+        var update = new SipMessage { IsRequest = true, Method = "UPDATE" };
+        update.SetHeader("From", invite.GetHeader("From")!);
+        update.SetHeader("To", replies[1].GetHeader("To")!);
+        update.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        update.SetHeader("CSeq", "103 UPDATE");
+        update.Body = invite.Body.Replace("a=curr:qos local none", "a=curr:qos local sendrecv");
+        await calls.HandleIncomingUpdateAsync(update, Reply);
+        Assert.Equal(200, replies[^2].StatusCode);
+        Assert.Contains("a=curr:qos remote sendrecv", replies[^2].Body);
+        Assert.Equal(180, replies[^1].StatusCode);
+        Assert.Equal(CallState.Ringing, calls.State);
+
+        await calls.AnswerAsync();
+        Assert.Equal(200, replies[^1].StatusCode);
+        Assert.Contains("precondition", replies[^1].GetHeader("Supported"));
+        Assert.Contains("UPDATE", replies[^1].GetHeader("Allow"));
+        Assert.Empty(replies[^1].Body);
+        var ack = new SipMessage { IsRequest = true, Method = "ACK" };
+        ack.SetHeader("From", invite.GetHeader("From")!);
+        ack.SetHeader("To", replies[^1].GetHeader("To")!);
+        ack.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        ack.SetHeader("CSeq", "101 ACK");
+        calls.HandleIncomingAck(ack);
+        Assert.Equal(CallState.Active, calls.State);
+        await calls.HangupAsync(sendSignaling: false);
+    }
+
+    [Fact]
+    public async Task Require100Rel_MakesRingingReliableAndAcceptsItsPrack()
+    {
+        using var calls = new ImsCallManager();
+        using var voWifi = new VoWifiManager();
+        var replies = new List<SipMessage>();
+        Task Reply(SipMessage response)
+        {
+            replies.Add(response);
+            return Task.CompletedTask;
+        }
+        var invite = CreateMockInvite();
+        invite.SetHeader("Require", "100rel");
+        await calls.HandleIncomingInviteAsync(invite, voWifi, Reply);
+
+        Assert.Equal([100, 180], replies.Select(response => response.StatusCode));
+        Assert.Equal("100rel", replies[^1].GetHeader("Require"));
+        Assert.Equal("1", replies[^1].GetHeader("RSeq"));
+
+        var prack = new SipMessage { IsRequest = true, Method = "PRACK" };
+        prack.SetHeader("From", invite.GetHeader("From")!);
+        prack.SetHeader("To", replies[^1].GetHeader("To")!);
+        prack.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        prack.SetHeader("CSeq", "102 PRACK");
+        prack.SetHeader("RAck", "1 101 INVITE");
+        await calls.HandleIncomingPrackAsync(prack, Reply);
+        Assert.Equal(200, replies[^1].StatusCode);
+
+        await calls.HandleIncomingPrackAsync(prack, Reply);
+        Assert.Equal(481, replies[^1].StatusCode);
+        await calls.HangupAsync(sendSignaling: false);
+    }
+
+    [Fact]
+    public async Task Require100Rel_WithQos_UsesConsecutiveReliableRseqNumbers()
+    {
+        using var calls = new ImsCallManager();
+        using var voWifi = new VoWifiManager();
+        var replies = new List<SipMessage>();
+        Task Reply(SipMessage response)
+        {
+            replies.Add(response);
+            return Task.CompletedTask;
+        }
+        var invite = CreateMockInvite();
+        invite.SetHeader("Supported", "precondition");
+        invite.SetHeader("Require", "100rel");
+        invite.Body += "a=curr:qos local none\r\na=curr:qos remote none\r\n" +
+            "a=des:qos mandatory local sendrecv\r\na=des:qos optional remote sendrecv\r\n";
+        await calls.HandleIncomingInviteAsync(invite, voWifi, Reply);
+        Assert.Equal("1", replies[^1].GetHeader("RSeq"));
+
+        var prack = new SipMessage { IsRequest = true, Method = "PRACK" };
+        prack.SetHeader("From", invite.GetHeader("From")!);
+        prack.SetHeader("To", replies[^1].GetHeader("To")!);
+        prack.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        prack.SetHeader("CSeq", "102 PRACK");
+        prack.SetHeader("RAck", "1 101 INVITE");
+        await calls.HandleIncomingPrackAsync(prack, Reply);
+        Assert.Equal(200, replies[^1].StatusCode);
+
+        var update = new SipMessage { IsRequest = true, Method = "UPDATE" };
+        update.SetHeader("From", invite.GetHeader("From")!);
+        update.SetHeader("To", prack.GetHeader("To")!);
+        update.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        update.SetHeader("CSeq", "103 UPDATE");
+        update.Body = invite.Body.Replace("a=curr:qos local none", "a=curr:qos local sendrecv");
+        await calls.HandleIncomingUpdateAsync(update, Reply);
+        Assert.Equal(180, replies[^1].StatusCode);
+        Assert.Equal("100rel", replies[^1].GetHeader("Require"));
+        Assert.Equal("2", replies[^1].GetHeader("RSeq"));
+
+        var secondPrack = new SipMessage { IsRequest = true, Method = "PRACK" };
+        secondPrack.SetHeader("From", invite.GetHeader("From")!);
+        secondPrack.SetHeader("To", prack.GetHeader("To")!);
+        secondPrack.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        secondPrack.SetHeader("CSeq", "104 PRACK");
+        secondPrack.SetHeader("RAck", "2 101 INVITE");
+        await calls.HandleIncomingPrackAsync(secondPrack, Reply);
+        Assert.Equal(200, replies[^1].StatusCode);
+        await calls.HangupAsync(sendSignaling: false);
+    }
+
+    [Fact]
+    public async Task MandatoryOriginatorQos_AcceptsReadyStatusInPrackSdpOffer()
+    {
+        using var calls = new ImsCallManager();
+        using var voWifi = new VoWifiManager();
+        var replies = new List<SipMessage>();
+        Task Reply(SipMessage response)
+        {
+            replies.Add(response);
+            return Task.CompletedTask;
+        }
+        var invite = CreateMockInvite();
+        invite.SetHeader("Supported", "precondition,100rel");
+        invite.Body += "a=curr:qos local none\r\na=curr:qos remote none\r\n" +
+            "a=des:qos mandatory local sendrecv\r\na=des:qos optional remote sendrecv\r\n";
+        await calls.HandleIncomingInviteAsync(invite, voWifi, Reply);
+
+        var prack = new SipMessage { IsRequest = true, Method = "PRACK" };
+        prack.SetHeader("From", invite.GetHeader("From")!);
+        prack.SetHeader("To", replies[1].GetHeader("To")!);
+        prack.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        prack.SetHeader("CSeq", "102 PRACK");
+        prack.SetHeader("RAck", "1 101 INVITE");
+        prack.Body = invite.Body.Replace("a=curr:qos local none", "a=curr:qos local sendrecv");
+        await calls.HandleIncomingPrackAsync(prack, Reply);
+
+        Assert.Equal(200, replies[^2].StatusCode);
+        Assert.Contains("a=curr:qos remote sendrecv", replies[^2].Body);
+        Assert.Equal(180, replies[^1].StatusCode);
+        Assert.Equal(CallState.Ringing, calls.State);
+        await calls.HangupAsync(sendSignaling: false);
+    }
+
+    [Theory]
+    [InlineData("a=des:qos mandatory remote sendrecv\r\n", "precondition,100rel")]
+    [InlineData("a=curr:qos local none\r\na=des:qos mandatory local sendrecv\r\n", "precondition")]
+    public async Task UnsupportedMandatoryQos_IsRejectedBeforeAlerting(string qos, string supported)
+    {
+        using var calls = new ImsCallManager();
+        using var voWifi = new VoWifiManager();
+        var replies = new List<SipMessage>();
+        var invite = CreateMockInvite();
+        invite.SetHeader("Supported", supported);
+        invite.Body += qos;
+        await calls.HandleIncomingInviteAsync(invite, voWifi, response =>
+        {
+            replies.Add(response);
+            return Task.CompletedTask;
+        });
+        Assert.Equal([100, 580], replies.Select(response => response.StatusCode));
+        Assert.Equal(CallState.Idle, calls.State);
+        Assert.Null(calls.ActiveCall);
     }
 
     [Fact]
@@ -283,6 +583,43 @@ public class IncomingCallTests
         Assert.Equal(487, replies[3].StatusCode); // 487 Request Terminated to INVITE
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EarlyQosCallCancelOrRejectReleasesPreparedRtp(bool reject)
+    {
+        using var calls = new ImsCallManager();
+        using var wifi = new VoWifiManager();
+        calls.ConfigureAudioRecording(false, null);
+        var invite = CreateMockInvite();
+        invite.SetHeader("Supported", "precondition,100rel");
+        invite.Body += "a=curr:qos local none\r\na=curr:qos remote none\r\n" +
+            "a=des:qos mandatory local sendrecv\r\na=des:qos optional remote sendrecv\r\n";
+        await calls.HandleIncomingInviteAsync(invite, wifi, _ => Task.CompletedTask);
+        Assert.Equal(CallState.Incoming, calls.State);
+        Assert.NotNull(calls.GetMediaConfiguration());
+        if (reject)
+            await calls.RejectAsync();
+        else
+        {
+            var cancel = new SipMessage { IsRequest = true, Method = "CANCEL", RequestUri = invite.RequestUri };
+            foreach (var header in new[] { "Via", "From", "To" }) cancel.SetHeader(header, invite.GetHeader(header)!);
+            cancel.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+            cancel.SetHeader("CSeq", "101 CANCEL");
+            await calls.HandleIncomingCancelAsync(cancel, _ => Task.CompletedTask);
+        }
+        Assert.Equal(CallState.Idle, calls.State);
+        Assert.Null(calls.ActiveCall);
+        Assert.Null(calls.GetMediaConfiguration());
+        Assert.Null(calls.GetMediaStats());
+        // A new incoming call must not reuse the cancelled early RTP leg.
+        invite.SetHeader("Call-ID", "next-offline-qos-call");
+        await calls.HandleIncomingInviteAsync(invite, wifi, _ => Task.CompletedTask);
+        Assert.Equal(CallState.Incoming, calls.State);
+        Assert.NotNull(calls.GetMediaConfiguration());
+        await calls.HangupAsync(sendSignaling: false);
+    }
+
     [Fact]
     public async Task VoKernel_AnswerAndRejectCommands_WorkProperly()
     {
@@ -304,6 +641,13 @@ public class IncomingCallTests
         // Execute "answer" command
         var ansResult = await kernel.ExecuteCommandAsync("answer");
         Assert.True(ansResult.Success);
+        Assert.Equal(CallState.Ringing, kernel.Calls.State);
+        var ack = new SipMessage { IsRequest = true, Method = "ACK" };
+        ack.SetHeader("From", invite.GetHeader("From")!);
+        ack.SetHeader("To", replies[^1].GetHeader("To")!);
+        ack.SetHeader("Call-ID", invite.GetHeader("Call-ID")!);
+        ack.SetHeader("CSeq", "101 ACK");
+        kernel.Calls.HandleIncomingAck(ack);
         Assert.Equal(CallState.Active, kernel.Calls.State);
 
         // Execute "hangup" command

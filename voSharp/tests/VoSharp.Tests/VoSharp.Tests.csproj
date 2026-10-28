@@ -8,6 +8,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Include="../../../contracts/ims-home-mnc-v1.json" Link="contracts/ims-home-mnc-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/sim-home-plmn-v1.json" Link="contracts/sim-home-plmn-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/isim-identity-v1.json" Link="contracts/isim-identity-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/ims-lte-pani-v1.json" Link="contracts/ims-lte-pani-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/epdg-discovery-v1.json" Link="contracts/epdg-discovery-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/sip-response-identity-v1.json" Link="contracts/sip-response-identity-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/amr-nb-rtp-v1.json" Link="contracts/amr-nb-rtp-v1.json" CopyToOutputDirectory="PreserveNewest" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
@@ -16,6 +23,18 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <None Include="../../../contracts/ims-sms-rpdu-v1.json" Link="contracts/ims-sms-rpdu-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/sip-sms-operation-v1.json" Link="contracts/sip-sms-operation-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/sip-message-parts-v1.json" Link="contracts/sip-message-parts-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/usim-aka-response-v1.json" Link="contracts/usim-aka-response-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/g711-codec-v1.json" Link="contracts/g711-codec-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/sip-peer-digest-v1.json" Link="contracts/sip-peer-digest-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/ims-aka-digest-v1.json" Link="contracts/ims-aka-digest-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/ims-esp-v1.json" Link="contracts/ims-esp-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/nested-ims-esp-v1.json" Link="contracts/nested-ims-esp-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/swu-esp-v1.json" Link="contracts/swu-esp-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/host-ims-pdn-v1.json" Link="contracts/host-ims-pdn-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/sim-identity-bcd-v1.json" Link="contracts/sim-identity-bcd-v1.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
@@ -24,10 +43,12 @@
     <ProjectReference Include="..\..\src\VoSharp.Crypto\VoSharp.Crypto.csproj" />
     <ProjectReference Include="..\..\src\VoSharp.Sim\VoSharp.Sim.csproj" />
     <ProjectReference Include="..\..\src\VoSharp.Modem\VoSharp.Modem.csproj" />
+    <ProjectReference Include="..\..\src\VoSharp.HostIms\VoSharp.HostIms.csproj" />
     <ProjectReference Include="..\..\src\VoSharp.Telephony\VoSharp.Telephony.csproj" />
     <ProjectReference Include="..\..\src\VoSharp.Sip\VoSharp.Sip.csproj" />
     <ProjectReference Include="..\..\src\VoSharp.Euicc\VoSharp.Euicc.csproj" />
     <ProjectReference Include="..\..\src\VoSharp.Kernel\VoSharp.Kernel.csproj" />
+    <ProjectReference Include="..\..\src\VoSharp.GatewayHost\VoSharp.GatewayHost.csproj" />
   </ItemGroup>
 
 </Project>

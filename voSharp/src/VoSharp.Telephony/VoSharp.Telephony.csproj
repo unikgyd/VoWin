@@ -15,7 +15,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="..\..\native\amd64\opencore-amr.dll" Link="Native\opencore-amr.dll" />
+    <EmbeddedResource Include="..\..\native\amd64\opencore-amr.dll" Link="Native\opencore-amr.dll" Condition="'$(VoSharpIncludeWindowsAmr)' != 'false'" />
   </ItemGroup>
 
   <PropertyGroup>

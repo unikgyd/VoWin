@@ -39,23 +39,41 @@ public static class DigestAka
         string cnonce,
         string? qop)
     {
-        // HA1 = MD5(username:realm:RES)
-        using var md5 = MD5.Create();
+        // RES is binary, not UTF-8 or hex. Keep HA1 and all secret-bearing
+        // temporary buffers mutable so they can be cleared on every exit.
         var prefix = Encoding.UTF8.GetBytes($"{username}:{realm}:");
         var ha1Input = new byte[prefix.Length + akaResponse.Length];
-        Buffer.BlockCopy(prefix, 0, ha1Input, 0, prefix.Length);
-        Buffer.BlockCopy(akaResponse, 0, ha1Input, prefix.Length, akaResponse.Length);
-        var ha1 = Convert.ToHexString(md5.ComputeHash(ha1Input)).ToLowerInvariant();
-
-        // HA2 = MD5(method:uri)
-        var ha2 = ComputeMd5($"{method}:{uri}");
-
-        if (string.IsNullOrEmpty(qop))
+        byte[]? ha1Hash = null;
+        byte[]? responseInput = null;
+        byte[]? responseHash = null;
+        try
         {
-            return ComputeMd5($"{ha1}:{nonce}:{ha2}");
+            Buffer.BlockCopy(prefix, 0, ha1Input, 0, prefix.Length);
+            Buffer.BlockCopy(akaResponse, 0, ha1Input, prefix.Length, akaResponse.Length);
+            ha1Hash = MD5.HashData(ha1Input);
+            var ha2 = ComputeMd5($"{method}:{uri}");
+            var suffix = Encoding.UTF8.GetBytes(string.IsNullOrEmpty(qop)
+                ? $":{nonce}:{ha2}"
+                : $":{nonce}:{nc}:{cnonce}:{qop}:{ha2}");
+            responseInput = new byte[32 + suffix.Length];
+            for (var i = 0; i < ha1Hash.Length; i++)
+            {
+                const string hex = "0123456789abcdef";
+                responseInput[i * 2] = (byte)hex[ha1Hash[i] >> 4];
+                responseInput[i * 2 + 1] = (byte)hex[ha1Hash[i] & 15];
+            }
+            Buffer.BlockCopy(suffix, 0, responseInput, 32, suffix.Length);
+            responseHash = MD5.HashData(responseInput);
+            return Convert.ToHexString(responseHash).ToLowerInvariant();
         }
-
-        return ComputeMd5($"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}");
+        finally
+        {
+            CryptographicOperations.ZeroMemory(prefix);
+            CryptographicOperations.ZeroMemory(ha1Input);
+            if (ha1Hash is not null) CryptographicOperations.ZeroMemory(ha1Hash);
+            if (responseInput is not null) CryptographicOperations.ZeroMemory(responseInput);
+            if (responseHash is not null) CryptographicOperations.ZeroMemory(responseHash);
+        }
     }
 
     /// <summary>

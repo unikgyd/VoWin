@@ -4,6 +4,7 @@
   xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
   xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
   xmlns:helpers="clr-namespace:VoWin.Helpers"
+  xmlns:controls="clr-namespace:VoWin.Views.Controls"
   xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
   xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
   xmlns:vm="clr-namespace:VoWin.ViewModels.Pages"
@@ -38,7 +39,8 @@
     <Grid Grid.Row="0" Margin="0,0,0,16">
       <StackPanel>
         <TextBlock Style="{DynamicResource AppPageTitleStyle}" Text="短信" />
-        <TextBlock Style="{DynamicResource AppPageSubtitleStyle}" Text="集中管理会话、验证码与发送状态" />
+        <controls:GatewayStatusPanel x:Name="GatewayStatus" Margin="0,8,0,0" ShowSms="True" IsDense="True"
+            Service="{Binding GatewayService}" Slot="{Binding SelectedSlot}" />
       </StackPanel>
     </Grid>
 
@@ -595,19 +597,25 @@
                 <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
                   <ui:SymbolIcon Symbol="Sim24" FontSize="14" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="0,0,6,0" VerticalAlignment="Center"/>
                   <ComboBox
-                    MinWidth="180"
+                    x:Name="SmsSlotSelector"
+                    Width="200"
                     Height="28"
                     FontSize="12"
                     Padding="8,2"
                     ItemsSource="{Binding Slots}"
                     SelectedItem="{Binding SelectedSlot, Mode=TwoWay}"
-                    DisplayMemberPath="DisplayTitle"
                     ToolTip="选择发送短信的模组 / SIM 卡"
-                  />
+                  >
+                    <ComboBox.ItemTemplate>
+                      <DataTemplate>
+                        <TextBlock Text="{Binding DisplayTitle}" TextTrimming="CharacterEllipsis" ToolTip="{Binding DisplayTitle}" />
+                      </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                  </ComboBox>
                 </StackPanel>
 
                 <!-- Character & Segment Count -->
-                <Border Grid.Column="1" VerticalAlignment="Center" Padding="8,2" Background="{DynamicResource ControlFillColorDefaultBrush}" CornerRadius="4">
+                <Border x:Name="SmsCharacterCount" Grid.Column="1" VerticalAlignment="Center" Padding="8,2" Background="{DynamicResource ControlFillColorDefaultBrush}" CornerRadius="4">
                   <TextBlock
                     FontSize="11"
                     Foreground="{DynamicResource AppTextSecondaryBrush}"
@@ -617,13 +625,14 @@
               </Grid>
 
               <TextBlock
+                x:Name="SmsSubmissionStatus"
                 Grid.Row="1"
                 Margin="0,0,0,6"
                 FontSize="11"
                 Foreground="{DynamicResource AppTextSecondaryBrush}"
                 Text="{Binding StatusMessage}"
-                TextTrimming="CharacterEllipsis"
-                Visibility="{Binding StatusMessage, Converter={StaticResource BoolToVis}}"
+                TextWrapping="Wrap"
+                Visibility="{Binding StatusMessage, Converter={StaticResource NullToVis}}"
               />
 
               <Grid Grid.Row="2">

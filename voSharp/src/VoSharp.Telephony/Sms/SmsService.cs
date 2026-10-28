@@ -201,11 +201,18 @@ public class SmsService
     /// Submits an SMS message over Cellular AT modem.
     /// Supports multi-part concatenation and requests delivery status reports by default.
     /// </summary>
-    public async Task<SmsSubmitResult> SendSmsDetailedAsync(
+    public Task<SmsSubmitResult> SendSmsDetailedAsync(
         string destinationNumber,
         string text,
         bool requestStatusReport = true,
-        CancellationToken ct = default)
+        CancellationToken ct = default) => SendSmsDetailedCoreAsync(destinationNumber, text, requestStatusReport, null, ct);
+
+    public Task<SmsSubmitResult> SendSmsDetailedGuardedAsync(string destinationNumber, string text, Action verifyOriginalSource,
+        bool requestStatusReport = true, CancellationToken ct = default) =>
+        SendSmsDetailedCoreAsync(destinationNumber, text, requestStatusReport, verifyOriginalSource ?? throw new ArgumentNullException(nameof(verifyOriginalSource)), ct);
+
+    private async Task<SmsSubmitResult> SendSmsDetailedCoreAsync(string destinationNumber, string text, bool requestStatusReport,
+        Action? verifyOriginalSource, CancellationToken ct)
     {
         var parts = SmsPdu.PrepareSubmitParts(destinationNumber, text, requestStatusReport: requestStatusReport);
         var now = DateTime.UtcNow;
@@ -224,14 +231,20 @@ public class SmsService
         );
 
         // Ensure 3GPP PDU mode
+        ct.ThrowIfCancellationRequested();
+        verifyOriginalSource?.Invoke();
         await _modem.SendRawAtCommandAsync("AT+CMGF=0", 1000, ct).ConfigureAwait(false);
 
         for (int i = 0; i < parts.Count; i++)
         {
             var part = parts[i];
+            ct.ThrowIfCancellationRequested();
+            verifyOriginalSource?.Invoke();
             result = result with { PartsAttempted = result.PartsAttempted + 1 };
 
-            var sendResp = await _modem.SendPduWithPromptAsync(part.TpduLength, part.PduHex, ct).ConfigureAwait(false);
+            var sendResp = verifyOriginalSource == null
+                ? await _modem.SendPduWithPromptAsync(part.TpduLength, part.PduHex, ct).ConfigureAwait(false)
+                : await _modem.SendPduWithPromptGuardedAsync(part.TpduLength, part.PduHex, verifyOriginalSource, ct).ConfigureAwait(false);
 
             int? allocatedMr = null;
             if (sendResp.Success)

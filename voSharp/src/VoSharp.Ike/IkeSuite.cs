@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+
 namespace VoSharp.Ike;
 
 /// <summary>Thrown when a peer proposal names algorithms this stack does not implement.</summary>
@@ -99,6 +101,8 @@ public sealed record IkeSuite(
                 $"Expected an IKE proposal, got protocol {proposal.Protocol}.");
 
         var chosen = SelectOnePerType(proposal);
+        if (proposal.Spi.Length != 0 || chosen.Keys.Any(type => type is < 1 or > 4))
+            throw new IkeUnsupportedSuiteException("Unexpected IKE SPI or transform type.");
 
         var encryption = Require(chosen, IkeTransformType.Encryption, "encryption");
         var prf = Require(chosen, IkeTransformType.Prf, "PRF");
@@ -140,6 +144,8 @@ public sealed record IkeSuite(
 
         foreach (var transform in proposal.Transforms)
         {
+            if (transform.HasUnsupportedAttributes || transform.Type != IkeTransformType.Encryption && transform.KeyLengthBits.HasValue)
+                throw new IkeUnsupportedSuiteException("Unsupported selected transform attributes.");
             if (!chosen.TryAdd(transform.Type, transform))
                 throw new IkeUnsupportedSuiteException(
                     $"Proposal repeats transform type {transform.Type}; a chosen proposal carries one of each.");
@@ -160,8 +166,8 @@ public sealed record IkeSuite(
 /// purpose: ESP carries no PRF, and the DH group is inherited from the IKE SA.
 /// </summary>
 /// <remarks>
-/// These values are handed to the Windows kernel through <c>VoSharp.Ipsec</c>. C# derives the
-/// ESP keys but never encrypts or decrypts an ESP packet itself.
+/// These values drive the userspace ESP tunnel; negotiation must match the
+/// cipher, integrity key and sequence width the data plane actually implements.
 /// </remarks>
 public sealed record EspSuite(ushort EncryptionId, int EncryptionBits, ushort IntegrityId)
 {
@@ -214,6 +220,10 @@ public sealed record EspSuite(ushort EncryptionId, int EncryptionBits, ushort In
                 $"An ESP proposal carries a 4-byte SPI; this one carries {proposal.Spi.Length}.");
 
         var chosen = IkeSuite.SelectOnePerType(proposal);
+
+        if (proposal.ProposalNumber == 0 || BinaryPrimitives.ReadUInt32BigEndian(proposal.Spi) < 256 ||
+            chosen.Keys.Any(type => type is not (IkeTransformType.Encryption or IkeTransformType.Integrity or IkeTransformType.ExtendedSequenceNumbers)))
+            throw new IkeUnsupportedSuiteException("Invalid ESP SPI or unoffered transform type.");
 
         var encryption = IkeSuite.Require(chosen, IkeTransformType.Encryption, "encryption");
         var integrity = IkeSuite.Require(chosen, IkeTransformType.Integrity, "integrity");

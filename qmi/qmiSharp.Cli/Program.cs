@@ -50,9 +50,13 @@ internal static class Program
         Console.WriteLine("  --catalog                           List catalog entries");
         Console.WriteLine("  --tcp=host:port <qmicli option>     Run QMI over a frame-preserving proxy");
         Console.WriteLine("  --device=<path> <qmicli option>     Run QMI over an explicit raw Win32 device");
+        Console.WriteLine("  --auto <qmicli option>              Discover one Quectel qcusbwwan private QMI channel");
+        Console.WriteLine("  --auto --wds-probe-cid-isolation --wda-get-data-format   Read-only driver diagnostics");
+        Console.WriteLine("  --auto --imsa-get-ims-registration-status --imsa-get-ims-services-status   Read-only baseband IMS/VoLTE status");
+        Console.WriteLine("  --auto --wds-try-ims-bearer-ipv6    Opt-in temporary IMS WDS call; automatically stops on exit");
         Console.WriteLine();
         Console.WriteLine("AT COM ports are not raw QMI endpoints. On standard Windows qcusbwwan/MBN drivers,");
-        Console.WriteLine("use --hardware-info; QMI commands require an explicitly exposed raw endpoint or proxy.");
+        Console.WriteLine("use --hardware-info; --auto supports a unique Quectel qcusbwwan private control file.");
     }
 
     private static async Task<int> PrintHardwareInfoAsync(string? requestedPort)

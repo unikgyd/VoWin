@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using VoSharp.Sip;
 using VoSharp.Telephony.VoWifi;
 
@@ -7,6 +8,71 @@ namespace VoSharp.Tests;
 
 public sealed class SipDeregistrationTests
 {
+    [Fact]
+    public async Task VoWifiStopUsesTheSameAkaProviderForRemovalAndRetainsConfirmation()
+    {
+        using var pcscf = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        using var transport = new SipTransport();
+        transport.Connect(IPAddress.Loopback, IPAddress.Loopback,
+            ((IPEndPoint)pcscf.Client.LocalEndPoint!).Port, 0);
+        using var session = new SipRegisterSession(transport, Profile(transport));
+        using var manager = new VoWifiManager();
+        var akaCalls = 0;
+        Func<byte[], byte[], CancellationToken, Task<(byte[] Res, byte[] Ck, byte[] Ik)>> aka = (_, _, _) =>
+        {
+            Interlocked.Increment(ref akaCalls);
+            return Task.FromResult((new byte[8], new byte[16], new byte[16]));
+        };
+        typeof(VoWifiManager).GetField("_registerSession", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(manager, session);
+        typeof(VoWifiManager).GetField("_deregisterAkaProvider", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(manager, aka);
+        var server = Task.Run(async () =>
+        {
+            await ReceiveAndReplyAsync(pcscf, 200);
+            var datagram = await pcscf.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3));
+            var request = SipMessage.Parse(datagram.Buffer);
+            var challenge = request.CreateResponse(401, "Unauthorized");
+            challenge.SetHeader("WWW-Authenticate",
+                $"Digest realm=\"ims.test\", nonce=\"{Convert.ToBase64String(new byte[32])}\", algorithm=AKAv1-MD5");
+            await pcscf.SendAsync(challenge.ToBytes(), datagram.RemoteEndPoint);
+            var authenticated = await ReceiveAndReplyAsync(pcscf, 200);
+            Assert.Equal("0", authenticated.GetHeader("Expires"));
+        });
+        await session.RegisterAsync(UnexpectedAka);
+        await manager.StopVoWifiAsync();
+        await server;
+        Assert.Equal(1, akaCalls);
+        Assert.True(manager.RemoteDeregistered);
+        Assert.Null(manager.LastDeregistrationError);
+        Assert.Equal(VoWifiState.Disconnected, manager.State);
+        await manager.StopVoWifiAsync();
+        Assert.True(manager.RemoteDeregistered); // A redundant local stop is not a new registrar transaction.
+    }
+
+    [Fact]
+    public async Task VoWifiStopRetainsRemovalFailureRatherThanConfusingLocalDisconnectWithRemoteAck()
+    {
+        using var pcscf = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        using var transport = new SipTransport(timeoutMs: 250);
+        transport.Connect(IPAddress.Loopback, IPAddress.Loopback,
+            ((IPEndPoint)pcscf.Client.LocalEndPoint!).Port, 0);
+        using var session = new SipRegisterSession(transport, Profile(transport));
+        using var manager = new VoWifiManager();
+        typeof(VoWifiManager).GetField("_registerSession", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(manager, session);
+        var server = Task.Run(async () =>
+        {
+            await ReceiveAndReplyAsync(pcscf, 200);
+            await pcscf.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3)); // Deliberately no removal response.
+        });
+        await session.RegisterAsync(UnexpectedAka);
+        await manager.StopVoWifiAsync();
+        await server;
+        Assert.False(manager.RemoteDeregistered);
+        Assert.Contains("no response", manager.LastDeregistrationError);
+        Assert.Equal(VoWifiState.Disconnected, manager.State);
+        await manager.StopVoWifiAsync();
+        Assert.Contains("no response", manager.LastDeregistrationError);
+    }
+
     [Fact]
     public async Task DeregisterRemovesTheSameContactWithHigherCseq()
     {
@@ -89,7 +155,8 @@ public sealed class SipDeregistrationTests
             var datagram = await pcscf.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3));
             var removal = SipMessage.Parse(datagram.Buffer);
             var accepted = removal.CreateResponse(200, "OK");
-            accepted.SetHeader("Contact", removal.GetHeader("Contact")!);
+            accepted.SetHeader("Contact", removal.GetHeader("Contact")!
+                .Replace(";expires=0", ";expires=3600", StringComparison.Ordinal));
             await pcscf.SendAsync(accepted.ToBytes(), datagram.RemoteEndPoint);
         });
 
@@ -115,7 +182,8 @@ public sealed class SipDeregistrationTests
             var removal = SipMessage.Parse(datagram.Buffer);
             var accepted = removal.CreateResponse(200, "OK");
             accepted.SetHeader("Contact", removal.GetHeader("Contact")!
-                .Replace(";transport=udp>", ">", StringComparison.OrdinalIgnoreCase));
+                .Replace(";transport=udp>", ">", StringComparison.OrdinalIgnoreCase)
+                .Replace(";expires=0", ";expires=3600", StringComparison.Ordinal));
             await pcscf.SendAsync(accepted.ToBytes(), datagram.RemoteEndPoint);
         });
 

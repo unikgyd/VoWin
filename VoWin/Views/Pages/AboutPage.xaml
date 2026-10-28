@@ -7,6 +7,9 @@
   xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
   xmlns:vm="clr-namespace:VoWin.ViewModels.Pages"
   Title="关于"
+  Background="{DynamicResource AppSurfaceBrush}"
+  UseLayoutRounding="True" SnapsToDevicePixels="True"
+  TextOptions.TextFormattingMode="Display" TextOptions.TextRenderingMode="ClearType"
   d:DataContext="{d:DesignInstance vm:AboutViewModel, IsDesignTimeCreatable=False}"
   d:DesignHeight="850"
   d:DesignWidth="1100"
@@ -48,9 +51,6 @@
           Padding="24,20"
           Margin="0,0,0,16"
         >
-          <Border.Effect>
-            <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-          </Border.Effect>
           <Grid>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="Auto" />
@@ -69,9 +69,6 @@
               VerticalAlignment="Top"
               Margin="0,0,20,0"
             >
-              <Border.Effect>
-                <DropShadowEffect BlurRadius="12" Direction="270" Opacity="0.10" ShadowDepth="3" Color="{DynamicResource AppShadowColor}" />
-              </Border.Effect>
               <Image
                 Source="pack://application:,,,/Assets/vowin.png"
                 Width="48"
@@ -114,9 +111,6 @@
           Padding="20,18"
           Margin="0,0,0,16"
         >
-          <Border.Effect>
-            <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-          </Border.Effect>
           <StackPanel>
             <Grid Margin="0,0,0,12">
               <Grid.ColumnDefinitions>
@@ -235,9 +229,6 @@
           Padding="20,18"
           Margin="0,0,0,16"
         >
-          <Border.Effect>
-            <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-          </Border.Effect>
           <StackPanel>
             <!-- Card Header -->
             <Grid Margin="0,0,0,10">
@@ -319,9 +310,6 @@
                     Height="160"
                     HorizontalAlignment="Center"
                   >
-                    <Border.Effect>
-                      <DropShadowEffect BlurRadius="8" Direction="270" Opacity="0.06" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-                    </Border.Effect>
                     <Image
                       Source="{Binding TronQrCode}"
                       RenderOptions.BitmapScalingMode="NearestNeighbor"
@@ -432,9 +420,6 @@
                     Height="160"
                     HorizontalAlignment="Center"
                   >
-                    <Border.Effect>
-                      <DropShadowEffect BlurRadius="8" Direction="270" Opacity="0.06" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-                    </Border.Effect>
                     <Image
                       Source="{Binding BscQrCode}"
                       RenderOptions.BitmapScalingMode="NearestNeighbor"
@@ -545,9 +530,6 @@
                     Height="160"
                     HorizontalAlignment="Center"
                   >
-                    <Border.Effect>
-                      <DropShadowEffect BlurRadius="8" Direction="270" Opacity="0.06" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-                    </Border.Effect>
                     <Image
                       Source="{Binding PolygonQrCode}"
                       RenderOptions.BitmapScalingMode="NearestNeighbor"
@@ -651,9 +633,6 @@
           Padding="20,18"
           Margin="0,0,0,16"
         >
-          <Border.Effect>
-            <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-          </Border.Effect>
           <StackPanel>
             <Grid Margin="0,0,0,10">
               <Grid.ColumnDefinitions>

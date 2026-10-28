@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.NetworkInformation;
+using VoSharp.Common.Utils;
 
 namespace VoSharp.Modem;
 
@@ -19,7 +20,7 @@ public sealed record HostImsPdnContext(
     IReadOnlyList<IPAddress> PcscfServers,
     IReadOnlyList<string> HostInterfaces)
 {
-    /// <summary>Only addresses from this context that were found on a live Windows interface.</summary>
+    /// <summary>Addresses owned by a live Windows interface, including the controlled PPP /64 address.</summary>
     public IReadOnlyList<IPAddress> HostOwnedAddresses { get; init; } = [];
     public string Label => FormatContextId(ContextId);
 
@@ -65,12 +66,20 @@ public sealed record HostImsProbeResult(
     public IReadOnlyList<HostImsWindowsAdapter> WindowsCellularAdapters { get; init; } = [];
     /// <summary>A missing result never authorizes registration.</summary>
     public IReadOnlyList<HostImsRouteCheck>? RouteChecks { get; init; }
+    /// <summary>Trusted bearer-owner anchor, not inferred from a matching IP address.</summary>
+    public int? OwnedInterfaceIndex { get; init; }
+    public ulong? OwnedInterfaceLuid { get; init; }
     public IReadOnlyList<HostImsEndpointCandidate> EndpointCandidates => Readiness == HostImsReadiness.HostRoutable
         ? HostImsPdnParser.GetEndpointCandidates(Contexts)
         : [];
 
     public bool IsRouteVerified(HostImsEndpointCandidate endpoint) =>
-        RouteChecks?.Any(check => check.Endpoint == endpoint && check.IsVerified) == true;
+        OwnedInterfaceIndex is not <= 0 && OwnedInterfaceLuid is not 0 &&
+        (OwnedInterfaceLuid is null || OwnedInterfaceIndex is not null) &&
+        RouteChecks?.Any(check => check.Endpoint == endpoint && check.IsVerified &&
+            check.InterfaceIndex is > 0 &&
+            (OwnedInterfaceIndex is null || check.InterfaceIndex == OwnedInterfaceIndex) &&
+            (OwnedInterfaceLuid is null || check.InterfaceLuid == OwnedInterfaceLuid)) == true;
 }
 
 internal sealed record HostImsConfiguredContext(int ContextId, string PdpType, string Apn);
@@ -83,8 +92,14 @@ internal sealed record HostImsRuntimeContext(
     IReadOnlyList<IPAddress> DnsServers,
     IReadOnlyList<IPAddress> PcscfServers);
 
+internal sealed record HostImsPppAddress(IPAddress Address, int PrefixLength, string? InterfaceName = null);
+
 internal static class HostImsPdnParser
 {
+    // This RAS entry is created only by the controlled CID 5 diagnostic. Do
+    // not classify arbitrary VPN/PPP interfaces as cellular IMS bearers.
+    internal const string ImsPppEntryName = "VoWin IMS PPP Probe";
+
     public static HostImsReadiness Classify(
         bool? simInserted,
         bool queryFailed,
@@ -108,7 +123,20 @@ internal static class HostImsPdnParser
                 .SelectMany(local => context.PcscfServers
                     .Where(pcscf => pcscf.AddressFamily == local.AddressFamily)
                     .Select(pcscf => new HostImsEndpointCandidate(context.ContextId, local, pcscf))))
+            .Distinct()
             .ToArray();
+
+    internal static bool IsUsableEndpointAddress(IPAddress address)
+    {
+        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any))
+            return false;
+        if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+            return address.ScopeId == 0 && !address.IsIPv4MappedToIPv6 && !address.IsIPv6LinkLocal && !address.IsIPv6Multicast;
+        if (address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
+        var bytes = address.GetAddressBytes();
+        return !address.Equals(IPAddress.Broadcast) && bytes[0] is < 224 or > 239 &&
+            !(bytes[0] == 169 && bytes[1] == 254);
+    }
 
     public static IReadOnlyList<HostImsConfiguredContext> ParseConfigured(IEnumerable<string> lines) =>
         lines.Select(line => ParseFields(line, "+CGDCONT:"))
@@ -148,7 +176,9 @@ internal static class HostImsPdnParser
         foreach (var line in lines)
         {
             var fields = ParseFields(line, "+CGCONTRDP:");
-            if (fields is not { Count: >= 4 } || !int.TryParse(fields[0], out var cid)) continue;
+            if (fields is not { Count: >= 4 } ||
+                !int.TryParse(fields[0], System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out var cid) || cid is < 1 or > 255) continue;
             result.Add(new HostImsRuntimeContext(
                 cid,
                 fields[2],
@@ -208,7 +238,7 @@ internal static class HostImsPdnParser
         return null;
     }
 
-    public static IReadOnlyDictionary<IPAddress, string[]> GetHostAddresses()
+    public static IReadOnlyDictionary<IPAddress, string[]> GetHostAddresses(string? expectedPppEntry = null)
     {
         var result = new Dictionary<IPAddress, List<string>>();
         try
@@ -217,6 +247,8 @@ internal static class HostImsPdnParser
             {
                 if (!IsHostImsDataInterface(nic.Name, nic.Description, nic.NetworkInterfaceType, nic.OperationalStatus))
                     continue;
+                if (expectedPppEntry != null && nic.NetworkInterfaceType == NetworkInterfaceType.Ppp &&
+                    nic.Name != expectedPppEntry) continue;
                 foreach (var address in nic.GetIPProperties().UnicastAddresses.Select(item => item.Address))
                 {
                     if (IPAddress.IsLoopback(address) || address.IsIPv6LinkLocal) continue;
@@ -227,6 +259,44 @@ internal static class HostImsPdnParser
         }
         catch { }
         return result.ToDictionary(pair => pair.Key, pair => pair.Value.ToArray());
+    }
+
+    public static IReadOnlyList<HostImsPppAddress> GetActiveImsPppAddresses()
+    {
+        try
+        {
+            return NetworkInterface.GetAllNetworkInterfaces()
+                .Where(nic => IsKnownImsPppInterface(nic.Name, nic.NetworkInterfaceType) &&
+                              nic.OperationalStatus == OperationalStatus.Up)
+                .SelectMany(nic => nic.GetIPProperties().UnicastAddresses
+                    .Where(item => item.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 &&
+                                   !item.Address.IsIPv6LinkLocal && item.PrefixLength == 64)
+                    .Select(item => new HostImsPppAddress(item.Address, item.PrefixLength, nic.Name)))
+                .Distinct()
+                .ToArray();
+        }
+        catch { return []; }
+    }
+
+    internal static IReadOnlyList<IPAddress> ResolveHostOwnedAddresses(
+        IReadOnlyList<IPAddress> modemAddresses,
+        IReadOnlyDictionary<IPAddress, string[]> hostAddresses,
+        IReadOnlyList<HostImsPppAddress> pppAddresses) =>
+        modemAddresses.Where(hostAddresses.ContainsKey)
+            .Concat(pppAddresses.Where(ppp => hostAddresses.ContainsKey(ppp.Address) &&
+                                              modemAddresses.Any(modem => IsSameImsPppPrefix(modem, ppp)))
+                .Select(ppp => ppp.Address))
+            .Distinct()
+            .ToArray();
+
+    internal static bool IsSameImsPppPrefix(IPAddress modemAddress, HostImsPppAddress ppp)
+    {
+        if (modemAddress.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6 ||
+            ppp.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6 ||
+            ppp.PrefixLength != 64 || modemAddress.IsIPv6LinkLocal || ppp.Address.IsIPv6LinkLocal)
+            return false;
+        return modemAddress.GetAddressBytes().AsSpan(0, 8)
+            .SequenceEqual(ppp.Address.GetAddressBytes().AsSpan(0, 8));
     }
 
     public static IReadOnlyList<HostImsWindowsAdapter> GetWindowsCellularAdapters()
@@ -243,6 +313,7 @@ internal static class HostImsPdnParser
     }
 
     internal static bool LooksLikeCellularAdapter(string name, string description, NetworkInterfaceType type) =>
+        IsKnownImsPppInterface(name, type) ||
         type is NetworkInterfaceType.Wwanpp or NetworkInterfaceType.Wwanpp2 ||
         name.Contains("cellular", StringComparison.OrdinalIgnoreCase) ||
         description.Contains("cellular", StringComparison.OrdinalIgnoreCase) ||
@@ -255,6 +326,10 @@ internal static class HostImsPdnParser
         type is not (NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel) &&
         LooksLikeCellularAdapter(name, description, type);
 
+    private static bool IsKnownImsPppInterface(string name, NetworkInterfaceType type) =>
+        type == NetworkInterfaceType.Ppp &&
+        HostImsBearerIdentity.IsControlledEntry(name);
+
     private static IReadOnlyList<IPAddress> ParseAddressRange(IReadOnlyList<string> fields, int start, int count) =>
         Enumerable.Range(start, count)
             .Where(index => index < fields.Count)
@@ -262,23 +337,34 @@ internal static class HostImsPdnParser
             .Distinct()
             .ToArray();
 
-    private static IReadOnlyList<IPAddress> ParseAddresses(string? value, bool stripIpv4Mask = false)
+    internal static IReadOnlyList<IPAddress> ParseAddresses(string? value, bool stripIpv4Mask = false)
     {
         if (string.IsNullOrWhiteSpace(value)) return [];
         var candidates = value.Split([' ', '/'], StringSplitOptions.RemoveEmptyEntries);
         var result = new List<IPAddress>();
         foreach (var candidate in candidates)
         {
-            if (IPAddress.TryParse(candidate, out var address))
+            IPAddress? address = null;
+            // Only colon-form IPv6 may use the framework parser. Its IPv4
+            // compatibility parser otherwise accepts shorthand, hex and octal,
+            // and even turns a /64 prefix into the address 0.0.0.64.
+            if (candidate.Contains(':') && !candidate.Contains('%') && IPAddress.TryParse(candidate, out address))
             {
                 if (!address.Equals(IPAddress.Any) && !address.Equals(IPAddress.IPv6Any)) result.Add(address);
                 continue;
             }
 
             var octets = candidate.Split('.');
-            if (!octets.All(part => byte.TryParse(part, out _))) continue;
-            var bytes = octets.Select(byte.Parse).ToArray();
-            if (bytes.Length == 8 && stripIpv4Mask) bytes = bytes[..4];
+            if (!octets.All(part => part.Length is >= 1 and <= 3 && part.All(char.IsAsciiDigit) &&
+                byte.TryParse(part, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out _))) continue;
+            var bytes = octets.Select(part => byte.Parse(part, System.Globalization.CultureInfo.InvariantCulture)).ToArray();
+            if (stripIpv4Mask && bytes.Length is 8 or 32)
+            {
+                var half = bytes.Length / 2;
+                if (!IsContiguousMask(bytes.AsSpan(half))) continue;
+                bytes = bytes[..half];
+            }
             if (bytes.Length is 4 or 16)
             {
                 address = new IPAddress(bytes);
@@ -288,25 +374,47 @@ internal static class HostImsPdnParser
         return result.Distinct().ToArray();
     }
 
+    private static bool IsContiguousMask(ReadOnlySpan<byte> mask)
+    {
+        var zeroSeen = false;
+        foreach (var octet in mask)
+            for (var bit = 7; bit >= 0; bit--)
+                if ((octet & (1 << bit)) == 0) zeroSeen = true;
+                else if (zeroSeen) return false;
+        return true;
+    }
+
     private static IReadOnlyList<string>? ParseFields(string line, string prefix)
     {
-        var index = line.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
-        if (index < 0) return null;
-        var input = line[(index + prefix.Length)..].Trim();
+        line = line.Trim();
+        if (!line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return null;
+        var input = line[prefix.Length..].Trim();
+        if (input.Length > 4096 || input.Any(char.IsControl)) return null;
         var fields = new List<string>();
         var current = new System.Text.StringBuilder();
         var quoted = false;
+        var closed = false;
         for (var i = 0; i < input.Length; i++)
         {
             var ch = input[i];
-            if (ch == '"') { quoted = !quoted; continue; }
+            if (ch == '"' && !closed && (quoted || current.ToString().Trim().Length == 0))
+            {
+                quoted = !quoted;
+                if (!quoted) closed = true;
+                continue;
+            }
+            if (ch == '"') return null;
             if (ch == ',' && !quoted)
             {
                 fields.Add(current.ToString().Trim());
                 current.Clear();
+                closed = false;
+                if (fields.Count >= 32) return null;
             }
+            else if (closed && !char.IsWhiteSpace(ch)) return null;
             else current.Append(ch);
         }
+        if (quoted) return null;
         fields.Add(current.ToString().Trim());
         return fields;
     }

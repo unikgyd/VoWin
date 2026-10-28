@@ -71,16 +71,40 @@ jobs:
       - name: Build release configuration
         run: dotnet build VoWin.slnx --configuration Release --no-restore
 
-      - name: Publish single-file Windows application
+      - name: Prepare pinned redistributable runtime bundle
+        shell: pwsh
+        run: ./packaging/Prepare-RuntimeBundle.ps1
+
+      - name: Publish lightweight single-file Windows application
         shell: pwsh
         run: |
           dotnet publish VoWin/VoWin.csproj `
             --configuration Release `
             --runtime win-x64 `
-            --no-restore `
             --self-contained false `
             --property:Version=$env:VERSION `
+            --property:VoWinRuntimeBundle="$env:GITHUB_WORKSPACE/packaging/runtime.zip" `
             --output publish/win-x64
+
+      - name: Verify offline package using system .NET without PowerShell or ADB on PATH
+        shell: pwsh
+        run: |
+          if ((Get-Item ./publish/win-x64/VoWin.exe).Length -gt 32MB) { throw 'VoWin.exe exceeded the 32 MiB release size budget.' }
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          $report = "$env:GITHUB_WORKSPACE/publish/runtime-verification.json"
+          $process = Start-Process -FilePath ./publish/win-x64/VoWin.exe -ArgumentList @('--verify-runtime', ('"' + $report + '"')) -WindowStyle Hidden -PassThru
+          if (-not $process.WaitForExit(90000) -or $process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $report)) {
+            throw 'Lightweight package verification failed.'
+          }
+          Get-Content -LiteralPath $report
+          $checks = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+          if (-not $checks.ManagedImsOwner.ManagedRas -or -not $checks.ManagedImsOwner.ManagedTaskScheduler -or
+              -not $checks.HostImsOwnerProtocolVerified -or $checks.ReadOnlyChildProcessesStarted -ne 1 -or $checks.BearerProcessesStarted) {
+            throw 'Package diagnostics must verify the matching managed owner using only its read-only protocol handshake; no bearer processes.'
+          }
+          if (-not $checks.QdcIdentityHelperVerified -or $checks.QdcIdentityHelperBytes -ne 3660) {
+            throw 'The tiny embedded read-only QDC507 identity helper must be hash verified.'
+          }
 
       - name: Create release archive and checksum
         shell: pwsh

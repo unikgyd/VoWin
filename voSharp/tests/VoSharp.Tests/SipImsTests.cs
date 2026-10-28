@@ -132,6 +132,30 @@ public class SipImsTests
         Assert.Equal("auth", challenge.Qop);
     }
 
+    [Fact]
+    public void ChallengeAcceptsCaseWhitespaceAndQuotedCommasWithoutChangingAkaPolicy()
+    {
+        var challenge = VoSharp.Sip.ImsRegisterBuilder.ParseWwwAuthenticate(
+            "dIgEsT ReAlM = \"ims.test\", NONCE = \"AAAA\", " +
+            "ALGORITHM = AKAv1-MD5, QOP = \" auth-int , AUTH \", " +
+            "OPAQUE = \"a,b\", StAlE = TRUE");
+
+        Assert.NotNull(challenge);
+        Assert.Equal("ims.test", challenge.Realm);
+        Assert.Equal("AAAA", challenge.Nonce);
+        Assert.Equal("auth", challenge.Qop);
+        Assert.Equal("a,b", challenge.Opaque);
+        Assert.True(challenge.Stale);
+    }
+
+    [Theory]
+    [InlineData("DigestX realm=\"r\", nonce=\"n\", algorithm=AKAv1-MD5")]
+    [InlineData("Digest realm=\"r\", nonce=\"n\", algorithm=AKAv1-MD5, nonce=\"other\"")]
+    [InlineData("Digest realm=\"r\", nonce=\"n\", algorithm=AKAv1-MD5, qop=\"auth-int\"")]
+    [InlineData("Digest realm=\"r\", nonce=\"n\", algorithm=AKAv1-MD5, opaque=\"unterminated")]
+    public void MalformedOrDowngradedChallengeIsRejected(string header) =>
+        Assert.Null(VoSharp.Sip.ImsRegisterBuilder.ParseWwwAuthenticate(header));
+
     // ── integrity-protected ──────────────────────────────────────────────────
 
     [Fact]
@@ -174,6 +198,27 @@ public class SipImsTests
     }
 
     [Fact]
+    public void RegisterAdvertisesSmsOnlyWhenItsMediaProfileSupportsIt()
+    {
+        var profile = new VoSharp.Sip.ImsProfile(
+            "001010123456789@ims.test", "sip:001010123456789@ims.test",
+            "ims.test", "860000000000001", "10.0.0.5");
+        var withSms = VoSharp.Sip.ImsRegisterBuilder.BuildInitialRegister(profile, "sms", 1);
+        Assert.Contains("+g.3gpp.smsip", withSms.GetHeader("Contact"));
+        Assert.Contains("+g.3gpp.smsip", withSms.GetHeader("Accept-Contact"));
+        Assert.Contains("MESSAGE", withSms.GetHeader("Allow"));
+        Assert.Contains("application/vnd.3gpp.sms", withSms.GetHeader("Accept"));
+
+        var voiceOnly = VoSharp.Sip.ImsRegisterBuilder.BuildInitialRegister(
+            profile with { AdvertiseSmsOverIms = false }, "voice", 1);
+        Assert.DoesNotContain("+g.3gpp.smsip", voiceOnly.GetHeader("Contact"));
+        Assert.DoesNotContain("+g.3gpp.smsip", voiceOnly.GetHeader("Accept-Contact"));
+        Assert.DoesNotContain("MESSAGE", voiceOnly.GetHeader("Allow"));
+        Assert.Null(voiceOnly.GetHeader("Accept"));
+        Assert.Contains("mmtel", voiceOnly.GetHeader("Contact"));
+    }
+
+    [Fact]
     public void FormatHostBracketsOnlyIpv6Addresses()
     {
         Assert.Equal("[2001:db8::1]", VoSharp.Sip.ImsRegisterBuilder.FormatHost("2001:db8::1"));
@@ -204,6 +249,22 @@ public class SipImsTests
         // "SIP/2.0/UDP 2001:db8::1:5060" would be read as host "2001" with a nonsense port.
         Assert.Contains("[2001:db8::1]:5060", via, StringComparison.Ordinal);
         Assert.Contains("[2001:db8::1]:5060", contact, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ProtectedRegisterAdvertisesServerPortInViaButUsesClientPortForTransport()
+    {
+        var profile = new VoSharp.Sip.ImsProfile(
+            "001010123456789@ims.mnc001.mcc001.3gppnetwork.org",
+            "sip:001010123456789@ims.mnc001.mcc001.3gppnetwork.org",
+            "ims.mnc001.mcc001.3gppnetwork.org", "860000000000001",
+            "2001:db8::1", LocalPort: 63311, ContactPort: 63312);
+
+        var message = VoSharp.Sip.ImsRegisterBuilder.BuildInitialRegister(profile, "callid", 2, "fromtag");
+
+        Assert.Contains("[2001:db8::1]:63312", message.GetHeader("Via"), StringComparison.Ordinal);
+        Assert.Contains("[2001:db8::1]:63312", message.GetHeader("Contact"), StringComparison.Ordinal);
+        Assert.Equal(63311, profile.LocalPort);
     }
 
     private static string Md5(string text)

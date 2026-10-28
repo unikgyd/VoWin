@@ -14,7 +14,17 @@ public sealed record IkeBackendResult(
     VoSharp.Ike.IkeSuite? IkeSuite = null,
     VoSharp.Ike.EspSuite? EspSuite = null,
     EspTunnel? EspTunnel = null,
-    VoSharp.Ike.IkeTransport? Transport = null
+    VoSharp.Ike.IkeTransport? Transport = null,
+    bool RetryableTransportFailure = false,
+    bool RetryableAddressFamilyFailure = false,
+    bool RetryableIdentityRejection = false,
+    bool RetryableInitialTimeout = false,
+    bool RetryableInitialProposal = false,
+    // May retain an earlier attempt's final AUTH for home-binding protection.
+    bool FinalAuthVerified = false,
+    bool InitialResponderAuthVerified = false,
+    // Must belong to this result's authenticated attempt, not historical AUTH.
+    VoSharp.Ike.IkeNetworkRejection? NetworkRejection = null
 );
 
 public interface IIkeBackend : IDisposable

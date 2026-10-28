@@ -38,6 +38,7 @@ namespace VoWin.ViewModels.Pages
     public partial class SystemStatusViewModel : ObservableObject
     {
         private readonly IVoKernelService _kernelService;
+        public IVoKernelService GatewayService => _kernelService;
         private readonly ICollectionView? _filteredLogsView;
         private readonly System.Windows.Threading.DispatcherTimer _heartbeatTimer;
         private readonly SemaphoreSlim _simSwitchGate = new(1, 1);
@@ -125,6 +126,76 @@ namespace VoWin.ViewModels.Pages
         [ObservableProperty]
         private bool _isHostImsProbeRunning;
 
+        [ObservableProperty]
+        private bool _isHostImsPppBusy;
+
+        [ObservableProperty]
+        private bool _isHostImsPppActive;
+
+        [ObservableProperty]
+        private bool _hostImsPppHandoffApproved;
+
+        [ObservableProperty]
+        private string _hostImsPppStatusText = "Windows 尚未持有 IMS PPP";
+
+        [ObservableProperty]
+        private string _hostImsPppDetail = "启动承载会暂时移交模组 IMS 并重启模组；不会发送 SIP REGISTER。";
+
+        [ObservableProperty]
+        private string _hostImsPppScriptPath = DefaultHostImsPppScriptPath();
+
+        [ObservableProperty]
+        private string _hostImsRasProbePath = DefaultHostImsRasProbePath();
+
+        private static string DefaultHostImsPppScriptPath()
+        {
+            var configured = Environment.GetEnvironmentVariable("VOWIN_HOST_IMS_PPP_OWNER");
+            if (!string.IsNullOrWhiteSpace(configured)) return configured;
+            var packaged = BundledRuntime.FindHostIms("VoSharp.HostIms.exe") ?? Path.Combine(AppContext.BaseDirectory,
+                "host-ims", "VoSharp.HostIms.exe");
+            if (File.Exists(packaged)) return packaged;
+            var candidate = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+                "..", "..", "..", "..", "publish", "host-ims", "VoSharp.HostIms.exe"));
+            return File.Exists(candidate) ? candidate : string.Empty;
+        }
+
+        private static string DefaultHostImsRasProbePath()
+        {
+            return DefaultHostImsPppScriptPath();
+        }
+
+        public bool CanStartHostImsPppBearer =>
+            !IsHostImsPppBusy && !IsHostImsPppActive && !IsHostImsProbeRunning &&
+            !IsHostImsRegistrationBusy && !HasHostImsRegistrationSession && HostImsPppHandoffApproved &&
+            !string.IsNullOrWhiteSpace(HostImsPppScriptPath) &&
+            !string.IsNullOrWhiteSpace(HostImsRasProbePath) &&
+            SelectedSlot is { IsPcscReader: false, Sim: not null };
+
+        public bool CanStopHostImsPppBearer =>
+            !IsHostImsPppBusy && !IsHostImsRegistrationBusy && IsHostImsPppActive;
+
+        partial void OnIsHostImsPppBusyChanged(bool value)
+        {
+            OnPropertyChanged(nameof(CanStartHostImsPppBearer));
+            OnPropertyChanged(nameof(CanStopHostImsPppBearer));
+            OnPropertyChanged(nameof(CanStartHostImsRegistration));
+        }
+
+        partial void OnIsHostImsPppActiveChanged(bool value)
+        {
+            OnPropertyChanged(nameof(CanStartHostImsPppBearer));
+            OnPropertyChanged(nameof(CanStopHostImsPppBearer));
+        }
+
+        partial void OnHostImsPppHandoffApprovedChanged(bool value) =>
+            OnPropertyChanged(nameof(CanStartHostImsPppBearer));
+
+        partial void OnHostImsPppScriptPathChanged(string value) =>
+            OnPropertyChanged(nameof(CanStartHostImsPppBearer));
+
+        partial void OnHostImsRasProbePathChanged(string value) =>
+            OnPropertyChanged(nameof(CanStartHostImsPppBearer));
+
         public ObservableCollection<HostImsEndpointCandidate> HostImsCandidateOptions { get; } = [];
 
         [ObservableProperty]
@@ -140,10 +211,31 @@ namespace VoWin.ViewModels.Pages
         private string _hostImsRegistrationDetail = "需先插卡并探测到 Windows 持有的 IMS 数据面。";
 
         [ObservableProperty]
+        private string _hostImsMediaStatusText = "无活动 Host IMS 语音媒体。";
+
+        [ObservableProperty]
         private bool _hasHostImsRegistrationSession;
 
+        [ObservableProperty]
+        private bool _hostImsSubscriberEgressApproved;
+
+        [ObservableProperty]
+        private bool _useHostImsUserspaceEsp = true;
+
+        [ObservableProperty]
+        private bool _useHostImsSmsReceive;
+
+        [ObservableProperty]
+        private string _hostImsWinDivertDllPath =
+            Environment.GetEnvironmentVariable("VOWIN_HOST_IMS_WINDIVERT_DLL") ??
+            BundledRuntime.FindHostIms("WinDivert.dll") ??
+            (File.Exists(Path.Combine(AppContext.BaseDirectory, "host-ims", "WinDivert.dll"))
+                ? Path.Combine(AppContext.BaseDirectory, "host-ims", "WinDivert.dll") : string.Empty);
+
         public bool CanStartHostImsRegistration =>
-            !IsHostImsProbeRunning && !IsHostImsRegistrationBusy &&
+            !IsHostImsProbeRunning && !IsHostImsRegistrationBusy && !IsHostImsPppBusy &&
+            HostImsSubscriberEgressApproved &&
+            (!UseHostImsUserspaceEsp || !string.IsNullOrWhiteSpace(HostImsWinDivertDllPath)) &&
             SelectedHostImsEndpoint is not null && SelectedSlot?.Sim is not null &&
             SelectedSlot.IsPcscReader == false;
 
@@ -153,17 +245,34 @@ namespace VoWin.ViewModels.Pages
         partial void OnSelectedHostImsEndpointChanged(HostImsEndpointCandidate? value) =>
             OnPropertyChanged(nameof(CanStartHostImsRegistration));
 
-        partial void OnIsHostImsProbeRunningChanged(bool value) =>
+        partial void OnIsHostImsProbeRunningChanged(bool value)
+        {
             OnPropertyChanged(nameof(CanStartHostImsRegistration));
+            OnPropertyChanged(nameof(CanStartHostImsPppBearer));
+        }
 
         partial void OnIsHostImsRegistrationBusyChanged(bool value)
         {
             OnPropertyChanged(nameof(CanStartHostImsRegistration));
             OnPropertyChanged(nameof(CanStopHostImsRegistration));
+            OnPropertyChanged(nameof(CanStartHostImsPppBearer));
+            OnPropertyChanged(nameof(CanStopHostImsPppBearer));
         }
 
-        partial void OnHasHostImsRegistrationSessionChanged(bool value) =>
+        partial void OnHasHostImsRegistrationSessionChanged(bool value)
+        {
             OnPropertyChanged(nameof(CanStopHostImsRegistration));
+            OnPropertyChanged(nameof(CanStartHostImsPppBearer));
+        }
+
+        partial void OnHostImsSubscriberEgressApprovedChanged(bool value) =>
+            OnPropertyChanged(nameof(CanStartHostImsRegistration));
+
+        partial void OnUseHostImsUserspaceEspChanged(bool value) =>
+            OnPropertyChanged(nameof(CanStartHostImsRegistration));
+
+        partial void OnHostImsWinDivertDllPathChanged(string value) =>
+            OnPropertyChanged(nameof(CanStartHostImsRegistration));
 
         [ObservableProperty]
         private string _hostImsStatusTitle = "尚未探测蜂窝 IMS";
@@ -211,7 +320,7 @@ namespace VoWin.ViewModels.Pages
         private bool _isDeviceDetailsExpanded;
 
         [ObservableProperty]
-        private bool _isLogPanelExpanded = true;
+        private bool _isLogPanelExpanded = false;
 
         [ObservableProperty]
         private bool _isAutoScrollPaused;
@@ -748,6 +857,8 @@ namespace VoWin.ViewModels.Pages
         public SystemStatusViewModel(IVoKernelService kernelService)
         {
             _kernelService = kernelService;
+            InitializeDiagnosticBindings();
+            _selectedOutgoingRoute = OutgoingRoutes[0];
             SelectedSlot = _kernelService.ActiveSlot ?? Slots.FirstOrDefault();
 
             _filteredLogsView = CollectionViewSource.GetDefaultView(Logs);
@@ -758,6 +869,8 @@ namespace VoWin.ViewModels.Pages
 
             Slots.CollectionChanged += (s, e) =>
             {
+                OnPropertyChanged(nameof(ModuleInstances));
+                OnPropertyChanged(nameof(SelectedModuleInstance));
                 if (SelectedSlot == null || !Slots.Contains(SelectedSlot))
                     SelectedSlot = SelectedSlot == null
                         ? Slots.FirstOrDefault()
@@ -846,17 +959,26 @@ namespace VoWin.ViewModels.Pages
                 OnPropertyChanged(nameof(SipPacketLoss));
                 OnPropertyChanged(nameof(LastProbeStatusText));
                 RefreshHostImsRegistrationStatus();
+                RefreshHostImsMediaStatus();
+                if (!IsHostImsPppBusy) RefreshHostImsPppBearerStatus();
+                NotifyAll();
+                if (SelectedSlot is { } currentSlot && !IsTelephonyBusy &&
+                    !string.Equals(_loadedTelephonyIccid, currentSlot.Sim?.Iccid, StringComparison.Ordinal))
+                    _ = LoadTelephonyPreferencesAsync(currentSlot);
             };
             _heartbeatTimer.Start();
         }
 
         partial void OnSelectedSlotChanged(ModemSlot? value)
         {
+            ClearVoWifiDiscoveryEditor();
             ResetHostImsProbe();
             NotifyAll();
             OnPropertyChanged(nameof(HasCurrentSim));
+            OnPropertyChanged(nameof(CanStartHostImsPppBearer));
             if (value != null)
             {
+                _ = LoadTelephonyPreferencesAsync(value);
                 _ = LoadSimSwitchesAsync(value);
                 _ = LoadVoWifiRouteAsync(value);
             }
@@ -865,6 +987,8 @@ namespace VoWin.ViewModels.Pages
         private void ResetHostImsProbe()
         {
             Interlocked.Increment(ref _hostImsProbeVersion);
+            HostImsPppHandoffApproved = false;
+            HostImsSubscriberEgressApproved = false;
             IsHostImsProbeRunning = false;
             HostImsStatusTitle = "尚未探测蜂窝 IMS";
             HostImsStatusDetail = SelectedSlot?.IsPcscReader == true
@@ -885,6 +1009,39 @@ namespace VoWin.ViewModels.Pages
             HostImsStatusBackground = TokenMutedBg;
             HostImsStatusSymbol = SymbolRegular.Info24;
             RefreshHostImsRegistrationStatus();
+            RefreshHostImsMediaStatus();
+            RefreshHostImsPppBearerStatus();
+        }
+
+        private void RefreshHostImsPppBearerStatus()
+        {
+            if (SelectedSlot is not { IsPcscReader: false } slot)
+            {
+                IsHostImsPppActive = false;
+                HostImsPppStatusText = "Windows 尚未持有 IMS PPP";
+                HostImsPppDetail = "请选择 AT 蜂窝模组。";
+                return;
+            }
+
+            try
+            {
+                var status = _kernelService.GetHostImsPppBearerStatus(slot.Id);
+                IsHostImsPppActive = status.IsActive;
+                HostImsPppStatusText = status.IsActive ? "Windows 已持有 IMS PPP" :
+                    status.LastError is not null ? "IMS PPP 租约异常" : "Windows 尚未持有 IMS PPP";
+                var renewal = status.LastRenewedAtUtc is { } lastRenewed
+                    ? $"租约续租已确认 {status.RenewalCount} 次，最近 {lastRenewed:yyyy-MM-dd HH:mm:ss} UTC。"
+                    : "租约续租尚无确认记录。";
+                HostImsPppDetail = status.Bearer is { } bearer
+                    ? $"接口 {bearer.InterfaceIndex}；本机 {bearer.LocalAddress}；P-CSCF {string.Join(", ", bearer.PcscfAddresses)}。媒体路由 {status.MediaRouteCount} 条；{renewal}承载本身不证明 SIP 注册。"
+                    : status.LastError ?? "未建立 Windows IMS 承载；模组内部 IMS 状态需单独核验。";
+            }
+            catch (Exception ex)
+            {
+                IsHostImsPppActive = false;
+                HostImsPppStatusText = "IMS PPP 状态不可用";
+                HostImsPppDetail = ex.Message;
+            }
         }
 
         private void RefreshHostImsRegistrationStatus()
@@ -900,23 +1057,27 @@ namespace VoWin.ViewModels.Pages
             try
             {
                 var status = _kernelService.GetHostImsRegistrationStatus(slot.Id);
+                if (status.IsRegistered) UseHostImsSmsReceive = status.SmsReceiveEnabled;
                 HasHostImsRegistrationSession = status.Endpoint is not null;
                 HostImsRegistrationStatusText = status.State switch
                 {
                     "registered" => "SIP REGISTER 已接受",
-                    "failed" => "注册刷新失败",
+                    "failed" => "Host IMS 注册失败",
                     "inactive" => "会话已失效",
                     "stopped" when status.RemoteDeregistered == true => "远端已确认注销",
                     _ => "尚未注册"
                 };
-                HostImsRegistrationDetail = status.LastError ??
+                var detail = status.LastError ??
                     (status.IsRegistered
-                        ? $"{status.Endpoint}；卡通道 {status.CardPath ?? "未标记"}；到期 {status.ExpiresAtUtc?.ToLocalTime():yyyy-MM-dd HH:mm:ss}。这不代表呼叫数据面已就绪。"
+                        ? $"{status.Endpoint}；卡通道 {status.CardPath ?? "未标记"}；短信接收 {(status.SmsReceiveEnabled ? "已启用（实验性）" : "未启用")}；到期 {status.ExpiresAtUtc?.ToLocalTime():yyyy-MM-dd HH:mm:ss}。这不代表呼叫数据面已就绪。"
                         : status.RemoteDeregistered == true
                             ? "运营商已确认注销此 SIP 绑定，本机会话已停止。"
                         : status.RemoteDeregistered == false
                             ? "本机会话已停止；远端注销未获确认，绑定可能保留到有效期结束。"
                         : "仅在 Windows 已持有 IMS bearer、卡有可读 ISIM 身份或满足严格 USIM 回退条件时可尝试实验性注册。");
+                if (!status.IsRegistered && _kernelService.GetHostImsPppBearerStatus(slot.Id).IsActive)
+                    detail += " Windows PPP 仍占用模组 IMS；如需 AT + USB Audio 降级，请先停止并恢复模组 IMS。";
+                HostImsRegistrationDetail = detail;
             }
             catch
             {
@@ -924,6 +1085,18 @@ namespace VoWin.ViewModels.Pages
                 HostImsRegistrationDetail = "所选卡槽的注册状态暂不可读取。";
                 HasHostImsRegistrationSession = false;
             }
+        }
+
+        private void RefreshHostImsMediaStatus()
+        {
+            var calls = SelectedSlot?.Calls;
+            var stats = calls?.IsHostImsCall == true ? calls.GetMediaStats() : null;
+            var playback = stats?.Playback is { } output
+                ? $"WinMM 播放 {(output.IsOpen ? "已打开" : $"未打开(MMRESULT {output.OpenResult})")} / 已写 {output.FramesWritten} / 丢 {output.FramesDropped} / 错 {output.WriteErrors}。"
+                : "播放状态未配置。";
+            HostImsMediaStatusText = stats is null
+                ? "无活动 Host IMS 语音媒体。"
+                : $"{calls!.State} · {calls.ActiveCall?.Codec ?? "协商中"} · RTP 发 {stats.PacketsSent} / 收 {stats.PacketsReceived} / 解码 {stats.AudioFramesDecoded} / 发送错误 {stats.SendErrors}。{playback}这些是 Windows 端计数，音量与对端听感须另行确认。";
         }
 
         private async Task LoadVoWifiRouteAsync(ModemSlot slot)
@@ -1182,6 +1355,7 @@ namespace VoWin.ViewModels.Pages
         private void QueueApplySimSwitches()
         {
             if (_isLoadingSimSwitches) return;
+            if (!CanEditRadioSettings) return;
             var slot = SelectedSlot;
             var iccid = slot?.Sim?.Iccid;
             if (slot == null || string.IsNullOrWhiteSpace(iccid))
@@ -1268,19 +1442,8 @@ namespace VoWin.ViewModels.Pages
                     await slot.RefreshMetricsAsync();
                 }
 
-                if (intent.VoWifi)
-                {
-                    if (slot.VoWifi.State == VoWifiState.Disconnected)
-                    {
-                        if (!await _kernelService.StartVoWifiAsync(slot.Id))
-                            warnings.Add("VoWiFi 未能启动，请查看诊断日志");
-                    }
-                }
-                else
-                {
-                    if (!await _kernelService.StopVoWifiAsync(slot.Id))
-                        warnings.Add("VoWiFi 未能正常停止");
-                }
+                // Communication lifecycle belongs to the mode coordinator,
+                // not to unrelated roaming/data preference edits.
 
                 if (_simSwitchIntentVersions.GetValueOrDefault(slot.Id) == intent.Version)
                 {
@@ -1399,23 +1562,10 @@ namespace VoWin.ViewModels.Pages
         }
 
         // ================= Action Commands =================
-        [RelayCommand]
+        [RelayCommand(AllowConcurrentExecutions = true)]
         private async Task ExecutePrimaryActionAsync()
         {
-            if (IsBusy) return;
-
-            if (IsVoWifiRunning || VoWifiState is VoWifiState.ConnectingIkev2 or VoWifiState.ResolvingEpdg or VoWifiState.AuthenticatingEapAka or VoWifiState.ImsRegistering)
-            {
-                await StopVoWifiAsync();
-            }
-            else if (SelectedSlot == null)
-            {
-                await RefreshMetricsAsync();
-            }
-            else
-            {
-                await StartVoWifiAsync();
-            }
+            await ExecuteTelephonyActionAsync();
         }
 
         [RelayCommand]
@@ -1540,6 +1690,7 @@ namespace VoWin.ViewModels.Pages
             if (IsHostImsProbeRunning) return;
 
             var version = Interlocked.Increment(ref _hostImsProbeVersion);
+            HostImsSubscriberEgressApproved = false;
             IsHostImsProbeRunning = true;
             HostImsCandidateOptions.Clear();
             SelectedHostImsEndpoint = null;
@@ -1578,6 +1729,98 @@ namespace VoWin.ViewModels.Pages
         }
 
         [RelayCommand]
+        private void BrowseHostImsPppScript()
+        {
+            var dialog = new OpenFileDialog
+            {
+                FileName = "VoSharp.HostIms.exe",
+                Filter = "C# IMS 承载管理器 (VoSharp.HostIms.exe)|VoSharp.HostIms.exe",
+                CheckFileExists = true
+            };
+            if (dialog.ShowDialog() == true)
+                HostImsPppScriptPath = dialog.FileName;
+        }
+
+        [RelayCommand]
+        private async Task StartHostImsPppBearerAsync()
+        {
+            if (!CanStartHostImsPppBearer || SelectedSlot is not { } slot) return;
+            IsHostImsPppBusy = true;
+            HostImsPppStatusText = "正在移交 IMS 承载…";
+            HostImsPppDetail = "正在暂时关闭模组内部 IMS、重启并建立隔离的 Windows PPP；失败会请求恢复。";
+            var started = false;
+            try
+            {
+                var status = await _kernelService.StartHostImsPppBearerAsync(
+                    HostImsPppScriptPath, HostImsRasProbePath,
+                    handoffApproved: HostImsPppHandoffApproved, slotId: slot.Id);
+                started = status.IsActive;
+                StatusMessage = started
+                    ? "Windows 已持有 IMS PPP；尚未发送 SIP REGISTER。"
+                    : "IMS PPP 租约未激活，请查看错误并核对模组恢复。";
+            }
+            catch (Exception ex)
+            {
+                if (ReferenceEquals(slot, SelectedSlot))
+                {
+                    HostImsPppStatusText = "IMS PPP 移交失败";
+                    HostImsPppDetail = ex.Message;
+                }
+                StatusMessage = $"IMS PPP 移交失败：{ex.Message}";
+            }
+            finally
+            {
+                HostImsPppHandoffApproved = false;
+                IsHostImsPppBusy = false;
+                if (started && ReferenceEquals(slot, SelectedSlot))
+                    RefreshHostImsPppBearerStatus();
+            }
+            if (started && ReferenceEquals(slot, SelectedSlot))
+                await ProbeHostImsAsync();
+        }
+
+        [RelayCommand]
+        private async Task StopHostImsPppBearerAsync()
+        {
+            if (!CanStopHostImsPppBearer || SelectedSlot is not { } slot) return;
+            IsHostImsPppBusy = true;
+            HostImsPppStatusText = "正在恢复模组 IMS…";
+            try
+            {
+                await _kernelService.StopHostImsPppBearerAsync(slot.Id);
+                StatusMessage = "Windows IMS PPP 已停止；已请求恢复模组内部 IMS。";
+                if (ReferenceEquals(slot, SelectedSlot)) ResetHostImsProbe();
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = $"停止 IMS PPP 失败：{ex.Message}";
+                if (ReferenceEquals(slot, SelectedSlot))
+                {
+                    HostImsPppStatusText = "IMS PPP 恢复失败";
+                    HostImsPppDetail = ex.Message;
+                }
+            }
+            finally
+            {
+                IsHostImsPppBusy = false;
+                if (ReferenceEquals(slot, SelectedSlot)) RefreshHostImsPppBearerStatus();
+            }
+        }
+
+        [RelayCommand]
+        private void BrowseHostImsWinDivertDll()
+        {
+            var dialog = new OpenFileDialog
+            {
+                FileName = "WinDivert.dll",
+                Filter = "WinDivert DLL (WinDivert.dll)|WinDivert.dll|所有文件 (*.*)|*.*",
+                CheckFileExists = true
+            };
+            if (dialog.ShowDialog() == true)
+                HostImsWinDivertDllPath = dialog.FileName;
+        }
+
+        [RelayCommand]
         private async Task StartHostImsRegistrationAsync()
         {
             if (IsHostImsRegistrationBusy) return;
@@ -1589,30 +1832,41 @@ namespace VoWin.ViewModels.Pages
                 return;
             }
 
+            var pppWasActive = IsHostImsPppActive;
             IsHostImsRegistrationBusy = true;
             HostImsRegistrationStatusText = "正在实验性注册…";
-            HostImsRegistrationDetail = "将重新探测 IMS bearer；ISIM 优先走 QMI UIM，读取不可用时回退 AT；无 ISIM 时严格验证 USIM，并在挑战前选择 QMI 或 AT AKA。";
+            HostImsRegistrationDetail = "将重新核验 IMS bearer 与当前 SIM；有 ipsec-3gpp 时使用 C# ESP（WinDivert 仅收发原始包）。";
+            var startFailed = false;
             try
             {
-                var status = await _kernelService.StartHostImsRegistrationAsync(slot.Id, endpoint);
+                var status = await _kernelService.StartHostImsRegistrationAsync(
+                    slot.Id, endpoint, subscriberEgressApproved: HostImsSubscriberEgressApproved,
+                    useUserspaceEsp: UseHostImsUserspaceEsp,
+                    winDivertDll: HostImsWinDivertDllPath,
+                    enableSmsReceiver: UseHostImsSmsReceive);
                 if (ReferenceEquals(slot, SelectedSlot)) RefreshHostImsRegistrationStatus();
                 StatusMessage = status.IsRegistered
-                    ? "Host IMS SIP 已注册；可实验性拨号，蜂窝 IPsec 与运营商实网语音仍未验收。"
+                    ? "Host IMS SIP 已注册；请分别核验当前来电接通、双向语音与挂断，注册成功本身不代表通话可用。"
                     : $"Host IMS 注册状态：{status.State}";
             }
             catch (Exception ex)
             {
+                startFailed = true;
                 if (ReferenceEquals(slot, SelectedSlot))
                 {
-                    HostImsRegistrationStatusText = "实验性注册失败";
-                    HostImsRegistrationDetail = ex.Message;
+                    RefreshHostImsPppBearerStatus();
+                    if (pppWasActive && !IsHostImsPppActive)
+                        ResetHostImsProbe();
+                    else
+                        RefreshHostImsRegistrationStatus();
                 }
                 StatusMessage = $"Host IMS 注册失败：{ex.Message}";
             }
             finally
             {
+                HostImsSubscriberEgressApproved = false;
                 IsHostImsRegistrationBusy = false;
-                if (ReferenceEquals(slot, SelectedSlot)) RefreshHostImsRegistrationStatus();
+                if (!startFailed && ReferenceEquals(slot, SelectedSlot)) RefreshHostImsRegistrationStatus();
             }
         }
 
@@ -1717,7 +1971,9 @@ namespace VoWin.ViewModels.Pages
             var usableCandidates = result.EndpointCandidates.Where(result.IsRouteVerified).ToArray();
             foreach (var candidate in usableCandidates)
                 HostImsCandidateOptions.Add(candidate);
-            SelectedHostImsEndpoint = usableCandidates.Length == 1 ? usableCandidates[0] : null;
+            var pppBearer = SelectedSlot?.GetHostImsPppBearerStatus().Bearer;
+            SelectedHostImsEndpoint = ModemSlot.SelectHostImsEndpoint(
+                usableCandidates, selectedEndpoint: null, pppBearer: pppBearer);
             OnPropertyChanged(nameof(CanStartHostImsRegistration));
         }
 
@@ -1758,30 +2014,33 @@ namespace VoWin.ViewModels.Pages
         {
             try
             {
-                StatusMessage = "正在整理 IMS 注册诊断报告…";
-                var report = await _kernelService.BuildImsDiagnosticReportAsync(SelectedSlot?.Id);
                 var dialog = new SaveFileDialog
                 {
-                    FileName = $"VoWin-IMS-Diagnostic-{DateTime.Now:yyyyMMdd-HHmmss}.txt",
-                    DefaultExt = ".txt",
-                    Filter = "VoWin 诊断报告 (*.txt)|*.txt|所有文件 (*.*)|*.*"
+                    FileName = $"VoWin-Diagnostics-{DateTime.Now:yyyyMMdd-HHmmss}.zip",
+                    DefaultExt = ".zip",
+                    Filter = "VoWin 诊断包 (*.zip)|*.zip"
                 };
 
                 if (dialog.ShowDialog() != true)
                 {
-                    StatusMessage = "已取消导出诊断报告。";
+                    DiagnosticExportStatus = "已取消导出，记录不受影响。";
                     return;
                 }
 
-                await File.WriteAllTextAsync(dialog.FileName, report);
-                StatusMessage = "IMS 诊断报告已导出，可发送给技术支持分析。";
-                AppToast.Show("诊断报告已导出", "报告已经过身份与密钥脱敏，可安全分享。", ControlAppearance.Success);
+                IsDiagnosticExportBusy = true;
+                DiagnosticExportStatus = "正在整理已脱敏的日志与状态快照…";
+                await _kernelService.ExportDiagnosticBundleAsync(dialog.FileName, SelectedSlot?.Id);
+                DiagnosticExportStatus = $"已导出：{dialog.FileName}";
+                StatusMessage = "诊断包已导出，可交给技术支持分析。";
+                AppToast.Show("诊断包已导出", "身份与密钥已脱敏；包含网络 IP 与域名，分享前可先检查。", ControlAppearance.Success);
             }
             catch (Exception ex)
             {
-                StatusMessage = $"导出 IMS 诊断报告失败: {ex.Message}";
-                AppToast.Show("导出失败", "未能生成 IMS 诊断报告，请查看实时日志。", ControlAppearance.Danger);
+                DiagnosticExportStatus = $"导出失败：{DiagnosticLogRedactor.Redact(ex.Message)}";
+                StatusMessage = DiagnosticExportStatus;
+                AppToast.Show("导出失败", "未能生成诊断包，已有记录不受影响。", ControlAppearance.Danger);
             }
+            finally { IsDiagnosticExportBusy = false; }
         }
     }
 }

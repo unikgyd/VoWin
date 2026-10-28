@@ -1,0 +1,198 @@
+{
+  "version": 1,
+  "description": "Authenticated IKE INFORMATIONAL payload semantics; only selected peer inbound ESP SPI 0x11223344 owns this child. Rejection sends fatal INVALID_SYNTAX.",
+  "outboundSpi": 287454020,
+  "cases": [
+    {
+      "name": "empty",
+      "payloads": [],
+      "accepted": true,
+      "ikeDeleted": false,
+      "childDeleted": false
+    },
+    {
+      "name": "unrelated-esp",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "03040001aabbccdd"
+        }
+      ],
+      "accepted": true,
+      "ikeDeleted": false,
+      "childDeleted": false
+    },
+    {
+      "name": "matching-esp-in-list",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "03040002aabbccdd11223344"
+        }
+      ],
+      "accepted": true,
+      "ikeDeleted": false,
+      "childDeleted": true
+    },
+    {
+      "name": "ah-is-not-esp",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "0204000111223344"
+        }
+      ],
+      "accepted": true,
+      "ikeDeleted": false,
+      "childDeleted": false
+    },
+    {
+      "name": "empty-esp-list",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "03040000"
+        }
+      ],
+      "accepted": true,
+      "ikeDeleted": false,
+      "childDeleted": false
+    },
+    {
+      "name": "ike",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "01000000"
+        }
+      ],
+      "accepted": true,
+      "ikeDeleted": true,
+      "childDeleted": false
+    },
+    {
+      "name": "mixed-ike-and-child",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "0304000111223344"
+        },
+        {
+          "kind": 42,
+          "hex": "01000000"
+        }
+      ],
+      "accepted": true,
+      "ikeDeleted": true,
+      "childDeleted": false
+    },
+    {
+      "name": "bad-ike-size",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "01040000"
+        }
+      ],
+      "accepted": false,
+      "ikeDeleted": true,
+      "childDeleted": false
+    },
+    {
+      "name": "bad-ike-count",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "0100000111223344"
+        }
+      ],
+      "accepted": false,
+      "ikeDeleted": true,
+      "childDeleted": false
+    },
+    {
+      "name": "truncated-esp-list",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "0304000211223344"
+        }
+      ],
+      "accepted": false,
+      "ikeDeleted": true,
+      "childDeleted": false
+    },
+    {
+      "name": "short-body",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "03"
+        }
+      ],
+      "accepted": false,
+      "ikeDeleted": true,
+      "childDeleted": false
+    },
+    {
+      "name": "unknown-protocol",
+      "payloads": [
+        {
+          "kind": 42,
+          "hex": "04040000"
+        }
+      ],
+      "accepted": false,
+      "ikeDeleted": true,
+      "childDeleted": false
+    },
+    {
+      "name": "status-notify",
+      "payloads": [
+        {
+          "kind": 41,
+          "hex": "0000fde8010203"
+        }
+      ],
+      "accepted": true,
+      "ikeDeleted": false,
+      "childDeleted": false
+    },
+    {
+      "name": "error-notify",
+      "payloads": [
+        {
+          "kind": 41,
+          "hex": "00000007"
+        }
+      ],
+      "accepted": false,
+      "ikeDeleted": true,
+      "childDeleted": false
+    },
+    {
+      "name": "unexpected-nonce",
+      "payloads": [
+        {
+          "kind": 40,
+          "hex": "01020304"
+        }
+      ],
+      "accepted": false,
+      "ikeDeleted": true,
+      "childDeleted": false
+    },
+    {
+      "name": "short-notify",
+      "payloads": [
+        {
+          "kind": 41,
+          "hex": "0000"
+        }
+      ],
+      "accepted": false,
+      "ikeDeleted": true,
+      "childDeleted": false
+    }
+  ]
+}

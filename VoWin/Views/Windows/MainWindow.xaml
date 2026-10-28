@@ -4,6 +4,7 @@
   xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
   xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
   xmlns:local="clr-namespace:VoWin.Views.Windows"
+  xmlns:controls="clr-namespace:VoWin.Views.Controls"
   xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
   xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
   Title="{Binding ViewModel.ApplicationTitle, Mode=OneWay}"
@@ -192,6 +193,7 @@
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
+      <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
     <ui:NavigationView
       x:Name="RootNavigation"
@@ -212,7 +214,19 @@
         </Grid>
       </ui:NavigationView.ContentOverlay>
     </ui:NavigationView>
-    <ContentPresenter x:Name="RootContentDialog" Grid.Row="0" Grid.RowSpan="2" />
+    <Border Grid.Row="2" Padding="16,7" BorderThickness="0,1,0,0"
+            BorderBrush="{DynamicResource AppCardBorderBrush}" Background="{DynamicResource AppNavigationBrush}">
+      <DockPanel LastChildFill="True">
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Margin="12,0,0,0">
+          <controls:StatusIndicator x:Name="FooterCellular" FontSize="11" Margin="0,0,16,0" />
+          <controls:StatusIndicator x:Name="FooterWifi" FontSize="11" Margin="0,0,16,0" />
+          <controls:StatusIndicator x:Name="FooterSip" FontSize="11" />
+        </StackPanel>
+        <TextBlock x:Name="GatewayFooterText" FontSize="11" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
+                   Foreground="{DynamicResource AppTextSecondaryBrush}" AutomationProperties.Name="全局网关状态" />
+      </DockPanel>
+    </Border>
+    <ContentPresenter x:Name="RootContentDialog" Grid.Row="0" Grid.RowSpan="3" />
     <ui:TitleBar
       x:Name="TitleBar"
       Title="{Binding ViewModel.ApplicationTitle}"
@@ -232,7 +246,7 @@
         />
       </ui:TitleBar.Icon>
     </ui:TitleBar>
-    <Border Grid.Row="0" Grid.RowSpan="2" Panel.ZIndex="100"
+    <Border Grid.Row="0" Grid.RowSpan="3" Panel.ZIndex="100"
             Background="{DynamicResource AppOverlayBrush}" IsHitTestVisible="True">
       <Border.Style>
         <Style TargetType="Border">
@@ -258,6 +272,18 @@
                      HorizontalAlignment="Center" Margin="0,12,0,0" MaxWidth="290"
                      Foreground="{DynamicResource AppTextTertiaryBrush}" FontSize="12"
                      TextWrapping="Wrap" TextAlignment="Center" />
+        </StackPanel>
+      </Border>
+    </Border>
+    <Border x:Name="ShutdownOverlay" Grid.Row="0" Grid.RowSpan="3" Panel.ZIndex="200" Visibility="Collapsed"
+            Background="{DynamicResource AppOverlayBrush}">
+      <Border Padding="28" Margin="24" MaxWidth="540" CornerRadius="16" HorizontalAlignment="Center" VerticalAlignment="Center"
+              Background="{DynamicResource AppCardElevatedBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
+        <StackPanel>
+          <TextBlock Text="正在安全退出 VoWin" FontSize="20" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" />
+          <TextBlock x:Name="ShutdownStatusText" TextWrapping="Wrap" Margin="0,14,0,10" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+          <TextBlock Text="只等待本程序注销和本机资源释放，不等待模组恢复、重启或重新识卡。" TextWrapping="Wrap" FontSize="12"
+                     Foreground="{DynamicResource AppTextSecondaryBrush}" />
         </StackPanel>
       </Border>
     </Border>

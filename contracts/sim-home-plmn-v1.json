@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "sources": ["3GPP TS 31.102 4.2.18, 4.2.84", "3GPP TS 24.008 PLMN coding"],
+  "ef_ad": [
+    {"id":"two", "data":"00000002", "mnc_length":2},
+    {"id":"three", "data":"00000003", "mnc_length":3},
+    {"id":"extension-not-mnc", "data":"0000000203", "mnc_length":2},
+    {"id":"extension-ff", "data":"00000003FFFF", "mnc_length":3},
+    {"id":"short-not-authoritative", "data":"000002", "mnc_length":null},
+    {"id":"unknown", "data":"0000000F", "mnc_length":null},
+    {"id":"extension-cannot-supply-mnc", "data":"000000FF02", "mnc_length":null},
+    {"id":"rfu-high-nibble", "data":"FFFFFFF3", "mnc_length":3}
+  ],
+  "crsm": [
+    {"id":"normal", "response":"+CRSM: 144,0,\"02F44002\"", "accepted":true},
+    {"id":"proactive-zero", "response":"+CRSM: 145,0,\"02F44002\"", "accepted":true},
+    {"id":"proactive-pending", "response":"+CRSM: 145,36,\"02F44002\"", "accepted":true},
+    {"id":"legacy-complete-data", "response":"+CRSM: 159,0,\"02F44002\"", "accepted":true},
+    {"id":"not-9000", "response":"+CRSM: 144,1,\"02F44002\"", "accepted":false},
+    {"id":"pending-get-response", "response":"+CRSM: 159,4,\"02F44002\"", "accepted":false},
+    {"id":"invalid-byte", "response":"+CRSM: 145,256,\"02F44002\"", "accepted":false},
+    {"id":"overflow", "response":"+CRSM: 999999999999999999999999999999,0,\"02F44002\"", "accepted":false},
+    {"id":"card-failure", "response":"+CRSM: 106,130,\"02F44002\"", "accepted":false}
+  ],
+  "ehplmn": [
+    {"id":"two-digit", "data":"02F440", "plmns":["20404"]},
+    {"id":"three-digit", "data":"130062", "plmns":["310260"]},
+    {"id":"multiple-ordered", "data":"02F44015F566FFFFFF130062", "plmns":["20404","51566","310260"]},
+    {"id":"deduplicate", "data":"02F44002F44015F566", "plmns":["20404","51566"]},
+    {"id":"invalid-mnc-a", "data":"02A440", "plmns":[]},
+    {"id":"invalid-mnc-e", "data":"02E44015F566", "plmns":["51566"]},
+    {"id":"invalid-mcc", "data":"A2F440", "plmns":[]},
+    {"id":"unused", "data":"FFFFFFFFFFFF", "plmns":[]},
+    {"id":"incomplete-record", "data":"02F4", "plmns":[]},
+    {"id":"complete-before-incomplete", "data":"02F44015F5", "plmns":["20404"]}
+  ]
+}

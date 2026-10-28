@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "hosts": [
+    {"input":" EPDG.EXAMPLE. ","normalized":"epdg.example"},
+    {"input":"203.0.113.7","normalized":"203.0.113.7"},
+    {"input":"2001:0db8::1","normalized":"2001:db8::1"},
+    {"input":"::ffff:203.0.113.7","normalized":"203.0.113.7"},
+    {"input":"10.0.0.7","normalized":"10.0.0.7"},
+    {"input":"127.0.0.1","invalid":true},
+    {"input":"::","invalid":true},
+    {"input":"fe80::1","invalid":true},
+    {"input":"ff02::1","invalid":true},
+    {"input":"240.0.0.1","invalid":true},
+    {"input":"https://epdg.example","invalid":true},
+    {"input":"epdg.example:500","invalid":true},
+    {"input":"192.0.2.999","invalid":true},
+    {"input":"bad_name.example","invalid":true},
+    {"input":"epdg.example/path","invalid":true}
+  ],
+  "plmns": [
+    {"mcc":"515","mnc":"66","host":"epdg.epc.mnc066.mcc515.pub.3gppnetwork.org"},
+    {"mcc":"204","mnc":"04","host":"epdg.epc.mnc004.mcc204.pub.3gppnetwork.org"},
+    {"mcc":"310","mnc":"260","host":"epdg.epc.mnc260.mcc310.pub.3gppnetwork.org"}
+  ]
+}

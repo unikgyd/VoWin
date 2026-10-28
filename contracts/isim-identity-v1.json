@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "description": "Synthetic TS 31.103 identity TLV codec cases. One 80 tag, bounded BER length, strict UTF-8, no whitespace/control, only FF record padding. Identity grammar is checked separately.",
+  "cases": [
+    {
+      "id": "short",
+      "raw": "8003616263",
+      "text": "abc"
+    },
+    {
+      "id": "padding",
+      "raw": "8003616263ffff",
+      "text": "abc"
+    },
+    {
+      "id": "long81",
+      "raw": "808103616263",
+      "text": "abc"
+    },
+    {
+      "id": "long82",
+      "raw": "80820003616263ff",
+      "text": "abc"
+    },
+    {
+      "id": "utf8",
+      "raw": "8002c3a9",
+      "text": "é"
+    },
+    {
+      "id": "empty",
+      "raw": "",
+      "text": null
+    },
+    {
+      "id": "empty-value",
+      "raw": "8000",
+      "text": null
+    },
+    {
+      "id": "wrong-tag",
+      "raw": "8103616263",
+      "text": null
+    },
+    {
+      "id": "truncated",
+      "raw": "8004616263",
+      "text": null
+    },
+    {
+      "id": "truncated81",
+      "raw": "8081",
+      "text": null
+    },
+    {
+      "id": "truncated82",
+      "raw": "808200",
+      "text": null
+    },
+    {
+      "id": "indefinite",
+      "raw": "80806162630000",
+      "text": null
+    },
+    {
+      "id": "unsupported-length",
+      "raw": "808301000061",
+      "text": null
+    },
+    {
+      "id": "null-padding",
+      "raw": "800361626300",
+      "text": null
+    },
+    {
+      "id": "second-tlv",
+      "raw": "8003616263800164",
+      "text": null
+    },
+    {
+      "id": "leading-space",
+      "raw": "800420616263",
+      "text": null
+    },
+    {
+      "id": "trailing-space",
+      "raw": "800461626320",
+      "text": null
+    },
+    {
+      "id": "inner-space",
+      "raw": "8003612062",
+      "text": null
+    },
+    {
+      "id": "control",
+      "raw": "8003610a62",
+      "text": null
+    },
+    {
+      "id": "invalid-utf8",
+      "raw": "8002c328",
+      "text": null
+    },
+    {
+      "id": "nbsp",
+      "raw": "800461c2a062",
+      "text": null
+    },
+    {
+      "id": "only-padding",
+      "raw": "ffff",
+      "text": null
+    },
+    {
+      "id": "too-long",
+      "raw": "80820201",
+      "text": null
+    }
+  ]
+}

@@ -1,4 +1,6 @@
 using System;
+using System.Net;
+using System.Net.NetworkInformation;
 using System.Text.RegularExpressions;
 using qmiSharp.Client;
 using qmiSharp.Core;
@@ -20,7 +22,9 @@ public static class QmiCliRunner
                              a.StartsWith("--nas-") ||
                              a.StartsWith("--uim-") ||
                              a.StartsWith("--wds-") ||
+                             a.StartsWith("--wda-") ||
                              a.StartsWith("--voice-") ||
+                             a.StartsWith("--imsa-") ||
                              a.StartsWith("--wms-") ||
                              a.StartsWith("--loc-") ||
                              a.StartsWith("--pdc-") ||
@@ -66,9 +70,17 @@ public static class QmiCliRunner
             transport = new Win32DeviceTransport(devicePath);
             target = devicePath;
         }
+        else if (args.Contains("--auto", StringComparer.OrdinalIgnoreCase))
+        {
+            var nativePath = QualcommWwanTransport.FindSingleControlPath()
+                ?? throw new InvalidOperationException(
+                    "No unique Quectel qcusbwwan private QMI control file was found.");
+            transport = new QualcommWwanTransport(nativePath);
+            target = "auto-discovered Quectel qcusbwwan";
+        }
         else
         {
-            throw new ArgumentException("Raw QMI commands require --tcp=host:port or --device=<Win32 raw-QMI device path>. Windows AT COM ports cannot carry QMUX frames.");
+            throw new ArgumentException("QMI commands require --auto, --tcp=host:port, or --device=<Win32 raw-QMI device path>. Windows AT COM ports cannot carry QMUX frames.");
         }
 
         Console.WriteLine($"[qmicli] Target QMI endpoint: {target}");
@@ -148,6 +160,24 @@ public static class QmiCliRunner
                     Console.WriteLine($"    Slot {s.PhysicalSlotNumber}: Active: {s.IsActive}, CardPresent: {s.CardPresent}");
                 }
             }
+            else if (arg == "--imsa-get-ims-registration-status")
+            {
+                await using var imsa = new ImsaService(client);
+                var status = await imsa.GetRegistrationStatusAsync().ConfigureAwait(false);
+                Console.WriteLine($"[{target}] Baseband IMS registration: " +
+                    $"status={status.Status?.ToString() ?? "unavailable"}, " +
+                    $"technology={status.RegistrationTechnology?.ToString() ?? "unavailable"}, " +
+                    $"error-code={status.ErrorCode?.ToString() ?? "unavailable"}.");
+            }
+            else if (arg == "--imsa-get-ims-services-status")
+            {
+                await using var imsa = new ImsaService(client);
+                var services = await imsa.GetServicesStatusAsync().ConfigureAwait(false);
+                Console.WriteLine($"[{target}] Baseband IMS services: " +
+                    $"voice={services.Voice?.ToString() ?? "unavailable"}, " +
+                    $"SMS={services.Sms?.ToString() ?? "unavailable"}, " +
+                    $"video={services.VideoTelephony?.ToString() ?? "unavailable"}.");
+            }
             else if (arg == "--wds-get-packet-service-status")
             {
                 await using var wds = new WdsService(client);
@@ -164,13 +194,41 @@ public static class QmiCliRunner
             {
                 await using var wds = new WdsService(client);
                 var settings = await wds.GetCurrentSettingsAsync().ConfigureAwait(false);
-                Console.WriteLine($"[{target}] Current Settings:\n    IP: {settings.Ipv4Address}\n    Mask: {settings.SubnetMask}\n    Gateway: {settings.Gateway}\n    DNS1: {settings.PrimaryDns}\n    DNS2: {settings.SecondaryDns}");
+                Console.WriteLine($"[{target}] Current Settings:\n    APN: {settings.ApnName ?? "unknown"}\n    IP family: {settings.IpFamily}\n    IPv4: {settings.Ipv4Address}\n    Mask: {settings.SubnetMask}\n    Gateway: {settings.Gateway}\n    DNS1: {settings.PrimaryDns}\n    DNS2: {settings.SecondaryDns}\n    IPv6: {settings.Ipv6Address}/{settings.Ipv6PrefixLength}\n    IPv6 gateway: {settings.Ipv6Gateway}\n    IPv6 DNS: {settings.Ipv6PrimaryDns}, {settings.Ipv6SecondaryDns}\n    P-CSCF: {string.Join(", ", settings.PcscfServers)}");
             }
             else if (arg == "--wds-get-packet-statistics")
             {
                 await using var wds = new WdsService(client);
                 var stats = await wds.GetPacketStatisticsAsync().ConfigureAwait(false);
                 Console.WriteLine($"[{target}] Packet Statistics:\n    Tx OK: {stats.TxPacketsOk} pkts ({stats.TxBytesOk} bytes)\n    Rx OK: {stats.RxPacketsOk} pkts ({stats.RxBytesOk} bytes)\n    Errors: Tx {stats.TxPacketErrors}, Rx {stats.RxPacketErrors}");
+            }
+            else if (arg == "--wds-probe-cid-isolation")
+            {
+                await using var shared = new WdsService(client);
+                await using var dedicated = new WdsService(client, dedicatedClientId: true);
+                var sharedStatus = await shared.GetPacketServiceStatusAsync().ConfigureAwait(false);
+                var dedicatedStatus = await dedicated.GetPacketServiceStatusAsync().ConfigureAwait(false);
+                if (shared.ClientId == dedicated.ClientId)
+                    throw new InvalidOperationException("The driver reused one WDS CID for two service files.");
+                Console.WriteLine($"[{target}] Independent WDS clients: shared CID {shared.ClientId} ({sharedStatus}), dedicated CID {dedicated.ClientId} ({dedicatedStatus}). No bearer was started.");
+            }
+            else if (arg == "--wds-try-ims-bearer")
+            {
+                if (transport is not QualcommWwanTransport)
+                    throw new InvalidOperationException("The IMS bearer experiment requires the auto-discovered qcusbwwan driver.");
+                await TryImsBearerAsync(client, target, 4).ConfigureAwait(false);
+            }
+            else if (arg == "--wds-try-ims-bearer-ipv6")
+            {
+                if (transport is not QualcommWwanTransport)
+                    throw new InvalidOperationException("The IMS bearer experiment requires the auto-discovered qcusbwwan driver.");
+                await TryImsBearerAsync(client, target, 6).ConfigureAwait(false);
+            }
+            else if (arg == "--wda-get-data-format")
+            {
+                await using var wda = new WdaService(client);
+                var format = await wda.GetDataFormatAsync().ConfigureAwait(false);
+                Console.WriteLine($"[{target}] Data format: link {format.LinkProtocol}, UL protocol {format.UplinkAggregationProtocol?.ToString() ?? "unknown"}, DL protocol {format.DownlinkAggregationProtocol?.ToString() ?? "unknown"}, UL size {format.UlAggregationSize}, DL size {format.DlAggregationSize}.");
             }
             else if (arg == "--wms-get-routes")
             {
@@ -215,5 +273,39 @@ public static class QmiCliRunner
         }
 
         return 0;
+    }
+
+    private static async Task TryImsBearerAsync(QmiClient client, string target, byte ipFamily)
+    {
+        // This opt-in diagnostic changes only a dedicated WDS data call. The
+        // lease's disposal always attempts StopNetwork before releasing its CID.
+        await using var wds = new WdsService(client, dedicatedClientId: true);
+        var before = await wds.GetPacketServiceStatusAsync().ConfigureAwait(false);
+        if (before != WdsPacketServiceStatus.Disconnected)
+            throw new InvalidOperationException($"Dedicated WDS CID was already {before}; refusing to alter it.");
+
+        await wds.SetIpFamilyAsync(ipFamily).ConfigureAwait(false);
+        Console.WriteLine($"[{target}] Starting temporary dedicated IMS IPv{ipFamily} WDS call on CID {wds.ClientId}...");
+        var handle = await wds.StartNetworkInterfaceAsync("ims", ipFamily).ConfigureAwait(false);
+        Console.WriteLine($"[{target}] WDS returned packet-data handle {handle}; validating runtime settings.");
+        var settings = await wds.GetCurrentSettingsAsync().ConfigureAwait(false);
+        var status = await wds.GetPacketServiceStatusAsync().ConfigureAwait(false);
+        var localAddress = ipFamily == 6 ? settings.Ipv6Address : settings.Ipv4Address;
+        Console.WriteLine($"[{target}] WDS state {status}; APN '{settings.ApnName ?? "unknown"}'; IPv4 {settings.Ipv4Address}; IPv6 {settings.Ipv6Address}; P-CSCF count {settings.PcscfServers.Count}.");
+
+        bool mapped = false;
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            mapped = localAddress is not null && NetworkInterface.GetAllNetworkInterfaces()
+                .Where(nic => nic.OperationalStatus == OperationalStatus.Up &&
+                    (nic.Description.Contains("Quectel", StringComparison.OrdinalIgnoreCase) ||
+                     nic.Description.Contains("Qualcomm", StringComparison.OrdinalIgnoreCase)))
+                .Any(nic => nic.GetIPProperties().UnicastAddresses
+                    .Any(address => address.Address.GetAddressBytes().SequenceEqual(localAddress.GetAddressBytes())));
+            if (mapped) break;
+            await Task.Delay(1000).ConfigureAwait(false);
+        }
+        Console.WriteLine($"[{target}] IMS IPv{ipFamily} on an active Windows modem NIC: {mapped}. This does not establish a P-CSCF route or IMS registration.");
+        Console.WriteLine($"[{target}] Stopping the temporary WDS call and releasing its CID.");
     }
 }

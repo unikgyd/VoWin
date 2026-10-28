@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using VoSharp.Ike;
 
 namespace VoSharp.Telephony.VoWifi;
 
@@ -11,9 +12,9 @@ public class EspTunnel : IDisposable
     private readonly byte[] _outboundAuthKey;
     private readonly byte[] _inboundEncKey;
     private readonly byte[] _inboundAuthKey;
-    private readonly string _encryption;
     private readonly string _integrity;
     private readonly int _icvLength;
+    private readonly IkeChildPolicy? _policy;
 
     private uint _outboundSeq;
     private uint _inboundHighestSeq;
@@ -33,7 +34,8 @@ public class EspTunnel : IDisposable
         byte[] inboundEncKey,
         byte[] inboundAuthKey,
         string encryption = "AES-CBC-128",
-        string integrity = "HMAC-SHA1-96")
+        string integrity = "HMAC-SHA1-96",
+        IkeChildPolicy? policy = null)
     {
         _outboundSpi = outboundSpi;
         _inboundSpi = inboundSpi;
@@ -41,13 +43,24 @@ public class EspTunnel : IDisposable
         ArgumentNullException.ThrowIfNull(outboundAuthKey);
         ArgumentNullException.ThrowIfNull(inboundEncKey);
         ArgumentNullException.ThrowIfNull(inboundAuthKey);
+        var expectedEncLength = encryption switch
+        {
+            "AES-CBC-128" => 16,
+            "AES-CBC-192" => 24,
+            "AES-CBC-256" => 32,
+            _ => throw new ArgumentException("Unsupported ESP encryption algorithm.", nameof(encryption))
+        };
+        var expectedAuthLength = integrity switch { "HMAC-MD5-96" => 16, "HMAC-SHA1-96" => 20, "HMAC-SHA256-128" => 32, _ => throw new ArgumentException("Unsupported ESP integrity algorithm.", nameof(integrity)) };
+        if (outboundAuthKey.Length != expectedAuthLength || inboundAuthKey.Length != expectedAuthLength ||
+            outboundEncKey.Length != expectedEncLength || inboundEncKey.Length != expectedEncLength)
+            throw new ArgumentException("Invalid ESP key lengths.");
         _outboundEncKey = outboundEncKey.ToArray();
         _outboundAuthKey = outboundAuthKey.ToArray();
         _inboundEncKey = inboundEncKey.ToArray();
         _inboundAuthKey = inboundAuthKey.ToArray();
-        _encryption = encryption;
         _integrity = integrity;
         _icvLength = integrity.Contains("SHA256", StringComparison.OrdinalIgnoreCase) ? 16 : 12;
+        _policy = policy;
     }
 
     /// <summary>
@@ -62,13 +75,16 @@ public class EspTunnel : IDisposable
             if (_outboundSeq == uint.MaxValue)
                 throw new InvalidOperationException("ESP outbound sequence exhausted; rekey the SA before sending more packets.");
 
-            uint seq = ++_outboundSeq;
-
             if (nextHeader is not 4 and not 41)
                 throw new ArgumentOutOfRangeException(nameof(nextHeader), "ESP tunnel mode supports only IPv4 or IPv6 inner packets.");
+            if (_policy != null && !_policy.AllowsPacket(innerPacket, true, nextHeader))
+                throw new InvalidOperationException("Inner IP packet is outside the negotiated CHILD_SA traffic policy.");
 
             const int blockSize = 16;
             int padLen = (blockSize - ((innerPacket.Length + 2) % blockSize)) % blockSize;
+            if (innerPacket.Length > 65507 - 24 - padLen - 2 - _icvLength)
+                throw new ArgumentException("ESP packet exceeds the UDP encapsulation limit.", nameof(innerPacket));
+            uint seq = ++_outboundSeq;
             byte[]? plaintext = new byte[innerPacket.Length + padLen + 2];
             byte[]? iv = new byte[blockSize];
             byte[]? ciphertext = null;
@@ -101,7 +117,11 @@ public class EspTunnel : IDisposable
                 Buffer.BlockCopy(iv, 0, espPacket, 8, blockSize);
                 Buffer.BlockCopy(ciphertext, 0, espPacket, 8 + blockSize, ciphertext.Length);
 
-                if (_integrity.Contains("SHA256", StringComparison.OrdinalIgnoreCase))
+                if (_integrity.Contains("MD5", StringComparison.OrdinalIgnoreCase))
+                {
+                    fullHash = HMACMD5.HashData(_outboundAuthKey, espPacket.AsSpan(0, authLen));
+                }
+                else if (_integrity.Contains("SHA256", StringComparison.OrdinalIgnoreCase))
                 {
                     using var hmac = new HMACSHA256(_outboundAuthKey);
                     fullHash = hmac.ComputeHash(espPacket, 0, authLen);
@@ -146,7 +166,7 @@ public class EspTunnel : IDisposable
 
             const int blockSize = 16;
             int minLen = 8 + blockSize + blockSize + _icvLength;
-            if (espPacket.Length < minLen)
+            if (espPacket.Length < minLen || espPacket.Length > 65507)
             {
                 TraceOpenFailure("truncated", espPacket.Length, 0, 0);
                 return null;
@@ -183,7 +203,11 @@ public class EspTunnel : IDisposable
 
             try
             {
-                if (_integrity.Contains("SHA256", StringComparison.OrdinalIgnoreCase))
+                if (_integrity.Contains("MD5", StringComparison.OrdinalIgnoreCase))
+                {
+                    fullHash = HMACMD5.HashData(_inboundAuthKey, espPacket.AsSpan(0, authLen));
+                }
+                else if (_integrity.Contains("SHA256", StringComparison.OrdinalIgnoreCase))
                 {
                     using var hmac = new HMACSHA256(_inboundAuthKey);
                     fullHash = hmac.ComputeHash(espPacket, 0, authLen);
@@ -245,6 +269,10 @@ public class EspTunnel : IDisposable
                     return null;
                 }
 
+                if (_policy != null && !_policy.AllowsPacket(decrypted.AsSpan(0, innerLen), false, nextHeader))
+                {
+                    TraceOpenFailure("traffic-selectors", espPacket.Length, spi, sequence); nextHeader = 0; return null;
+                }
                 CommitSequence(sequence);
                 return decrypted.AsSpan(0, innerLen).ToArray();
             }

@@ -2,12 +2,15 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.RegularExpressions;
+using VoSharp.Common.Events;
 using VoSharp.Kernel.SipGateway;
 using VoSharp.Sip;
+using VoSharp.Telephony.Audio;
 using VoSharp.Telephony.Calls;
 
 namespace VoSharp.Tests;
 
+[Collection("SIP loopback sockets")]
 public sealed class SipGatewayTests
 {
     [Fact]
@@ -120,6 +123,87 @@ public sealed class SipGatewayTests
     }
 
     [Fact]
+    public async Task RtpSession_PcmuComfortSilenceUsesPcmuBytes()
+    {
+        using var session = new RtpSession(null, localAddress: IPAddress.Loopback);
+        var sent = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        session.CustomSender = packet =>
+        {
+            sent.TrySetResult(packet);
+            return Task.CompletedTask;
+        };
+        session.SetRemoteEndpoint(IPAddress.Loopback, 25000, payloadType: 0, codec: "PCMU");
+
+        var packet = await sent.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(172, packet.Length);
+        Assert.Equal(0, packet[1] & 0x7f);
+        Assert.All(packet[12..], value => Assert.Equal((byte)0xff, value));
+    }
+
+    [Fact]
+    public async Task RtpSession_OctetAlignedAmrComfortSilenceUsesNegotiatedPacking()
+    {
+        using var session = new RtpSession(null, localAddress: IPAddress.Loopback);
+        var sent = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        session.CustomSender = packet =>
+        {
+            sent.TrySetResult(packet);
+            return Task.CompletedTask;
+        };
+        session.SetRemoteEndpoint(IPAddress.Loopback, 25000, payloadType: 102,
+            codec: "AMR", amrOctetAligned: true);
+
+        var packet = await sent.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(102, packet[1] & 0x7f);
+        Assert.Equal((byte)0xf0, packet[12]); // OA CMR byte
+        Assert.Equal((byte)0x04, packet[13]); // FT=0, Q=1 TOC byte
+        var frame = AmrNbDecoder.RtpPayloadToAmrFrame(packet[12..], forceOctetAligned: true);
+        Assert.Equal(13, frame.Length);
+        Assert.Equal((byte)0x04, frame[0]);
+    }
+
+    [Fact]
+    public async Task RtpSession_AmrModeSetConstrainsSpeechAndComfortSilence()
+    {
+        using var session = new RtpSession(null, localAddress: IPAddress.Loopback);
+        var sent = new List<byte[]>();
+        var idlePacket = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        session.CustomSender = packet =>
+        {
+            lock (sent)
+            {
+                sent.Add(packet);
+                if (sent.Count == 2) idlePacket.TrySetResult(packet);
+            }
+            return Task.CompletedTask;
+        };
+        session.SetRemoteEndpoint(IPAddress.Loopback, 25000, payloadType: 102,
+            codec: "AMR", amrOctetAligned: true, amrModeSet: "2");
+        var pcm = new short[160];
+        for (var i = 0; i < pcm.Length; i++)
+            pcm[i] = (short)(Math.Sin(2 * Math.PI * 440 * i / 8000) * 12000);
+        session.SendAudioPcm(pcm);
+        byte[] speech;
+        lock (sent) speech = Assert.Single(sent);
+        Assert.Equal("2", session.AmrModeSet);
+        Assert.Equal(2, AmrNbDecoder.RtpPayloadToAmrFrame(speech[12..], forceOctetAligned: true)[0] >> 3 & 0x0f);
+
+        var silence = await idlePacket.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(2, AmrNbDecoder.RtpPayloadToAmrFrame(silence[12..], forceOctetAligned: true)[0] >> 3 & 0x0f);
+    }
+
+    [Fact]
+    public void RtpSession_RejectsInvalidAmrModeSetWithoutChangingEndpoint()
+    {
+        using var session = new RtpSession(null, localAddress: IPAddress.Loopback);
+        Assert.Throws<ArgumentException>(() => session.SetRemoteEndpoint(IPAddress.Loopback, 25000,
+            payloadType: 102, codec: "AMR", amrModeSet: "0,8"));
+        Assert.Throws<ArgumentException>(() => session.SetRemoteEndpoint(IPAddress.Loopback, 25000,
+            payloadType: 102, codec: "AMR", amrModeSet: "7,7"));
+        Assert.Null(session.AmrModeSet);
+    }
+
+    [Fact]
     public void RtpSession_DropsWrongSourceVersionAndUnnegotiatedPayload()
     {
         using var session = new RtpSession(null);
@@ -143,6 +227,179 @@ public sealed class SipGatewayTests
         packet[1] = 8;
         session.ProcessRtpPacket(packet, allowed);
         Assert.Equal(1, decoded);
+    }
+
+    [Fact]
+    public void RtpSession_StripsPaddingAndRejectsMalformedPaddingBeforeCountingArrival()
+    {
+        using var session = new RtpSession(null);
+        var decodedLengths = new List<int>();
+        session.OnAudioDecoded = samples => decodedLengths.Add(samples.Length);
+        var packet = new byte[12 + 160 + 4];
+        packet[0] = 0xA0; // RTP v2 with padding.
+        packet[1] = 8;
+        Array.Fill(packet, (byte)0xD5, 12, 160);
+        packet[^1] = 4;
+
+        session.ProcessRtpPacket(packet);
+        Assert.Equal([160], decodedLengths);
+        Assert.Equal(1UL, session.TotalPacketsReceived);
+
+        packet[^1] = 0;
+        session.ProcessRtpPacket(packet);
+        packet[^1] = 177; // More padding than bytes after the RTP header.
+        session.ProcessRtpPacket(packet);
+        Assert.Equal([160], decodedLengths);
+        Assert.Equal(1UL, session.TotalPacketsReceived);
+    }
+
+    [Fact]
+    public void RtpSession_DropsRtcpFromOtherThanNegotiatedEndpoint()
+    {
+        using var session = new RtpSession(null);
+        var allowed = new IPEndPoint(IPAddress.Loopback, 25001);
+        session.SetRemoteEndpoint(allowed.Address, 25000, remoteRtcpPort: allowed.Port);
+        var rtp = new byte[13];
+        rtp[0] = 0x80;
+        rtp[1] = 8;
+        rtp[12] = 0xD5;
+        BinaryPrimitives.WriteUInt32BigEndian(rtp.AsSpan(8), 0x12345678);
+        session.ProcessRtpPacket(rtp);
+
+        var senderReport = new byte[28];
+        senderReport[0] = 0x80;
+        senderReport[1] = 200;
+        BinaryPrimitives.WriteUInt16BigEndian(senderReport.AsSpan(2), 6);
+        BinaryPrimitives.WriteUInt32BigEndian(senderReport.AsSpan(4), 0x12345678);
+        BinaryPrimitives.WriteUInt32BigEndian(senderReport.AsSpan(8), 0x01020304);
+        session.ProcessRtcpPacket(senderReport, new IPEndPoint(allowed.Address, 25002));
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32BigEndian(session.CreateReceiverReport()!.AsSpan(24)));
+
+        session.ProcessRtcpPacket(senderReport, allowed);
+        Assert.Equal(0x03040000u,
+            BinaryPrimitives.ReadUInt32BigEndian(session.CreateReceiverReport()!.AsSpan(24)));
+    }
+
+    [Fact]
+    public async Task RtpSession_ProtectedSendersSuppressPlainUdpAndReportAsyncFailure()
+    {
+        await using var bus = new AsyncEventBus();
+        using var plainReceiver = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        using var session = new RtpSession(null, bus, localAddress: IPAddress.Loopback);
+        var packetSent = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sendError = new TaskCompletionSource<TelephonyEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var subscription = bus.Subscribe("rtp.send.error", ev => sendError.TrySetResult(ev));
+        var remotePort = ((IPEndPoint)plainReceiver.Client.LocalEndPoint!).Port;
+
+        Assert.Throws<ArgumentException>(() => session.SetRemoteEndpoint(
+            IPAddress.Loopback, remotePort,
+            protectedRtpSender: _ => Task.CompletedTask));
+        Assert.Null(session.RemoteRtcpEndPoint);
+        session.SetRemoteEndpoint(IPAddress.Loopback, remotePort,
+            protectedRtpSender: packet =>
+            {
+                packetSent.TrySetResult(packet);
+                return Task.FromException(new InvalidOperationException("injected protected send failure"));
+            },
+            protectedRtcpSender: _ => Task.CompletedTask);
+
+        session.SendAudioPcm(new short[160]);
+        Assert.Equal(8, (await packetSent.Task.WaitAsync(TimeSpan.FromSeconds(3)))[1] & 0x7f);
+        Assert.Contains("injected protected send failure",
+            (await sendError.Task.WaitAsync(TimeSpan.FromSeconds(3))).Payload?.ToString());
+        Assert.Equal(1UL, session.GetMediaStats().SendErrors);
+        Assert.Equal(0UL, session.GetMediaStats().PacketsSent);
+        await Assert.ThrowsAsync<TimeoutException>(async () =>
+            await plainReceiver.ReceiveAsync().WaitAsync(TimeSpan.FromMilliseconds(150)));
+    }
+
+    [Fact]
+    public async Task RtpSession_MediaStatsSeparateSendReceiveAndDecode()
+    {
+        using var session = new RtpSession(null, localAddress: IPAddress.Loopback);
+        var sent = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        session.CustomSender = packet =>
+        {
+            sent.TrySetResult(packet);
+            return Task.CompletedTask;
+        };
+        session.SetRemoteEndpoint(IPAddress.Loopback, 25000, startSenders: false);
+        session.SendAudioPcm(new short[160]);
+        var packet = await sent.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.True(SpinWait.SpinUntil(() => session.GetMediaStats().PacketsSent == 1,
+            TimeSpan.FromSeconds(3)));
+        var expected = new RtpMediaStats(1, 0, 0, 0)
+        {
+            PcmSamplesReceived = 160, AudioFramesEncoded = 1, AudioPacketsSent = 1
+        };
+        Assert.Equal(expected, session.GetMediaStats());
+
+        session.ProcessRtpPacket(packet, new IPEndPoint(IPAddress.Loopback, 25001));
+        Assert.Equal(0UL, session.GetMediaStats().PacketsReceived);
+        session.ProcessRtpPacket(packet, new IPEndPoint(IPAddress.Loopback, 25000));
+        Assert.Equal(expected with { PacketsReceived = 1, AudioFramesDecoded = 1 }, session.GetMediaStats());
+    }
+
+    [Fact]
+    public void RtpSession_AccumulatesVariableMicrophoneCallbacksIntoTwentyMillisecondFrames()
+    {
+        using var session = new RtpSession(null, localAddress: IPAddress.Loopback);
+        var packets = new List<byte[]>();
+        session.CustomSender = packet =>
+        {
+            packets.Add(packet);
+            return Task.CompletedTask;
+        };
+        session.SetRemoteEndpoint(IPAddress.Loopback, 25000, startSenders: false);
+
+        session.SendAudioPcm(Enumerable.Repeat((short)1000, 80).ToArray());
+        Assert.Empty(packets);
+        session.SendAudioPcm(Enumerable.Repeat((short)2000, 320).ToArray());
+        Assert.Equal(2, packets.Count);
+        session.SendAudioPcm(Enumerable.Repeat((short)3000, 80).ToArray());
+        Assert.Equal(3, packets.Count);
+
+        var firstFrame = Enumerable.Repeat((short)1000, 80)
+            .Concat(Enumerable.Repeat((short)2000, 80)).ToArray();
+        var thirdFrame = Enumerable.Repeat((short)2000, 80)
+            .Concat(Enumerable.Repeat((short)3000, 80)).ToArray();
+        Assert.Equal(G711Codec.EncodeAlaw(firstFrame), packets[0][12..]);
+        Assert.Equal(G711Codec.EncodeAlaw(Enumerable.Repeat((short)2000, 160).ToArray()), packets[1][12..]);
+        Assert.Equal(G711Codec.EncodeAlaw(thirdFrame), packets[2][12..]);
+        Assert.All(packets, packet => Assert.Equal(172, packet.Length));
+        var seq0 = BinaryPrimitives.ReadUInt16BigEndian(packets[0].AsSpan(2, 2));
+        var ts0 = BinaryPrimitives.ReadUInt32BigEndian(packets[0].AsSpan(4, 4));
+        Assert.Equal((ushort)(seq0 + 1), BinaryPrimitives.ReadUInt16BigEndian(packets[1].AsSpan(2, 2)));
+        Assert.Equal((ushort)(seq0 + 2), BinaryPrimitives.ReadUInt16BigEndian(packets[2].AsSpan(2, 2)));
+        Assert.Equal(ts0 + 160, BinaryPrimitives.ReadUInt32BigEndian(packets[1].AsSpan(4, 4)));
+        Assert.Equal(ts0 + 320, BinaryPrimitives.ReadUInt32BigEndian(packets[2].AsSpan(4, 4)));
+    }
+
+    [Fact]
+    public void RtpSession_AmrDoesNotDropTheSecondFrameOfALargeMicrophoneCallback()
+    {
+        using var session = new RtpSession(null, localAddress: IPAddress.Loopback);
+        var packets = new List<byte[]>();
+        session.CustomSender = packet =>
+        {
+            packets.Add(packet);
+            return Task.CompletedTask;
+        };
+        session.SetRemoteEndpoint(IPAddress.Loopback, 25000, payloadType: 102,
+            codec: "AMR", amrOctetAligned: true, amrModeSet: "2", startSenders: false);
+        var pcm = Enumerable.Range(0, 320)
+            .Select(i => (short)(Math.Sin(2 * Math.PI * 440 * i / 8000) * 12000)).ToArray();
+
+        session.SendAudioPcm(pcm[..80]);
+        Assert.Empty(packets);
+        session.SendAudioPcm(pcm[80..]);
+        Assert.Equal(2, packets.Count);
+        Assert.All(packets, packet =>
+            Assert.Equal(2, AmrNbDecoder.RtpPayloadToAmrFrame(packet[12..],
+                forceOctetAligned: true)[0] >> 3 & 0x0f));
+        var firstTimestamp = BinaryPrimitives.ReadUInt32BigEndian(packets[0].AsSpan(4, 4));
+        Assert.Equal(firstTimestamp + 160,
+            BinaryPrimitives.ReadUInt32BigEndian(packets[1].AsSpan(4, 4)));
     }
 
     [Fact]
@@ -392,29 +649,111 @@ public sealed class SipGatewayTests
         var cancelOk = SipMessage.Parse((await phone.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3))).Buffer);
         Assert.Equal(200, cancelOk.StatusCode);
         Assert.Equal("5 CANCEL", cancelOk.GetHeader("CSeq"));
-        controller.DialRelease.TrySetResult();
         var cancelledFinal = SipMessage.Parse((await phone.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3))).Buffer);
         Assert.Equal(487, cancelledFinal.StatusCode);
+        // The phone transaction must end even while the carrier ignores its
+        // cancellation token and has not returned from DialCarrierAsync.
+        Assert.Equal(0, gateway.Status.ActiveDialogs);
+        controller.DialRelease.TrySetResult();
         await controller.SecondHangup.Task.WaitAsync(TimeSpan.FromSeconds(3));
         Assert.Equal(2, controller.HangupCount);
         Assert.Equal(0, gateway.Status.ActiveDialogs);
 
         controller.DialRelease = null;
+
+        // The desktop can also hang up a still-dialing carrier leg. That is
+        // 487 to the pending phone INVITE, not an invalid early-dialog BYE.
+        controller.DialRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var desktopCancelled = Invite(6, "z9hG4bK-desktop-cancelled");
+        desktopCancelled.SetHeader("Call-ID", "desktop-cancelled@test.local");
+        var desktopDigest = SipDigestAuthenticator.Md5Hex($"{ha1}:{nonce}:00000003:client:auth:{ha2}");
+        desktopCancelled.SetHeader("Proxy-Authorization",
+            $"Digest username=\"1001\", realm=\"test.local\", nonce=\"{nonce}\", uri=\"{desktopCancelled.RequestUri}\", response=\"{desktopDigest}\", algorithm=MD5, qop=auth, nc=00000003, cnonce=\"client\"");
+        await phone.SendAsync(desktopCancelled.ToBytes(), server);
+        Assert.Equal(100, SipMessage.Parse((await phone.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3))).Buffer).StatusCode);
+        Assert.Equal(180, SipMessage.Parse((await phone.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3))).Buffer).StatusCode);
+        await controller.Started.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        controller.EndDialing();
+        var desktopFinal = SipMessage.Parse((await phone.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3))).Buffer);
+        Assert.Equal(487, desktopFinal.StatusCode);
+        Assert.Equal(0, gateway.Status.ActiveDialogs);
+        controller.DialRelease.TrySetResult();
+        await controller.ThirdHangup.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        controller.DialRelease = null;
         var unacknowledged = Invite(6, "z9hG4bK-no-ack");
         unacknowledged.SetHeader("Call-ID", "unacknowledged-bridge@test.local");
-        var thirdDigest = SipDigestAuthenticator.Md5Hex($"{ha1}:{nonce}:00000003:client:auth:{ha2}");
+        var thirdDigest = SipDigestAuthenticator.Md5Hex($"{ha1}:{nonce}:00000004:client:auth:{ha2}");
         unacknowledged.SetHeader("Proxy-Authorization",
-            $"Digest username=\"1001\", realm=\"test.local\", nonce=\"{nonce}\", uri=\"{unacknowledged.RequestUri}\", response=\"{thirdDigest}\", algorithm=MD5, qop=auth, nc=00000003, cnonce=\"client\"");
-        await phone.SendAsync(unacknowledged.ToBytes(), server);
-        SipMessage noAckFinal;
-        do
+            $"Digest username=\"1001\", realm=\"test.local\", nonce=\"{nonce}\", uri=\"{unacknowledged.RequestUri}\", response=\"{thirdDigest}\", algorithm=MD5, qop=auth, nc=00000004, cnonce=\"client\"");
+        controller.HangupRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
         {
-            noAckFinal = SipMessage.Parse((await phone.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3))).Buffer);
-        } while (noAckFinal.StatusCode < 200);
-        Assert.Equal(200, noAckFinal.StatusCode);
-        await controller.ThirdHangup.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        Assert.Equal(3, controller.HangupCount);
-        Assert.Equal(0, gateway.Status.ActiveDialogs);
+            await phone.SendAsync(unacknowledged.ToBytes(), server);
+            SipMessage noAckFinal;
+            do
+            {
+                noAckFinal = SipMessage.Parse((await phone.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3))).Buffer);
+            } while (noAckFinal.StatusCode < 200);
+            Assert.Equal(200, noAckFinal.StatusCode);
+            await controller.FourthHangup.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.Equal(4, controller.HangupCount);
+            Assert.False(controller.HangupRelease.Task.IsCompleted);
+            Assert.Equal(0, gateway.Status.ActiveDialogs);
+        }
+        finally { controller.HangupRelease.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task CancelClearsLocalDialogBeforeFinalResponseEvenWhileOwnedCarrierHangupIsBlocked()
+    {
+        var options = new SipGatewayOptions { BindAddress = IPAddress.Loopback, SipPort = GetFreeUdpPort(),
+            Realm = "cancel.test", Accounts = new() { ["1001"] = "secret" } };
+        var controller = new DialingController { ReportEarlyOwnership = true,
+            DialRelease = new(TaskCreationOptions.RunContinuationsAsynchronously),
+            HangupRelease = new(TaskCreationOptions.RunContinuationsAsynchronously) };
+        await using var gateway = new SipGateway(options, controller);
+        await gateway.StartAsync();
+        using var phone = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var server = new IPEndPoint(IPAddress.Loopback, options.SipPort);
+        var invite = new SipMessage { IsRequest = true, Method = "INVITE", RequestUri = "sip:123456@cancel.test",
+            Body = "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 25000 RTP/AVP 8\r\n" };
+        invite.SetHeader("Via", "SIP/2.0/UDP 127.0.0.1:5099;branch=z9hG4bK-cancel-first;rport");
+        invite.SetHeader("From", "<sip:1001@cancel.test>;tag=phone"); invite.SetHeader("To", "<sip:123456@cancel.test>");
+        invite.SetHeader("Call-ID", "blocked-owned-cleanup@cancel.test"); invite.SetHeader("CSeq", "1 INVITE");
+        invite.SetHeader("Content-Type", "application/sdp");
+        await phone.SendAsync(invite.ToBytes(), server);
+        var challenge = SipMessage.Parse((await phone.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3))).Buffer);
+        Assert.Equal(407, challenge.StatusCode);
+        var nonce = Regex.Match(challenge.GetHeader("Proxy-Authenticate")!, "nonce=\"([^\"]+)\"").Groups[1].Value;
+        var digest = SipDigestAuthenticator.Md5Hex($"{SipDigestAuthenticator.Md5Hex("1001:cancel.test:secret")}:{nonce}:00000001:client:auth:{SipDigestAuthenticator.Md5Hex($"INVITE:{invite.RequestUri}")}");
+        invite.SetHeader("Proxy-Authorization", $"Digest username=\"1001\", realm=\"cancel.test\", nonce=\"{nonce}\", uri=\"{invite.RequestUri}\", response=\"{digest}\", algorithm=MD5, qop=auth, nc=00000001, cnonce=\"client\"");
+        invite.SetHeader("Via", "SIP/2.0/UDP 127.0.0.1:5099;branch=z9hG4bK-cancel-second;rport");
+        invite.SetHeader("CSeq", "2 INVITE");
+        try
+        {
+            await phone.SendAsync(invite.ToBytes(), server);
+            await controller.Started.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            var cancel = SipMessage.Parse(invite.ToBytes()); cancel.Method = "CANCEL"; cancel.Body = ""; cancel.RawBody = [];
+            cancel.SetHeader("CSeq", "2 CANCEL"); cancel.Headers.Remove("Proxy-Authorization");
+            await phone.SendAsync(cancel.ToBytes(), server);
+            var finals = new List<SipMessage>();
+            while (finals.Count < 2)
+            {
+                var response = SipMessage.Parse((await phone.ReceiveAsync().WaitAsync(TimeSpan.FromSeconds(3))).Buffer);
+                if (response.StatusCode >= 200) finals.Add(response);
+            }
+            Assert.Contains(finals, reply => reply.StatusCode == 200 && reply.GetHeader("CSeq") == "2 CANCEL");
+            Assert.Contains(finals, reply => reply.StatusCode == 487 && reply.GetHeader("CSeq") == "2 INVITE");
+            Assert.Equal(0, gateway.Status.ActiveDialogs);
+            await controller.HangupEntered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.False(controller.HangupRelease.Task.IsCompleted);
+            Assert.Equal("slot-a", controller.HungUpSlot);
+            // Returning success after cancellation must not resurrect or release
+            // another modem, nor submit a second hangup of this carrier leg.
+            controller.DialRelease.TrySetResult();
+            Assert.Equal(1, controller.HangupCount);
+        }
+        finally { controller.DialRelease.TrySetResult(); controller.HangupRelease.TrySetResult(); }
     }
 
     [Fact]
@@ -560,14 +899,21 @@ public sealed class SipGatewayTests
     private sealed class DialingController : ISipGatewayCallController
     {
         public event EventHandler<IncomingCallEventArgs>? IncomingCall { add { } remove { } }
-        public event EventHandler<CallEndedEventArgs>? CallEnded { add { } remove { } }
+        public event EventHandler<CallEndedEventArgs>? CallEnded;
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public void EndDialing() => CallEnded?.Invoke(this, new CallEndedEventArgs(
+            "carrier-outbound", "123456", TimeSpan.Zero, "HANGUP", null, DateTime.UtcNow, "slot-a"));
         public string? DialedNumber { get; private set; }
         public int HangupCount { get; private set; }
         public string? HungUpSlot { get; private set; }
         public TaskCompletionSource HungUp { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource SecondHangup { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource ThirdHangup { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FourthHangup { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource? DialRelease { get; set; }
+        public TaskCompletionSource? HangupRelease { get; set; }
+        public TaskCompletionSource HangupEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool ReportEarlyOwnership { get; set; }
 
         public async Task<SipGatewayCarrierCall> DialCarrierAsync(string number, string? slotId, CancellationToken ct)
         {
@@ -578,17 +924,32 @@ public sealed class SipGatewayTests
             return new SipGatewayCarrierCall(call, "slot-a", new SilentMedia());
         }
 
+        public Task<SipGatewayCarrierCall> DialCarrierAsync(string number, string? slotId, CancellationToken ct,
+            Action<string, string?> onStarted)
+        {
+            // Only report early ownership in the desktop hangup scenario;
+            // retain the late-returning unknown-leg CANCEL regression above.
+            if (ReportEarlyOwnership || HangupCount >= 2)
+            {
+                onStarted("carrier-outbound", "slot-a");
+                Started.TrySetResult();
+            }
+            return DialCarrierAsync(number, slotId, ct);
+        }
+
         public Task<SipGatewayCarrierCall> AnswerCarrierAsync(string? slotId, CancellationToken ct) =>
             throw new NotSupportedException();
 
-        public Task HangupAsync(string? slotId, CancellationToken ct)
+        public async Task HangupAsync(string? slotId, CancellationToken ct)
         {
             HangupCount++;
             HungUpSlot = slotId;
             HungUp.TrySetResult();
             if (HangupCount >= 2) SecondHangup.TrySetResult();
             if (HangupCount >= 3) ThirdHangup.TrySetResult();
-            return Task.CompletedTask;
+            if (HangupCount >= 4) FourthHangup.TrySetResult();
+            HangupEntered.TrySetResult();
+            if (HangupRelease != null) await HangupRelease.Task;
         }
 
         public Task SendDtmfAsync(char digit, string? slotId, CancellationToken ct) => Task.CompletedTask;

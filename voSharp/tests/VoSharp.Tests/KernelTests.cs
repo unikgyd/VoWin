@@ -1,3 +1,5 @@
+using System.Net;
+using System.Text.Json;
 using VoSharp.Common.Events;
 using VoSharp.Kernel;
 using VoSharp.Kernel.Ipc;
@@ -9,6 +11,40 @@ namespace VoSharp.Tests;
 
 public class KernelTests
 {
+    [Fact]
+    public void UserspaceHostImsBackendRequiresExplicitSubscriberEgressAndDriverFiles()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        Assert.False(VoKernel.TryCreateHostImsUserspaceBackend(
+            null, null, out var backend, out var error));
+        Assert.Null(backend);
+        Assert.Contains("SUBSCRIBER_EGRESS_APPROVED", error);
+
+        Assert.False(VoKernel.TryCreateHostImsUserspaceBackend(
+            "1", null, out backend, out error));
+        Assert.Null(backend);
+        Assert.Contains("VOWIN_HOST_IMS_WINDIVERT_DLL", error);
+
+        Assert.False(VoKernel.TryCreateHostImsUserspaceBackend(
+            "1", "WinDivert.dll", out backend, out error));
+        Assert.Null(backend);
+        Assert.Contains("VOWIN_HOST_IMS_WINDIVERT_DLL", error);
+    }
+
+    [Fact]
+    public void CommandResultSerializesIpv6AddressesAsStrings()
+    {
+        var result = new KernelCommandResult(true, "IMS route", new
+        {
+            Local = IPAddress.Parse("2001:db8::1234"),
+            Pcscf = new[] { IPAddress.Parse("2001:db8::1") }
+        });
+        using var json = JsonDocument.Parse(result.ToJson());
+        Assert.Equal("2001:db8::1234", json.RootElement.GetProperty("Data").GetProperty("Local").GetString());
+        Assert.Equal("2001:db8::1", json.RootElement.GetProperty("Data").GetProperty("Pcscf")[0].GetString());
+    }
+
     [Fact]
     public async Task TestKernel_CommandExecution_Lifecycle()
     {
@@ -43,6 +79,16 @@ public class KernelTests
         // 5. Offline SMS fails closed and is not written to the outbox
         var smsRes = await kernel.ExecuteCommandAsync("sms send 10086 CXCX");
         Assert.False(smsRes.Success);
+        var unavailableHostWithoutReceiptFlag = await kernel.ExecuteCommandAsync(
+            "sms send 10086 CXCX --host-ims");
+        Assert.False(unavailableHostWithoutReceiptFlag.Success);
+        Assert.Contains("No Host IMS slot", unavailableHostWithoutReceiptFlag.Message);
+        var unavailableHost = await kernel.ExecuteCommandAsync(
+            "sms send 10086 CXCX --host-ims --no-receipt");
+        Assert.False(unavailableHost.Success);
+        var conflictingTransports = await kernel.ExecuteCommandAsync(
+            "sms send 10086 CXCX --host-ims --cellular --no-receipt");
+        Assert.False(conflictingTransports.Success);
         Assert.Empty(kernel.Outbox);
 
         // 6. History

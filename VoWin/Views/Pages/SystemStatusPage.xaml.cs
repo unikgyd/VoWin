@@ -15,20 +15,34 @@ namespace VoWin.Views.Pages
         private ScrollViewer? _logScrollViewer;
         private int _scrollPending;
 
+        private void UpdateLogLayout()
+        {
+            if (ExpandedTerminalPanel == null) return;
+            var bottom = ActualWidth < 1100;
+            Grid.SetColumn(ExpandedTerminalPanel, bottom ? 0 : 1);
+            Grid.SetRow(ExpandedTerminalPanel, bottom ? 1 : 0);
+            Grid.SetColumnSpan(ExpandedTerminalPanel, bottom ? 2 : 1);
+            ExpandedTerminalPanel.Width = bottom ? double.NaN : 370;
+            ExpandedTerminalPanel.Height = bottom ? 330 : double.NaN;
+            ExpandedTerminalPanel.Margin = bottom ? new Thickness(0, 10, 0, 0) : new Thickness(0);
+        }
+
         public SystemStatusPage(SystemStatusViewModel viewModel)
         {
             ViewModel = viewModel;
             DataContext = viewModel;
 
             InitializeComponent();
+            SizeChanged += (_, _) => UpdateLogLayout();
 
             Loaded += OnPageLoaded;
             Unloaded += OnPageUnloaded;
-            viewModel.PropertyChanged += OnViewModelPropertyChanged;
         }
 
         private void OnPageLoaded(object sender, RoutedEventArgs e)
         {
+            ViewModel.PropertyChanged -= OnViewModelPropertyChanged;
+            ViewModel.PropertyChanged += OnViewModelPropertyChanged;
             DisableAncestorScrollViewers();
             HookLogAutoScroll();
         }
@@ -191,6 +205,10 @@ namespace VoWin.Views.Pages
         private void OnTerminalPreviewMouseWheel(object sender, MouseWheelEventArgs e)
         {
             var sv = FindLogScrollViewer();
+            // The connection-details tab owns its own scroll viewer.
+            for (var current = e.OriginalSource as DependencyObject; current != null && current != ExpandedTerminalPanel;
+                 current = current is Visual ? VisualTreeHelper.GetParent(current) : LogicalTreeHelper.GetParent(current))
+                if (current is ScrollViewer other && other != sv) return;
             if (sv != null)
             {
                 sv.ScrollToVerticalOffset(sv.VerticalOffset - (e.Delta / 2.0));

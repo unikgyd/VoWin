@@ -6,6 +6,40 @@ namespace VoSharp.Telephony.VoWifi;
 
 public static class IpPacketUtils
 {
+    // IMS ESP performs these checks before committing the replay window. Keep
+    // this strict boundary separate from general tunnel fragmentation helpers.
+    internal static void ValidateImsUdpPayload(IPAddress source, IPAddress destination, ReadOnlySpan<byte> udp)
+    {
+        if (source.AddressFamily != destination.AddressFamily || udp.Length < 8 ||
+            udp.Length > ushort.MaxValue || BinaryPrimitives.ReadUInt16BigEndian(udp[4..]) != udp.Length)
+            throw new FormatException("Invalid IMS UDP length.");
+        var supplied = BinaryPrimitives.ReadUInt16BigEndian(udp[6..]);
+        var ipv6 = source.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
+        if (supplied == 0)
+        {
+            if (ipv6) throw new FormatException("Missing IMS IPv6 UDP checksum.");
+            return; // RFC 768 permits checksum omission on IPv4 only.
+        }
+        uint sum = (uint)udp.Length + 17;
+        AddWords(source.GetAddressBytes(), ref sum);
+        AddWords(destination.GetAddressBytes(), ref sum);
+        AddWords(udp, ref sum);
+        while (sum > ushort.MaxValue) sum = (sum & ushort.MaxValue) + (sum >> 16);
+        if ((ushort)sum != ushort.MaxValue) throw new FormatException("Invalid IMS UDP checksum.");
+    }
+
+    internal static void ValidateImsOuterHeader(byte[] packet, int headerLength, int total)
+    {
+        if (packet.Length != total) throw new FormatException("Ambiguous IMS IP length.");
+        if (packet[0] >> 4 == 4)
+        {
+            uint sum = 0;
+            AddWords(packet.AsSpan(0, headerLength), ref sum);
+            while (sum > ushort.MaxValue) sum = (sum & ushort.MaxValue) + (sum >> 16);
+            if ((ushort)sum != ushort.MaxValue || (BinaryPrimitives.ReadUInt16BigEndian(packet.AsSpan(6)) & 0x8000) != 0)
+                throw new FormatException("Invalid IMS IPv4 header.");
+        }
+    }
     /// <summary>
     /// Conservative inner-packet MTU used by the userspace ePDG tunnel. With UDP/4500,
     /// AES-CBC and a 12/16-byte ICV, a 1400-byte inner packet stays below a 1500-byte

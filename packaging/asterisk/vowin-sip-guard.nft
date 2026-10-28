@@ -1,0 +1,10 @@
+# Fail-closed example only: no user's interfaces or subnets are embedded.
+# Prefer generated/vowin-sip-guard.nft from your explicit TrustedNetworks.
+# Add your trusted CIDRs to this set before using this template.
+add table inet vowin_sip_guard
+add chain inet vowin_sip_guard input { type filter hook input priority -10; policy accept; }
+flush chain inet vowin_sip_guard input
+add set inet vowin_sip_guard trusted_v4 { type ipv4_addr; flags interval; }
+add rule inet vowin_sip_guard input iifname "lo" udp dport { 5060, 10000-10099 } counter accept
+add rule inet vowin_sip_guard input ip saddr @trusted_v4 udp dport { 5060, 10000-10099 } counter accept
+add rule inet vowin_sip_guard input udp dport { 5060, 10000-10099 } counter drop

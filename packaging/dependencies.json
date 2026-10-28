@@ -1,0 +1,21 @@
+{
+  "winDivert": {
+    "url": "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip",
+    "sha256": "63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15",
+    "x64Files": {
+      "WinDivert.dll": "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2",
+      "WinDivert64.sys": "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2",
+      "WinDivert.LICENSE.txt": "14a0cb5214d536e4fdae6aa3f5696f981eeda106cd026e9794bba489ee79d628"
+    }
+  },
+  "platformTools": {
+    "url": "https://dl.google.com/android/repository/platform-tools_r36.0.0-win.zip",
+    "sha256": "12c2841f354e92a0eb2fd7bf6f0f9bf8538abce7bd6b060ac8349d6f6a61107c"
+  },
+  "voiceCommit": "0443dfdaf8aec086fd76ba2ee9152fd908114524",
+  "voiceFiles": [
+    { "name": "qdc507_aprv3.ko", "sha256": "3d82d3dec4f1e323201bba87156df9d41438e08314097353f2607f9117211d4a" },
+    { "name": "qdc507_voice.ko", "sha256": "ed3821682d5309969a01c764192c83feff9669c61ef237c69475cd1619cf296c" },
+    { "name": "mavo-pcm-bridge.armv7", "sha256": "88d47c15e61d1428a59c821fed804c2e6490e82859a085062f21966b58d167fc" }
+  ]
+}

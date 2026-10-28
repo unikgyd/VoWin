@@ -40,7 +40,8 @@ public static class HardwareAka
     public const ushort SwMacFailure = 0x9862;
 
     /// <summary>Maximum GET RESPONSE round trips before giving up on a chained response.</summary>
-    public const int MaxChainedExchanges = 4;
+    public const int MaxChainedExchanges = 8;
+    public const int MaxResponseBodyLength = 4096;
 
     /// <summary>
     /// Builds the USIM AUTHENTICATE APDU:
@@ -88,8 +89,10 @@ public static class HardwareAka
 
         for (var exchange = 0; exchange < MaxChainedExchanges; exchange++)
         {
+            ct.ThrowIfCancellationRequested();
             var raw = await transmit(current, ct).ConfigureAwait(false);
             if (raw is null || raw.Length < 2) return null;
+            if (raw.Length - 2 > MaxResponseBodyLength - collected.Count) return null;
 
             var sw1 = raw[^2];
             var sw2 = raw[^1];
@@ -97,6 +100,15 @@ public static class HardwareAka
             // 9862 is terminal — stop rather than trying to drain a response that will not come.
             if (((ushort)((sw1 << 8) | sw2)) == SwMacFailure)
                 return new byte[] { sw1, sw2 };
+
+            // Borrow the Rust UICC path's explicit wrong-Le correction. Only
+            // correct commands with a short Le; a Case 3 SELECT ends in data.
+            if (sw1 == 0x6C && raw.Length != 2) return null;
+            if (sw1 == 0x6C && TryCorrectResponseLength(current, sw2, out var corrected))
+            {
+                current = corrected;
+                continue;
+            }
 
             collected.AddRange(raw.AsSpan(0, raw.Length - 2));
 
@@ -129,12 +141,20 @@ public static class HardwareAka
         {
             var raw = transmit(current);
             if (raw is null || raw.Length < 2) return null;
+            if (raw.Length - 2 > MaxResponseBodyLength - collected.Count) return null;
 
             var sw1 = raw[^2];
             var sw2 = raw[^1];
 
             if (((ushort)((sw1 << 8) | sw2)) == SwMacFailure)
                 return new byte[] { sw1, sw2 };
+
+            if (sw1 == 0x6C && raw.Length != 2) return null;
+            if (sw1 == 0x6C && TryCorrectResponseLength(current, sw2, out var corrected))
+            {
+                current = corrected;
+                continue;
+            }
 
             collected.AddRange(raw.AsSpan(0, raw.Length - 2));
 
@@ -150,6 +170,19 @@ public static class HardwareAka
         }
 
         return null;
+    }
+
+    private static bool TryCorrectResponseLength(byte[] command, byte le, out byte[] corrected)
+    {
+        corrected = command;
+        // Short Case 2: header + Le. Short Case 4: header + Lc + data + Le.
+        // Do not guess an Le for data-only or extended-length APDUs.
+        var hasShortLe = command.Length == 5 ||
+            (command.Length >= 6 && command[4] != 0 && command.Length == 6 + command[4]);
+        if (!hasShortLe) return false;
+        corrected = command.ToArray();
+        corrected[^1] = le;
+        return true;
     }
 
     /// <summary>
@@ -184,13 +217,39 @@ public static class HardwareAka
         if (sw == 0x6E00)
             return new HardwareAkaResult(false, false, null, null, null, null,
                 "USIM class not supported (SW=6E00).");
-        if (sw1 != 0x90 && sw1 != 0x61)
+        // This codec receives a reassembled response. 61xx/9Fxx must first be
+        // drained by the transport; a plausible body is not proof of success.
+        if (sw != 0x9000)
             return new HardwareAkaResult(false, false, null, null, null, null,
                 $"Card error SW1=0x{sw1:x2} SW2=0x{sw2:x2}");
 
         var data = rawResponse.AsSpan(0, len - 2);
         if (data.Length == 0)
             return new HardwareAkaResult(false, false, null, null, null, null, "Empty response data");
+
+        // Firmware compatibility also exercised by the Rust UIM transport:
+        // accept exactly one 80 envelope, with a short or 81 length. This is
+        // not a generic BER parser: unknown tags, nesting and trailing bytes
+        // must not turn malformed authentication data into usable keys.
+        if (data[0] == 0x80)
+        {
+            if (data.Length < 2)
+                return new HardwareAkaResult(false, false, null, null, null, null, "Truncated authentication envelope");
+            var headerLength = 2;
+            int payloadLength = data[1];
+            if (payloadLength == 0x81 && data.Length >= 3)
+            {
+                headerLength = 3;
+                payloadLength = data[2];
+            }
+            else if (payloadLength >= 0x80)
+            {
+                return new HardwareAkaResult(false, false, null, null, null, null, "Unsupported authentication envelope length");
+            }
+            if (payloadLength == 0 || payloadLength != data.Length - headerLength)
+                return new HardwareAkaResult(false, false, null, null, null, null, "Invalid authentication envelope length");
+            data = data[headerLength..];
+        }
 
         return data[0] switch
         {
@@ -205,10 +264,10 @@ public static class HardwareAka
     /// Parses tag 0xDB: RES, CK and IK.
     /// </summary>
     /// <remarks>
-    /// Two encodings occur in the field and stacks disagree on which one a real USIM emits:
+    /// The standard layout and a legacy total-length compatibility form are supported:
     /// <list type="bullet">
-    ///   <item><description>A — <c>DB | totalLen | RES(len) | CK(len) | IK(len)</c> (BER-TLV)</description></item>
-    ///   <item><description>B — <c>DB |            RES(len) | CK(len) | IK(len)</c> (no outer length)</description></item>
+    ///   <item><description>A — <c>DB | totalLen | RES(len) | CK(len) | IK(len)</c> (compatibility)</description></item>
+    ///   <item><description>B — <c>DB |            RES(len) | CK(len) | IK(len)</c> (TS 31.102)</description></item>
     /// </list>
     /// Rather than guess, try A then B and accept whichever walks the TLV stream exactly to the end
     /// of the buffer <em>and</em> yields 16-byte CK/IK. Milenage fixes those lengths, so that
@@ -241,7 +300,7 @@ public static class HardwareAka
         // Optional Kc (GSM cipher key, 8 bytes) per 3GPP TS 31.102 §7.1.2.1
         if (offset < data.Length)
         {
-            _ = TryReadTlv(data, ref offset, out _);
+            if (!TryReadTlv(data, ref offset, out var kc) || kc.Length != 8) return false;
         }
 
         // The TLV stream must finish exactly at the end of the data.
@@ -249,7 +308,9 @@ public static class HardwareAka
         if (res.Length is < 4 or > 16) return false;
         if (ck.Length != 16 || ik.Length != 16) return false;
 
-        result = (res, ck, ik);
+        // Validate using borrowed spans first. Failed compatibility parses
+        // must not leave allocated partial RES/CK/IK copies for the GC.
+        result = (res.ToArray(), ck.ToArray(), ik.ToArray());
         return true;
     }
 
@@ -264,7 +325,7 @@ public static class HardwareAka
             if (!TryReadTlv(data, ref offset, out var auts)) continue;
             if (offset != data.Length || auts.Length != AutsLength) continue;
 
-            return new HardwareAkaResult(false, true, null, null, null, auts, "Synchronization failure");
+            return new HardwareAkaResult(false, true, null, null, null, auts.ToArray(), "Synchronization failure");
         }
 
         return new HardwareAkaResult(false, false, null, null, null, null,
@@ -282,15 +343,15 @@ public static class HardwareAka
         return data[1] == data.Length - 2;
     }
 
-    private static bool TryReadTlv(ReadOnlySpan<byte> data, ref int offset, out byte[] value)
+    private static bool TryReadTlv(ReadOnlySpan<byte> data, ref int offset, out ReadOnlySpan<byte> value)
     {
-        value = Array.Empty<byte>();
+        value = default;
         if (offset >= data.Length) return false;
 
         int length = data[offset++];
         if (length == 0 || offset + length > data.Length) return false;
 
-        value = data.Slice(offset, length).ToArray();
+        value = data.Slice(offset, length);
         offset += length;
         return true;
     }

@@ -18,7 +18,12 @@ public sealed record IkePayload(IkePayloadType Type, byte[] Body, bool Critical 
 }
 
 /// <summary>One transform inside a proposal.</summary>
-public sealed record IkeTransform(byte Type, ushort Id, ushort? KeyLengthBits = null);
+public sealed record IkeTransform(byte Type, ushort Id, ushort? KeyLengthBits = null)
+{
+    // An unknown attribute makes this transform unsuitable for selection; it
+    // must not disappear during decoding and accidentally become acceptable.
+    public bool HasUnsupportedAttributes { get; init; }
+}
 
 /// <summary>One proposal inside an SA payload.</summary>
 public sealed class IkeProposal
@@ -47,6 +52,7 @@ public sealed class IkeProposal
 /// </remarks>
 public static class IkeWire
 {
+    private const int MaximumMessageLength = 1024 * 1024;
     // ── Message header ──────────────────────────────────────────────────────
 
     public sealed class IkeMessage
@@ -62,7 +68,7 @@ public static class IkeWire
 
     public static IkeMessage ParseMessage(ReadOnlySpan<byte> buffer)
     {
-        if (buffer.Length < IkeDefaults.HeaderLength)
+        if (buffer.Length < IkeDefaults.HeaderLength || buffer.Length > MaximumMessageLength)
             throw new IkeFormatException(
                 $"IKE header needs {IkeDefaults.HeaderLength} bytes, got {buffer.Length}.");
 
@@ -101,16 +107,25 @@ public static class IkeWire
         var next = first;
         var offset = 0;
 
-        while (next != IkePayloadType.None && offset < buffer.Length)
+        if (buffer.Length > MaximumMessageLength) throw new IkeFormatException("Excessive IKE payload chain.");
+        while (next != IkePayloadType.None)
         {
+            if (payloads.Count >= 128) throw new IkeFormatException("Excessive IKE payload count.");
             var (payload, consumed) = ParsePayload(buffer[offset..], next);
             payloads.Add(payload);
 
             // The "next payload" byte belongs to the preceding payload's header.
             next = (IkePayloadType)buffer[offset];
             offset += consumed;
+            // SK/SKF are terminal outer payloads. Their next byte describes
+            // plaintext inside the encryption boundary, not an outer sibling.
+            if (payload.Type is IkePayloadType.Encrypted or IkePayloadType.EncryptedFragment)
+            {
+                next = IkePayloadType.None;
+                break;
+            }
         }
-
+        if (offset != buffer.Length) throw new IkeFormatException("Trailing IKE payload bytes.");
         return payloads;
     }
 
@@ -121,6 +136,7 @@ public static class IkeWire
     public static byte[] SerializePayloadChain(IReadOnlyList<IkePayload> payloads)
     {
         ArgumentNullException.ThrowIfNull(payloads);
+        if (payloads.Count > 128) throw new IkeFormatException("Excessive IKE payload count.");
 
         var bodies = new List<byte[]>(payloads.Count);
         var total = 0;
@@ -128,9 +144,13 @@ public static class IkeWire
         for (var i = 0; i < payloads.Count; i++)
         {
             var nextType = i + 1 < payloads.Count ? payloads[i + 1].Type : IkePayloadType.None;
+            if (payloads[i].Type is IkePayloadType.None ||
+                payloads[i].Type is IkePayloadType.Encrypted or IkePayloadType.EncryptedFragment && i + 1 != payloads.Count)
+                throw new IkeFormatException("Invalid IKE payload order.");
             var body = SerializePayload(payloads[i], nextType);
             bodies.Add(body);
             total += body.Length;
+            if (total > MaximumMessageLength - IkeDefaults.HeaderLength) throw new IkeFormatException("Excessive IKE message size.");
         }
 
         var chain = new byte[total];
@@ -173,9 +193,11 @@ public static class IkeWire
     private static byte[] SerializePayload(IkePayload payload, IkePayloadType nextType)
     {
         var length = IkeDefaults.GenericPayloadHeaderLength + payload.Body.Length;
+        if (length > ushort.MaxValue) throw new IkeFormatException("Excessive IKE payload size.");
         var buffer = new byte[length];
 
-        buffer[0] = (byte)(payload.NextPayloadOverride ?? nextType);
+        buffer[0] = (byte)(payload.Type is IkePayloadType.Encrypted or IkePayloadType.EncryptedFragment
+            ? payload.NextPayloadOverride ?? IkePayloadType.None : nextType);
         buffer[1] = (byte)(payload.Critical ? 0x80 : 0x00);
         BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(2, 2), (ushort)length);
         payload.Body.CopyTo(buffer.AsSpan(4));
@@ -194,6 +216,7 @@ public static class IkeWire
             throw new IkeFormatException($"Payload {type} declares length {length} beyond the buffer.");
 
         var critical = (buffer[1] & 0x80) != 0;
+        if (critical && !Enum.IsDefined(type)) throw new IkeFormatException("Unsupported critical IKE payload.");
         var body = buffer[4..length].ToArray();
 
         return (
@@ -209,7 +232,7 @@ public static class IkeWire
     public static byte[] EncodeProposals(IReadOnlyList<IkeProposal> proposals)
     {
         ArgumentNullException.ThrowIfNull(proposals);
-        if (proposals.Count == 0)
+        if (proposals.Count is 0 or > 64)
             throw new IkeFormatException("An SA payload must carry at least one proposal.");
 
         using var stream = new MemoryStream();
@@ -218,6 +241,8 @@ public static class IkeWire
         {
             var isLastProposal = i + 1 == proposals.Count;
             stream.Write(EncodeProposal(proposals[i], isLastProposal));
+            if (stream.Length > ushort.MaxValue - IkeDefaults.GenericPayloadHeaderLength)
+                throw new IkeFormatException("Excessive SA payload size.");
         }
 
         return stream.ToArray();
@@ -226,23 +251,30 @@ public static class IkeWire
     /// <summary>Decodes an SA payload body back into proposals.</summary>
     public static List<IkeProposal> DecodeProposals(ReadOnlySpan<byte> body)
     {
+        if (body.IsEmpty || body.Length > ushort.MaxValue - 4) throw new IkeFormatException("Invalid SA payload size.");
         var proposals = new List<IkeProposal>();
         var offset = 0;
 
         while (offset < body.Length)
         {
+            if (proposals.Count >= 64) throw new IkeFormatException("Excessive SA proposal count.");
             var (proposal, consumed, isLast) = DecodeProposal(body[offset..]);
             proposals.Add(proposal);
             offset += consumed;
 
-            if (isLast) break;
+            if (isLast)
+            {
+                if (offset != body.Length) throw new IkeFormatException("Trailing SA proposal data.");
+                return proposals;
+            }
         }
-
-        return proposals;
+        throw new IkeFormatException("SA proposal chain omitted its last marker.");
     }
 
     private static byte[] EncodeProposal(IkeProposal proposal, bool isLast)
     {
+        if (proposal.ProposalNumber == 0 || proposal.Spi.Length > byte.MaxValue || proposal.Transforms.Count is 0 or > 64)
+            throw new IkeFormatException("Invalid SA proposal fields.");
         const int headerLength = 8;   // Last/Resv/Len/Num/ProtoID/SPISize/NumTransforms
         var spiSize = (byte)proposal.Spi.Length;
 
@@ -257,6 +289,7 @@ public static class IkeWire
         }
 
         var length = headerLength + spiSize + transformBytes;
+        if (length > ushort.MaxValue) throw new IkeFormatException("Excessive SA proposal size.");
         var buffer = new byte[length];
 
         buffer[0] = (byte)(isLast ? 0 : 2);   // 2 = more proposals follow, 0 = last
@@ -286,12 +319,15 @@ public static class IkeWire
             throw new IkeFormatException("Truncated proposal header.");
 
         var lastFlag = buffer[0];
+        if (lastFlag is not (0 or 2)) throw new IkeFormatException("Invalid SA proposal last marker.");
         var length = BinaryPrimitives.ReadUInt16BigEndian(buffer[2..4]);
         if (length < 8 || length > buffer.Length)
             throw new IkeFormatException($"Proposal declares length {length} beyond the buffer.");
 
         var spiSize = buffer[6];
         var transformCount = buffer[7];
+        if (8 + spiSize > length || transformCount is 0 or > 64 || buffer[4] == 0)
+            throw new IkeFormatException("Invalid SA proposal fields.");
 
         var proposal = new IkeProposal
         {
@@ -307,15 +343,19 @@ public static class IkeWire
                 throw new IkeFormatException("Proposal declares more transforms than it carries.");
 
             var (transform, consumed) = DecodeTransform(buffer[offset..length]);
+            if (buffer[offset] != (i + 1 == transformCount ? 0 : 3))
+                throw new IkeFormatException("Transform count conflicts with last marker.");
             proposal.Transforms.Add(transform);
             offset += consumed;
         }
+        if (offset != length) throw new IkeFormatException("Trailing SA transform data.");
 
         return (proposal, length, lastFlag == 0);
     }
 
     private static byte[] EncodeTransform(IkeTransform transform, bool isLast)
     {
+        if (transform.HasUnsupportedAttributes) throw new IkeFormatException("Cannot serialize unsupported transform attributes.");
         const int headerLength = 8;   // Last/Resv/Len/Type/Resv/ID
         var attributeLength = transform.KeyLengthBits.HasValue ? 4 : 0;
         var length = headerLength + attributeLength;
@@ -353,27 +393,29 @@ public static class IkeWire
             Id: BinaryPrimitives.ReadUInt16BigEndian(buffer[6..8]));
 
         ushort? keyLength = null;
-        for (var offset = 8; offset + 4 <= length; offset += 4)
+        bool unsupported = false;
+        var seen = new HashSet<ushort>();
+        for (var offset = 8; offset < length;)
         {
+            if (length - offset < 4 || seen.Count >= 32) throw new IkeFormatException("Invalid transform attributes.");
             var raw = BinaryPrimitives.ReadUInt16BigEndian(buffer[offset..(offset + 2)]);
             var isTv = (raw & IkeAttributeType.FormatTv) != 0;
             var type = (ushort)(raw & ~IkeAttributeType.FormatTv);
 
-            if (type != IkeAttributeType.KeyLength) continue;
-
-            if (isTv)
+            if (!seen.Add(type)) throw new IkeFormatException("Duplicate transform attribute.");
+            int valueLength = isTv ? 2 : BinaryPrimitives.ReadUInt16BigEndian(buffer[(offset + 2)..(offset + 4)]);
+            int valueOffset = offset + (isTv ? 2 : 4);
+            if (valueLength > length - valueOffset) throw new IkeFormatException("Truncated transform attribute.");
+            if (type == IkeAttributeType.KeyLength)
             {
-                keyLength = BinaryPrimitives.ReadUInt16BigEndian(buffer[(offset + 2)..(offset + 4)]);
+                if (valueLength != 2) throw new IkeFormatException("Invalid key-length attribute.");
+                keyLength = BinaryPrimitives.ReadUInt16BigEndian(buffer.Slice(valueOffset, 2));
             }
-            else
-            {
-                var valueLength = BinaryPrimitives.ReadUInt16BigEndian(buffer[(offset + 2)..(offset + 4)]);
-                if (valueLength == 2 && offset + 8 <= length)
-                    keyLength = BinaryPrimitives.ReadUInt16BigEndian(buffer[(offset + 4)..(offset + 6)]);
-            }
+            else unsupported = true;
+            offset = valueOffset + valueLength;
         }
 
-        return (transform with { KeyLengthBits = keyLength }, length);
+        return (transform with { KeyLengthBits = keyLength, HasUnsupportedAttributes = unsupported }, length);
     }
 }
 

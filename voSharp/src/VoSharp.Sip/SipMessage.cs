@@ -16,6 +16,8 @@ public class SipMessage
     public byte[]? RawBody { get; set; }
     // Receive-path context. Never serialized; copied onto responses to this request.
     internal Func<SipMessage, CancellationToken, Task>? ResponseSender { get; set; }
+    /// <summary>Trusted per-transaction route. Not serialized onto the SIP wire.</summary>
+    public VoSharp.Telephony.VoWifi.SipDatagramRoute? OutgoingRoute { get; set; }
 
     public static string CanonicalHeaderName(string name) => name.Trim().ToLowerInvariant() switch
     {

@@ -15,6 +15,7 @@ public class AtSession : IAtSession, IAsyncDisposable
     private Task? _readTask;
     private CancellationTokenSource? _readLoopCts;
     private TaskCompletionSource<bool>? _pendingPrompt;
+    private int _disposed;
 
     public AtSession(string portName, int baudRate = 115200, AsyncEventBus? eventBus = null)
     {
@@ -56,6 +57,7 @@ public class AtSession : IAtSession, IAsyncDisposable
     {
         lock (_portLifecycleGate)
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
             if (_port.IsOpen) return;
             var previous = _readTask;
             if (previous is { IsCompleted: false } &&
@@ -170,12 +172,24 @@ public class AtSession : IAtSession, IAsyncDisposable
         }
     }
 
-    public async Task<AtResponse> ExecutePromptCommandAsync(
+    public Task<AtResponse> ExecutePromptCommandAsync(
         string initialCommand,
         string payload,
         int promptTimeoutMs = 3000,
         int completionTimeoutMs = 15000,
-        CancellationToken ct = default)
+        CancellationToken ct = default) =>
+        ExecutePromptCommandCoreAsync(initialCommand, payload, null, promptTimeoutMs, completionTimeoutMs, ct);
+
+    /// <summary>Revalidates the original owner immediately before CMGS and the payload write, not just before waiting for the prompt.</summary>
+    public Task<AtResponse> ExecutePromptCommandGuardedAsync(string initialCommand, string payload, Action beforePayloadWrite,
+        int promptTimeoutMs = 3000, int completionTimeoutMs = 15000, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(beforePayloadWrite);
+        return ExecutePromptCommandCoreAsync(initialCommand, payload, beforePayloadWrite, promptTimeoutMs, completionTimeoutMs, ct);
+    }
+
+    private async Task<AtResponse> ExecutePromptCommandCoreAsync(string initialCommand, string payload, Action? beforePayloadWrite,
+        int promptTimeoutMs, int completionTimeoutMs, CancellationToken ct)
     {
         if (!IsOpen)
             return new AtResponse(false, Array.Empty<string>(), "Port is not open");
@@ -196,6 +210,10 @@ public class AtSession : IAtSession, IAsyncDisposable
                 return new AtResponse(false, Array.Empty<string>(), "AT_DESYNCHRONIZED");
             if (!IsOpen)
                 return new AtResponse(false, Array.Empty<string>(), "Port is not open");
+
+            linkedCts.Token.ThrowIfCancellationRequested();
+            beforePayloadWrite?.Invoke();
+            linkedCts.Token.ThrowIfCancellationRequested();
 
             var promptTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             _pendingPrompt = promptTcs;
@@ -230,7 +248,7 @@ public class AtSession : IAtSession, IAsyncDisposable
                 _pendingPrompt = null;
             }
 
-            _port.Write(payload + "\x1A");
+            WritePromptPayload(payload, linkedCts.Token, beforePayloadWrite, _port.Write);
 
             using var cmdReg = linkedCts.Token.Register(() => _router.Timeout(pending));
 
@@ -262,6 +280,16 @@ public class AtSession : IAtSession, IAsyncDisposable
                 try { _lock.Release(); } catch { }
             }
         }
+    }
+
+    // Kept as the actual production write boundary so race tests can inject a
+    // prompt-time identity change without opening a COM port or sending SMS.
+    internal static void WritePromptPayload(string payload, CancellationToken ct, Action? beforePayloadWrite, Action<string> write)
+    {
+        ct.ThrowIfCancellationRequested();
+        beforePayloadWrite?.Invoke();
+        ct.ThrowIfCancellationRequested();
+        write(payload + "\x1A");
     }
 
     private async Task ReadLoopAsync(CancellationToken readerCt)
@@ -343,6 +371,7 @@ public class AtSession : IAtSession, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cts.Cancel();
         CloseCore(out var reader);
         if (reader != null)

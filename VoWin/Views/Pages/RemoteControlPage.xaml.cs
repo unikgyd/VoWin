@@ -14,12 +14,6 @@ public partial class RemoteControlPage : INavigableView<RemoteControlViewModel>
         ViewModel = viewModel;
         DataContext = this;
         InitializeComponent();
-        QqSecretBox.Password = viewModel.QqClientSecret;
-    }
-
-    private void OnQqSecretChanged(object sender, RoutedEventArgs e)
-    {
-        if (sender is PasswordBox box) ViewModel.QqClientSecret = box.Password;
     }
 
     private void OnPreviewMouseWheel(object sender, MouseWheelEventArgs e)

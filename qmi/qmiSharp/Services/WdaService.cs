@@ -9,7 +9,11 @@ public enum WdaLinkProtocol : uint
     RawIP = 2
 }
 
-public readonly record struct WdaDataFormat(WdaLinkProtocol LinkProtocol, uint UlAggregationSize, uint DlAggregationSize);
+public readonly record struct WdaDataFormat(WdaLinkProtocol LinkProtocol, uint UlAggregationSize, uint DlAggregationSize)
+{
+    public uint? UplinkAggregationProtocol { get; init; }
+    public uint? DownlinkAggregationProtocol { get; init; }
+}
 
 public sealed class WdaService : IAsyncDisposable
 {
@@ -37,12 +41,7 @@ public sealed class WdaService : IAsyncDisposable
         var req = new QmiPacket(QmiServiceType.WDA, _clientId, 0, 0x0021);
         var resp = await _client.SendRequestAsync(req, cancellationToken).ConfigureAwait(false);
         resp.CheckResult();
-
-        var linkProt = (WdaLinkProtocol)(resp.GetTlv(0x11)?.AsUInt32() ?? (uint)WdaLinkProtocol.RawIP);
-        uint ulAgg = resp.GetTlv(0x18)?.AsUInt32() ?? 0;
-        uint dlAgg = resp.GetTlv(0x16)?.AsUInt32() ?? 0;
-
-        return new WdaDataFormat(linkProt, ulAgg, dlAgg);
+        return ParseDataFormat(resp, WdaLinkProtocol.RawIP, 0, 0);
     }
 
     public async Task<WdaDataFormat> SetDataFormatAsync(
@@ -68,12 +67,22 @@ public sealed class WdaService : IAsyncDisposable
 
         var resp = await _client.SendMessageAsync(QmiServiceType.WDA, 0x0020, builder.Build(), cancellationToken).ConfigureAwait(false);
         resp.CheckResult();
+        return ParseDataFormat(resp, linkProtocol, ulAggregationSize.GetValueOrDefault(),
+            dlAggregationSize.GetValueOrDefault());
+    }
 
-        var linkProt = (WdaLinkProtocol)(resp.GetTlv(0x11)?.AsUInt32() ?? (uint)linkProtocol);
-        uint ulAgg = resp.GetTlv(0x18)?.AsUInt32() ?? ulAggregationSize.GetValueOrDefault();
-        uint dlAgg = resp.GetTlv(0x16)?.AsUInt32() ?? dlAggregationSize.GetValueOrDefault();
-
-        return new WdaDataFormat(linkProt, ulAgg, dlAgg);
+    internal static WdaDataFormat ParseDataFormat(QmiPacket response, WdaLinkProtocol defaultProtocol,
+        uint defaultUlSize, uint defaultDlSize)
+    {
+        ArgumentNullException.ThrowIfNull(response);
+        return new WdaDataFormat(
+            (WdaLinkProtocol)(response.GetTlv(0x11)?.AsUInt32() ?? (uint)defaultProtocol),
+            response.GetTlv(0x18)?.AsUInt32() ?? defaultUlSize,
+            response.GetTlv(0x16)?.AsUInt32() ?? defaultDlSize)
+        {
+            UplinkAggregationProtocol = response.GetTlv(0x12)?.AsUInt32(),
+            DownlinkAggregationProtocol = response.GetTlv(0x13)?.AsUInt32()
+        };
     }
 
     public async ValueTask DisposeAsync()

@@ -20,14 +20,20 @@ public sealed class QmiImsBearerLease : IAsyncDisposable
     public uint? PacketDataHandle => _wds.OwnedPacketDataHandle;
     public bool IsBearerStateIndeterminate => _wds.IsBearerStateIndeterminate;
 
-    public async Task<QmiImsPdn> StartAsync(string apn, CancellationToken ct = default)
+    public Task<QmiImsPdn> StartAsync(string apn, CancellationToken ct = default) =>
+        StartAsync(apn, 4, ct);
+
+    public async Task<QmiImsPdn> StartAsync(string apn, byte ipFamily, CancellationToken ct = default)
     {
         if (!HostImsPdnParser.IsImsApn(apn))
             throw new ArgumentException("An IMS APN is required for a QMI IMS bearer.", nameof(apn));
+        if (ipFamily is not (4 or 6))
+            throw new ArgumentOutOfRangeException(nameof(ipFamily), "Only IPv4 or IPv6 QMI bearers are supported.");
         if (PacketDataHandle is not null || CurrentPdn is not null)
             throw new InvalidOperationException("This QMI IMS bearer lease is already active.");
 
-        await _wds.StartNetworkInterfaceAsync(apn, ipFamily: 4, ct).ConfigureAwait(false);
+        await _wds.SetIpFamilyAsync(ipFamily, ct).ConfigureAwait(false);
+        await _wds.StartNetworkInterfaceAsync(apn, ipFamily, ct).ConfigureAwait(false);
         try
         {
             var settings = await _wds.GetCurrentSettingsAsync(ct).ConfigureAwait(false);
@@ -39,18 +45,19 @@ public sealed class QmiImsBearerLease : IAsyncDisposable
                     .ConfigureAwait(false);
                 reportedApn = profile.ApnName;
             }
-            if (!HostImsPdnParser.IsImsApn(reportedApn) ||
-                settings.Ipv4Address is null || settings.Ipv4Address.Equals(IPAddress.Any))
-                throw new InvalidOperationException("QMI WDS did not return a valid IMS APN and IPv4 address.");
+            var local = ipFamily == 6 ? settings.Ipv6Address : settings.Ipv4Address;
+            if (!HostImsPdnParser.IsImsApn(reportedApn) || local is null ||
+                !HostImsPdnParser.IsUsableEndpointAddress(local))
+                throw new InvalidOperationException($"QMI WDS did not return a valid IMS APN and IPv{ipFamily} address.");
             var pcscf = settings.PcscfServers
-                .Where(address => address.AddressFamily == settings.Ipv4Address.AddressFamily &&
-                    !address.Equals(IPAddress.Any))
+                .Where(address => address.AddressFamily == local.AddressFamily &&
+                    HostImsPdnParser.IsUsableEndpointAddress(address) && !address.Equals(local))
                 .Distinct().ToArray();
             if (pcscf.Length == 0)
                 throw new InvalidOperationException("QMI WDS did not return an IMS P-CSCF address.");
 
             CurrentPdn = new QmiImsPdn(settings.ProfileIndex, reportedApn!,
-                settings.Ipv4Address, pcscf);
+                local, pcscf);
             return CurrentPdn;
         }
         catch (Exception original)

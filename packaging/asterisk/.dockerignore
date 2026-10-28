@@ -1,0 +1,7 @@
+credentials.json
+vowin-client.json
+config
+*.log
+admin-access.local.txt
+admin-backup-*
+admin/

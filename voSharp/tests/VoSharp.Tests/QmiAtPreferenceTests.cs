@@ -1,3 +1,4 @@
+using VoSharp.Common.Aka;
 using VoSharp.Modem;
 using VoSharp.Modem.At;
 
@@ -5,6 +6,32 @@ namespace VoSharp.Tests;
 
 public sealed class QmiAtPreferenceTests
 {
+    [Fact]
+    public async Task AtCompatibilityBypassesQmiAndReenableRequiresPhysicalBinding()
+    {
+        await using var modem = new ModemDriver("COM999", qmi: new FakeQmiReader());
+        Assert.Equal(ModemControlPreference.QmiPreferred, modem.ControlPreference);
+        Assert.True(modem.IsQmiActive);
+        var qmiReads = 0;
+        modem.ControlPreference = ModemControlPreference.AtOnly;
+        Assert.False(modem.IsQmiActive);
+        var result = await modem.PreferQmiAsync(_ => { qmiReads++; return Task.FromResult("qmi"); },
+            _ => Task.FromResult("at"), value => value.Length != 0, CancellationToken.None);
+        Assert.Equal("at", result); Assert.Equal(0, qmiReads);
+        modem.ControlPreference = ModemControlPreference.QmiPreferred;
+        result = await modem.PreferQmiAsync(_ => { qmiReads++; return Task.FromResult("qmi"); },
+            _ => Task.FromResult("at"), value => value.Length != 0, CancellationToken.None);
+        Assert.Equal("at", result); Assert.Equal(0, qmiReads);
+        Assert.Contains("binding verification", modem.LastQmiFallbackReason);
+    }
+
+    [Fact]
+    public async Task InvalidControlPreferenceCannotChangeTheDefault()
+    {
+        await using var modem = new ModemDriver("COM999", qmi: new FakeQmiReader());
+        Assert.Throws<ArgumentOutOfRangeException>(() => modem.ControlPreference = (ModemControlPreference)42);
+        Assert.Equal(ModemControlPreference.QmiPreferred, modem.ControlPreference);
+    }
     [Theory]
     [InlineData("123456789012345", "123456789012345", true)]
     [InlineData("123456789012345", "123456789012346", false)]
@@ -127,9 +154,26 @@ public sealed class QmiAtPreferenceTests
         Assert.False(atCalled);
     }
 
-    private sealed class FakeQmiReader : IQmiModemReader, IQmiImsProfileReader
+    [Fact]
+    public async Task QmiAkaNeverUsesAnUnverifiedAtPortPairing()
+    {
+        var qmi = new FakeQmiReader();
+        await using var modem = new ModemDriver("COM999", qmi: qmi);
+        var challenge = AkaChallenge.Create(new byte[16], new byte[16]);
+
+        Assert.False(await modem.TryCanAuthenticateQmiUsimAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            modem.AuthenticateQmiUsimAkaAsync(challenge));
+        Assert.Equal(0, qmi.UsimPreflightCalls);
+        Assert.Equal(0, qmi.UsimAkaCalls);
+        Assert.Contains("AT channel", modem.LastQmiFallbackReason);
+    }
+
+    private sealed class FakeQmiReader : IQmiModemReader, IQmiImsProfileReader, IQmiUsimReader
     {
         public int ActiveImsQueries { get; private set; }
+        public int UsimPreflightCalls { get; private set; }
+        public int UsimAkaCalls { get; private set; }
         public IReadOnlyList<QmiImsProfile> ConfiguredImsProfiles { get; init; } = [];
         public bool SimInserted { get; init; }
         public QmiImsPdn? ActiveImsPdn { get; init; }
@@ -149,6 +193,16 @@ public sealed class QmiAtPreferenceTests
             Task.FromResult(ConfiguredImsProfiles);
         public Task<SignalQuality?> GetSignalAsync(CancellationToken ct = default) => Task.FromResult(Signal);
         public Task<NetworkRegistration?> GetRegistrationAsync(CancellationToken ct = default) => Task.FromResult(Registration);
+        public Task<bool> CanAuthenticateUsimAsync(CancellationToken ct = default)
+        {
+            UsimPreflightCalls++;
+            return Task.FromResult(true);
+        }
+        public Task<AkaResult> AuthenticateUsimAsync(AkaChallenge challenge, CancellationToken ct = default)
+        {
+            UsimAkaCalls++;
+            throw new InvalidOperationException("Unverified QMI AKA must not be called.");
+        }
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

@@ -1,4 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <None Include="../../../contracts/ike-backoff-v1.json" Link="contracts/ike-backoff-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/ike-init-cookie-v1.json" Link="contracts/ike-init-cookie-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/ike-control-v1.json" Link="contracts/ike-control-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/swu-child-v1.json" Link="contracts/swu-child-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/eap-aka-v1.json" Link="contracts/eap-aka-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/swu-protected-v1.json" Link="contracts/swu-protected-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/swu-ike-init-v1.json" Link="contracts/swu-ike-init-v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../contracts/swu-cp-reply-v1.json" Link="contracts/swu-cp-reply-v1.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>

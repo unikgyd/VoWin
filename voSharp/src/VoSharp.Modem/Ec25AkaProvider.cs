@@ -33,6 +33,7 @@ public sealed class Ec25AkaProvider : IAkaProvider
     };
 
     private readonly IAtSession _session;
+    private string? _selectedBasicUsimAid;
 
     public Ec25AkaProvider(IAtSession session)
     {
@@ -44,6 +45,18 @@ public sealed class Ec25AkaProvider : IAkaProvider
     {
         var result = await VerifyUsimReadyAsync(expectedIccid, requireCardIccid: false, ct: ct).ConfigureAwait(false);
         return result.Ready;
+    }
+
+    /// <summary>Restores the basic-channel USIM selection after read-only eUICC inventory.
+    /// Some EC20 firmware loses its baseband USIM view if ISD-R probing is not followed
+    /// immediately by this selection. No AKA, PIN, REFRESH or profile change is sent.
+    /// This is cleanup, not a replacement for the next ICCID/CPIN readiness check.</summary>
+    public async Task<bool> RestoreBasicUsimApplicationAsync(CancellationToken ct = default)
+    {
+        if (!_session.IsOpen) return false;
+        var candidates = _selectedBasicUsimAid is { } aid ? new[] { aid }.Concat(UsimAids) : UsimAids;
+        return await SelectBasicUsimApplicationAsync(candidates.Distinct(StringComparer.OrdinalIgnoreCase), ct)
+            .ConfigureAwait(false) is not null;
     }
 
     /// <summary>
@@ -282,7 +295,10 @@ public sealed class Ec25AkaProvider : IAkaProvider
 
             var response = await ExchangeAsync(select, channelId: 0, ct).ConfigureAwait(false);
             if (response is { Length: >= 2 } && response[^2] == 0x90 && response[^1] == 0x00)
+            {
+                _selectedBasicUsimAid = aid;
                 return aid;
+            }
         }
 
         return null;
@@ -352,18 +368,23 @@ public sealed class Ec25AkaProvider : IAkaProvider
     {
         if (bytes.Length != 10) return string.Empty;
 
-        var digits = new List<char>(20);
+        Span<char> digits = stackalloc char[20];
+        var length = 0;
+        var padding = false;
         foreach (var value in bytes)
         {
-            var low = value & 0x0F;
-            var high = value >> 4;
-            if (!AppendIccidNibble(low, digits) || !AppendIccidNibble(high, digits))
-                return string.Empty;
+            for (var shift = 0; shift <= 4; shift += 4)
+            {
+                var nibble = (value >> shift) & 15;
+                if (nibble == 15) { padding = true; continue; }
+                // F is trailing padding, not a separator to be silently removed.
+                if (padding || nibble > 9) return string.Empty;
+                digits[length++] = (char)('0' + nibble);
+            }
         }
 
-        var iccid = new string(digits.ToArray());
-        return iccid.StartsWith("89", StringComparison.Ordinal) && iccid.Length is >= 18 and <= 20
-            ? iccid
+        return length is >= 18 and <= 20 && digits[0] == '8' && digits[1] == '9'
+            ? new string(digits[..length])
             : string.Empty;
     }
 
@@ -377,14 +398,6 @@ public sealed class Ec25AkaProvider : IAkaProvider
 
     private static bool HasSuccessStatus(byte[]? response) =>
         response is { Length: >= 2 } && response[^2] == 0x90 && response[^1] == 0x00;
-
-    private static bool AppendIccidNibble(int nibble, List<char> output)
-    {
-        if (nibble == 0x0F) return true;
-        if (nibble > 9) return false;
-        output.Add((char)('0' + nibble));
-        return true;
-    }
 
     private async Task<IReadOnlyList<string>> DiscoverUsimAidsAsync(CancellationToken ct)
     {

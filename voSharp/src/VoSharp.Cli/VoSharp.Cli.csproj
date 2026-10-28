@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\VoSharp.Kernel\VoSharp.Kernel.csproj" />
     <ProjectReference Include="..\VoSharp.Common\VoSharp.Common.csproj" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
   </ItemGroup>
 
   <PropertyGroup>

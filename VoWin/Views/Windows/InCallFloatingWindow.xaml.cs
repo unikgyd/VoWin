@@ -11,8 +11,10 @@ namespace VoWin.Views.Windows
     {
         private static InCallFloatingWindow? _instance;
         private Func<Task>? _onHangup;
-        private Action<bool>? _onMuteChanged;
+        private Func<bool, bool>? _onMuteChanged;
         private bool _isMuted;
+        private long _presentationVersion;
+        private bool _hangupInProgress;
         private Point _mouseDownPos;
         private DateTime _mouseDownTime;
 
@@ -20,6 +22,7 @@ namespace VoWin.Views.Windows
         {
             InitializeComponent();
             Loaded += OnLoaded;
+            Closed += (_, _) => { if (ReferenceEquals(_instance, this)) _instance = null; };
         }
 
         private void OnLoaded(object sender, RoutedEventArgs e)
@@ -35,19 +38,22 @@ namespace VoWin.Views.Windows
             string durationText,
             string? slotInfo,
             Func<Task> onHangup,
-            Action<bool> onMuteChanged,
-            bool isMuted = false)
+            Func<bool, bool> onMuteChanged,
+            bool isMuted = false,
+            bool canMute = true)
         {
             RunOnUi(() =>
             {
-                if (_instance == null || !_instance.IsLoaded)
+                if (_instance == null)
                 {
                     _instance = new InCallFloatingWindow();
                 }
 
                 _instance._onHangup = onHangup;
+                _instance._presentationVersion++;
                 _instance._onMuteChanged = onMuteChanged;
                 _instance._isMuted = isMuted;
+                _instance.BtnMute.IsEnabled = canMute;
 
                 _instance.TxtNumber.Text = string.IsNullOrWhiteSpace(number) ? "当前通话" : number;
                 _instance.TxtDuration.Text = string.IsNullOrWhiteSpace(durationText) ? "00:00" : durationText;
@@ -57,6 +63,20 @@ namespace VoWin.Views.Windows
 
                 _instance.Show();
                 _instance.Topmost = true;
+            });
+        }
+
+        public static void UpdatePresentation(string number, string duration, bool isMuted, bool canMute)
+        {
+            RunOnUi(() =>
+            {
+                if (_instance == null) return;
+                _instance.TxtNumber.Text = number;
+                // Do not hide an actionable hangup error on the next timer tick.
+                if (_instance.TxtDuration.ToolTip == null) _instance.TxtDuration.Text = duration;
+                _instance._isMuted = isMuted;
+                _instance.BtnMute.IsEnabled = canMute && !_instance._hangupInProgress;
+                _instance.UpdateMuteVisuals();
             });
         }
 
@@ -126,9 +146,14 @@ namespace VoWin.Views.Windows
         private void BtnMute_Click(object sender, RoutedEventArgs e)
         {
             e.Handled = true;
-            _isMuted = !_isMuted;
-            UpdateMuteVisuals();
-            _onMuteChanged?.Invoke(_isMuted);
+            if (!BtnMute.IsEnabled) return;
+            try
+            {
+                if (_onMuteChanged?.Invoke(!_isMuted) != true) return;
+                _isMuted = !_isMuted;
+                UpdateMuteVisuals();
+            }
+            catch (Exception ex) { BtnMute.ToolTip = $"静音失败：{ex.Message}"; }
         }
 
         private void UpdateMuteVisuals()
@@ -150,14 +175,27 @@ namespace VoWin.Views.Windows
         private async void BtnHangup_Click(object sender, RoutedEventArgs e)
         {
             e.Handled = true;
-            Dismiss();
-            if (_onHangup != null)
+            if (_onHangup != null && !_hangupInProgress)
             {
+                _hangupInProgress = true;
+                var version = _presentationVersion;
+                var callback = _onHangup;
+                BtnHangup.IsEnabled = false;
                 try
                 {
-                    await _onHangup();
+                    await callback();
+                    if (_presentationVersion == version && ReferenceEquals(_instance, this)) Dismiss();
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    if (_presentationVersion == version)
+                    {
+                        TxtDuration.Text = "挂断失败";
+                        TxtDuration.ToolTip = ex.Message;
+                        BtnHangup.ToolTip = "挂断失败，点击重试；或返回主界面查看详情";
+                    }
+                }
+                finally { _hangupInProgress = false; BtnHangup.IsEnabled = true; }
             }
         }
 

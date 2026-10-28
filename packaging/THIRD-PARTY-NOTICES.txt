@@ -1,0 +1,34 @@
+VoWin Windows x64 runtime bundle
+
+This archive contains redistributable runtime components, not personal settings,
+subscriber identities, SIM credentials, ADB authorization keys or user profiles.
+
+.NET / Windows Desktop Runtime: Microsoft, MIT; installed separately, NOT included.
+https://github.com/dotnet/runtime ; https://github.com/dotnet/wpf
+
+Host IMS handoff/recovery is managed C#; PowerShell is NOT included or used at runtime.
+
+WinDivert 2.2.2: LGPL-3.0; see host-ims/WinDivert.LICENSE.txt.
+Unmodified binaries: https://github.com/basil00/WinDivert/releases/tag/v2.2.2
+Corresponding source: https://github.com/basil00/WinDivert/tree/v2.2.2
+Advanced diagnostics allow an explicitly supplied replacement DLL/driver pair.
+
+Android Platform Tools 36.0.0: see adb/NOTICE.txt for component licenses.
+ADB source: https://android.googlesource.com/platform/packages/modules/adb/
+Only adb.exe and its two companion libraries are included, not fastboot/flashing tools.
+
+MaVo module voice runtime: commit 0443dfdaf8aec086fd76ba2ee9152fd908114524.
+https://github.com/moluncn/mavo/tree/0443dfdaf8aec086fd76ba2ee9152fd908114524
+See voice/MaVo.LICENSE.txt, MaVo.THIRD_PARTY_NOTICES.md, COPYING-GPL-2.0
+and MODULE-REPORT.md for licenses, kernel-source identity and compatibility limits.
+Kernel modules remain restricted to the tested QDC507 Linux 3.18.44 firmware.
+
+OpenCORE AMR: Apache-2.0; see OpenCORE-AMR.LICENSE.txt.
+The codec DLL is already embedded in VoSharp.Telephony.
+https://sourceforge.net/projects/opencore-amr/
+
+Optional Quectel OEM drivers: copyright their respective vendor.
+A local private-use build may include explicitly exported, unmodified signed
+INF/CAT/SYS packages from its owner. Do not publish those packages without
+the vendor's redistribution permission. Public CI does not collect OEM drivers.
+Windows' own USB Audio, WinUSB and RAS components are not copied or redistributed.

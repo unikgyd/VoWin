@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
@@ -16,11 +18,20 @@ public sealed class IkeTransport : IDisposable
     private readonly IPAddress _remoteIp;
     private readonly TimeSpan _timeout;
     private readonly CancellationTokenSource _cts = new();
-    private readonly Channel<byte[]> _espChannel = Channel.CreateUnbounded<byte[]>();
-    private readonly ConcurrentDictionary<(uint MessageId, IkeExchangeType Exchange), TaskCompletionSource<byte[]>> _pendingIkeResponses = new();
+    // UDP loss is preferable to retaining an unbounded encrypted media backlog.
+    private readonly Channel<byte[]> _espChannel = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
+    {
+        FullMode = BoundedChannelFullMode.DropOldest,
+        SingleWriter = true,
+        SingleReader = false
+    });
+    private sealed record PendingResponse(Action<byte[]> Deliver, Action Cancel);
+    private readonly ConcurrentDictionary<(uint MessageId, IkeExchangeType Exchange), PendingResponse> _pendingIkeResponses = new();
+    private readonly SemaphoreSlim _exchangeGate = new(1, 1);
     private readonly Socks5Client? _socks5Client;
     private readonly Action<string>? _diagnosticLog;
     private readonly IPAddress? _localAddress;
+    private readonly Func<IPAddress, CancellationToken, Task>? _beforeInitialSend;
 
     private Socket? _socket;
     private IPEndPoint _remoteEndpoint;
@@ -36,6 +47,8 @@ public sealed class IkeTransport : IDisposable
     public IPEndPoint? LocalEndpoint => _socket?.LocalEndPoint as IPEndPoint;
     public ChannelReader<byte[]> EspPackets => _espChannel.Reader;
     public Socks5Client? Socks5Proxy => _socks5Client;
+    internal IPAddress GatewayAddress => _socks5Client == null && _socket?.RemoteEndPoint is IPEndPoint peer
+        ? peer.Address : _remoteEndpoint.Address;
 
     /// <summary>
     /// Installs the active IKE SA request handler. After the ESP packet pump owns
@@ -51,18 +64,21 @@ public sealed class IkeTransport : IDisposable
         TimeSpan? timeout = null,
         Socks5Client? socks5Client = null,
         Action<string>? diagnosticLog = null,
-        IPAddress? localAddress = null)
+        IPAddress? localAddress = null,
+        Func<IPAddress, CancellationToken, Task>? beforeInitialSend = null)
     {
         _remoteIp = remoteIp ?? throw new ArgumentNullException(nameof(remoteIp));
         _remoteEndpoint = new IPEndPoint(remoteIp, initialPort);
         _timeout = timeout ?? TimeSpan.FromSeconds(12);
         _socks5Client = socks5Client;
         _diagnosticLog = diagnosticLog;
-        if (localAddress is not null && localAddress.AddressFamily != remoteIp.AddressFamily)
+        if (socks5Client == null && localAddress is not null && localAddress.AddressFamily != remoteIp.AddressFamily)
             throw new ArgumentException("The requested local address must use the same IP family as the ePDG endpoint.", nameof(localAddress));
         _localAddress = localAddress;
+        _beforeInitialSend = beforeInitialSend;
 
-        InitSocket(bindPort: 0);
+        try { InitSocket(bindPort: 0); }
+        catch { Dispose(); throw; }
     }
 
     private void InitSocket(int bindPort)
@@ -81,9 +97,9 @@ public sealed class IkeTransport : IDisposable
                 _socket = new Socket(_socks5RelayEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
                 var any = _socks5RelayEndpoint.AddressFamily == AddressFamily.InterNetwork
                     ? IPAddress.Any : IPAddress.IPv6Any;
-                var bindAddress = _localAddress?.AddressFamily == _socks5RelayEndpoint.AddressFamily
-                    ? _localAddress
-                    : any;
+                if (_localAddress != null && _localAddress.AddressFamily != _socks5RelayEndpoint.AddressFamily)
+                    throw new ArgumentException("The requested local address must use the SOCKS relay's IP family, not the ePDG target's family.");
+                var bindAddress = _localAddress ?? any;
                 _socket.Bind(new IPEndPoint(bindAddress, 0));
                 _socket.Connect(_socks5RelayEndpoint);
                 Log($"IKE transport SOCKS5 UDP ready; relay={_socks5RelayEndpoint}; target={_remoteEndpoint}; local={LocalEndpoint}.");
@@ -154,180 +170,153 @@ public sealed class IkeTransport : IDisposable
     /// <summary>
     /// Sends an IKE packet and waits for a matching response, with retransmissions.
     /// </summary>
-    public async Task<byte[]> RoundTripAsync(byte[] packet, CancellationToken ct = default)
+    public Task<byte[]> RoundTripAsync(byte[] packet, CancellationToken ct = default)
+        => RoundTripCoreAsync(new[] { packet }, bytes => bytes, ct);
+
+    /// <summary>Authenticated SK/SKF exchange; filters forged datagrams without ending the receive window.</summary>
+    public async Task<IkeDecryptedMessage> RoundTripEncryptedAsync(
+        IkeWire.IkeMessage header, IReadOnlyList<IkePayload> payloads, IkeSuite suite,
+        byte[] outgoingEncryption, byte[] outgoingIntegrity, byte[] incomingEncryption, byte[] incomingIntegrity,
+        bool fragmentationNegotiated, CancellationToken ct = default)
     {
-        ThrowIfDisposed();
-        ArgumentNullException.ThrowIfNull(packet);
-
-        if (packet.Length < IkeDefaults.HeaderLength)
-            throw new ArgumentException("Packet is too short for IKE header.", nameof(packet));
-
-        var expectedMessageId = BinaryPrimitives.ReadUInt32BigEndian(packet.AsSpan(20, 4));
-        var expectedExchange = (IkeExchangeType)packet[18];
-
-        // Once ESP dispatch owns the socket it also owns all receives.  Route IKE
-        // INFORMATIONAL responses through that pump instead of racing two readers.
-        if (_packetPumpTask != null)
-            return await RoundTripViaPacketPumpAsync(packet, expectedMessageId, expectedExchange, ct).ConfigureAwait(false);
-
-        byte[] wirePacket;
-        if (_isFloated)
+        var maximum = _remoteIp.AddressFamily == AddressFamily.InterNetwork ? 540 : 1228;
+        if (_socks5Client != null) maximum -= 40; // relay address/header and outer-family allowance
+        var packets = IkeProtectedMessage.Encrypt(header, payloads, suite, outgoingEncryption, outgoingIntegrity, fragmentationNegotiated, maximum);
+        var expected = new IkeWire.IkeMessage
         {
-            // Prepend 4-byte non-ESP marker: 00 00 00 00
-            wirePacket = new byte[4 + packet.Length];
-            Buffer.BlockCopy(packet, 0, wirePacket, 4, packet.Length);
-        }
-        else
-        {
-            wirePacket = packet;
-        }
-
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
-        linkedCts.CancelAfter(_timeout);
-        var token = linkedCts.Token;
-
-        var backoffs = new[]
-        {
-            TimeSpan.FromMilliseconds(500),
-            TimeSpan.FromSeconds(1),
-            TimeSpan.FromSeconds(2),
-            TimeSpan.FromSeconds(4)
+            InitiatorSpi = header.InitiatorSpi,
+            ResponderSpi = header.ResponderSpi,
+            MessageId = header.MessageId,
+            Exchange = header.Exchange,
+            Flags = (header.Flags ^ IkeFlags.Initiator) | IkeFlags.Response
         };
-
-        var recvBuffer = new byte[65535];
-
-        for (var attempt = 0; attempt < backoffs.Length; attempt++)
-        {
-            var interval = backoffs[attempt];
-            token.ThrowIfCancellationRequested();
-
-            if (_socket == null)
-                throw new InvalidOperationException("Socket is not initialized.");
-
-            var sendBuf = _socks5Client != null
-                ? Socks5Client.EncapsulateUdpDatagram(wirePacket, _remoteEndpoint)
-                : wirePacket;
-            Log($"IKE UDP TX; exchange={expectedExchange}; message-id={expectedMessageId}; attempt={attempt + 1}/{backoffs.Length}; " +
-                $"target={_remoteEndpoint}; relay={_socks5RelayEndpoint?.ToString() ?? "direct"}; ike-bytes={wirePacket.Length}; udp-bytes={sendBuf.Length}.");
-            await _socket.SendAsync(sendBuf, SocketFlags.None, token).ConfigureAwait(false);
-
-            var attemptDeadline = DateTime.UtcNow + interval;
-            while (DateTime.UtcNow < attemptDeadline)
-            {
-                token.ThrowIfCancellationRequested();
-
-                var remaining = attemptDeadline - DateTime.UtcNow;
-                if (remaining <= TimeSpan.Zero) break;
-
-                using var readCts = new CancellationTokenSource(remaining);
-                using var readLinked = CancellationTokenSource.CreateLinkedTokenSource(token, readCts.Token);
-
-                try
-                {
-                    var received = await _socket.ReceiveAsync(recvBuffer, SocketFlags.None, readLinked.Token).ConfigureAwait(false);
-                    ReadOnlySpan<byte> respSpan;
-                    if (_socks5Client != null)
-                    {
-                        var dec = Socks5Client.DecapsulateUdpDatagram(recvBuffer.AsMemory(0, received));
-                        if (dec == null || dec.Value.Length < IkeDefaults.HeaderLength)
-                        {
-                            Log($"IKE UDP RX ignored; relay={_socks5RelayEndpoint}; udp-bytes={received}; reason=invalid SOCKS5 UDP datagram or short IKE payload.");
-                            continue;
-                        }
-                        respSpan = dec.Value.Span;
-                    }
-                    else
-                    {
-                        if (received < IkeDefaults.HeaderLength)
-                            continue;
-                        respSpan = recvBuffer.AsSpan(0, received);
-                    }
-
-                    Log($"IKE UDP RX; exchange={expectedExchange}; expected-message-id={expectedMessageId}; udp-bytes={received}; ike-bytes={respSpan.Length}; relay={_socks5RelayEndpoint?.ToString() ?? "direct"}.");
-
-                    if (_isFloated)
-                    {
-                        // Check for Non-ESP Marker (4 bytes 00 00 00 00)
-                        if (respSpan.Length >= 4 + IkeDefaults.HeaderLength &&
-                            BinaryPrimitives.ReadUInt32BigEndian(respSpan[..4]) == 0)
-                        {
-                            respSpan = respSpan[4..];
-                        }
-                        else
-                        {
-                            // Could be ESP packet or keepalive; ignore for IKE state machine
-                            continue;
-                        }
-                    }
-
-                    var msgId = BinaryPrimitives.ReadUInt32BigEndian(respSpan.Slice(20, 4));
-                    var exchange = (IkeExchangeType)respSpan[18];
-                    var flags = (IkeFlags)respSpan[19];
-
-                    // Check that it is a Response matching our MessageId
-                    if (flags.HasFlag(IkeFlags.Response) && msgId == expectedMessageId && exchange == expectedExchange)
-                    {
-                        return respSpan.ToArray();
-                    }
-                    Log($"IKE UDP RX ignored; expected={expectedExchange}/{expectedMessageId}; actual={exchange}/{msgId}; flags={flags}.");
-                }
-                catch (OperationCanceledException) when (readCts.IsCancellationRequested && !token.IsCancellationRequested)
-                {
-                    // Timeout on this read attempt, retry or retransmit
-                    Log($"IKE UDP RX timeout; exchange={expectedExchange}; message-id={expectedMessageId}; attempt={attempt + 1}/{backoffs.Length}; waited-ms={(int)interval.TotalMilliseconds}; target={_remoteEndpoint}.");
-                    break;
-                }
-            }
-        }
-
-        throw new TimeoutException($"IKE exchange timed out waiting for ePDG response to Message ID {expectedMessageId}.");
+        using var receiver = new IkeEncryptedMessageReceiver(expected, suite, incomingEncryption, incomingIntegrity, fragmentationNegotiated,
+            _timeout > TimeSpan.FromMinutes(1) ? TimeSpan.FromMinutes(1) : _timeout);
+        return await RoundTripCoreAsync(packets, bytes => receiver.Accept(bytes), ct).ConfigureAwait(false);
     }
 
-    private async Task<byte[]> RoundTripViaPacketPumpAsync(
-        byte[] packet, uint expectedMessageId, IkeExchangeType expectedExchange, CancellationToken ct)
+    private async Task<T> RoundTripCoreAsync<T>(IReadOnlyList<byte[]> packets, Func<byte[], T?> accept, CancellationToken ct) where T : class
     {
-        var key = (expectedMessageId, expectedExchange);
-        var response = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!_pendingIkeResponses.TryAdd(key, response))
-            throw new InvalidOperationException($"IKE exchange {expectedExchange}/{expectedMessageId} is already pending.");
-
+        ThrowIfDisposed();
+        if (packets.Count is < 1 or > IkeProtectedMessage.MaximumFragments) throw new ArgumentException("Invalid IKE packet batch.");
+        var request = IkeWire.ParseMessage(packets[0]);
+        if (request.Flags.HasFlag(IkeFlags.Response)) throw new ArgumentException("IKE request must not have response flag.");
+        await _exchangeGate.WaitAsync(ct).ConfigureAwait(false);
+        var key = (request.MessageId, request.Exchange);
+        var response = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var deliveryGate = new object();
+        var invalid = 0;
+        void Deliver(byte[] bytes)
+        {
+            lock (deliveryGate)
+            {
+                if (response.Task.IsCompleted) return;
+                try
+                {
+                    if (bytes.Length < 28 || bytes[17] >> 4 != 2 ||
+                        BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(24, 4)) != bytes.Length ||
+                        BinaryPrimitives.ReadUInt64BigEndian(bytes.AsSpan(0, 8)) != request.InitiatorSpi ||
+                        request.ResponderSpi != 0 && BinaryPrimitives.ReadUInt64BigEndian(bytes.AsSpan(8, 8)) != request.ResponderSpi ||
+                        BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(20, 4)) != request.MessageId ||
+                        bytes[18] != (byte)request.Exchange || (bytes[19] & 0x28) != ((((byte)request.Flags ^ 8) & 8) | 32))
+                    {
+                        if (++invalid >= 256) response.TrySetException(new IkeFormatException("Too many unrelated IKE datagrams."));
+                        return;
+                    }
+                    var value = accept(bytes);
+                    if (value != null) response.TrySetResult(value);
+                }
+                catch (Exception ex) when (ex is IkeFormatException or CryptographicException)
+                {
+                    if (++invalid >= 256) response.TrySetException(new IkeFormatException("Too many invalid protected IKE datagrams."));
+                }
+                catch (Exception ex) { response.TrySetException(ex); }
+            }
+        }
         try
         {
+            ThrowIfDisposed();
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
             linkedCts.CancelAfter(_timeout);
             var token = linkedCts.Token;
-            var wirePacket = _isFloated ? new byte[4 + packet.Length] : packet;
-            if (_isFloated)
-                Buffer.BlockCopy(packet, 0, wirePacket, 4, packet.Length);
-            var sendBuf = _socks5Client != null
-                ? Socks5Client.EncapsulateUdpDatagram(wirePacket, _remoteEndpoint)
-                : wirePacket;
-            var backoffs = new[]
+            var viaPump = _packetPumpTask != null;
+            if (viaPump && !_pendingIkeResponses.TryAdd(key, new(Deliver, () => response.TrySetCanceled())))
+                throw new InvalidOperationException("IKE transaction is already pending.");
+            var gateway = new IPEndPoint(GatewayAddress, _remoteEndpoint.Port);
+            var wirePackets = packets.Select(packet =>
             {
-                TimeSpan.FromMilliseconds(500), TimeSpan.FromSeconds(1),
-                TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4)
-            };
-
-            foreach (var interval in backoffs)
+                var wire = _isFloated ? new byte[4 + packet.Length] : packet;
+                if (_isFloated) Buffer.BlockCopy(packet, 0, wire, 4, packet.Length);
+                return _socks5Client != null ? Socks5Client.EncapsulateUdpDatagram(wire, gateway) : wire;
+            }).ToArray();
+            var buffer = new byte[65535];
+            foreach (var interval in new[] { TimeSpan.FromMilliseconds(500), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4) })
             {
                 token.ThrowIfCancellationRequested();
                 if (_socket == null) throw new InvalidOperationException("Socket is not initialized.");
-                await _socket.SendAsync(sendBuf, SocketFlags.None, token).ConfigureAwait(false);
-
-                var completed = await Task.WhenAny(response.Task, Task.Delay(interval, token)).ConfigureAwait(false);
-                if (completed == response.Task)
-                    return await response.Task.ConfigureAwait(false);
+                foreach (var wire in wirePackets)
+                {
+                    if (request.Exchange == IkeExchangeType.IkeSaInit && request.MessageId == 0 && _beforeInitialSend != null)
+                    {
+                        try
+                        {
+                            await _beforeInitialSend(gateway.Address, token).ConfigureAwait(false);
+                            token.ThrowIfCancellationRequested();
+                        }
+                        catch (OperationCanceledException) when (ct.IsCancellationRequested || _cts.IsCancellationRequested) { throw; }
+                        catch (IkeAdmissionException) { throw; }
+                        catch (Exception error) { throw new IkeAdmissionException("IKE initial send admission could not be confirmed.", error); }
+                    }
+                    await _socket.SendAsync(wire, SocketFlags.None, token).ConfigureAwait(false);
+                }
+                Log($"IKE UDP TX; exchange={request.Exchange}; message-id={request.MessageId}; fragments={packets.Count}; target={_remoteEndpoint}.");
+                if (viaPump)
+                {
+                    var winner = await Task.WhenAny(response.Task, Task.Delay(interval, token)).ConfigureAwait(false);
+                    if (winner == response.Task) return await response.Task.ConfigureAwait(false);
+                    continue;
+                }
+                var started = Stopwatch.GetTimestamp();
+                while (Stopwatch.GetElapsedTime(started) < interval)
+                {
+                    token.ThrowIfCancellationRequested();
+                    var remaining = interval - Stopwatch.GetElapsedTime(started);
+                    if (remaining <= TimeSpan.Zero) break;
+                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    readCts.CancelAfter(remaining);
+                    try
+                    {
+                        var size = await _socket.ReceiveAsync(buffer, SocketFlags.None, readCts.Token).ConfigureAwait(false);
+                        var raw = _socks5Client != null
+                            ? Socks5Client.DecapsulateUdpDatagram(buffer.AsMemory(0, size)) : buffer.AsMemory(0, size);
+                        if (raw == null) continue;
+                        var memory = raw.Value;
+                        if (_isFloated)
+                        {
+                            if (memory.Length < 4 || BinaryPrimitives.ReadUInt32BigEndian(memory.Span[..4]) != 0) continue;
+                            memory = memory[4..];
+                        }
+                        Deliver(memory.ToArray());
+                        if (response.Task.IsCompleted) return await response.Task.ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested) { break; }
+                }
             }
-
-            throw new TimeoutException($"IKE exchange timed out waiting for ePDG response to Message ID {expectedMessageId}.");
+            token.ThrowIfCancellationRequested();
+            throw new TimeoutException($"IKE exchange timed out waiting for ePDG response to Message ID {request.MessageId}.");
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested && !_cts.IsCancellationRequested)
         {
-            throw new TimeoutException($"IKE exchange timed out waiting for ePDG response to Message ID {expectedMessageId}.");
+            throw new TimeoutException($"IKE exchange timed out waiting for ePDG response to Message ID {request.MessageId}.");
         }
         finally
         {
-            _pendingIkeResponses.TryRemove(key, out _);
+            lock (deliveryGate)
+            {
+                _pendingIkeResponses.TryRemove(key, out _);
+                response.TrySetCanceled(); // no callback can outlive its receiver
+            }
+            _exchangeGate.Release();
         }
     }
 
@@ -405,11 +394,13 @@ public sealed class IkeTransport : IDisposable
                     uint spi = BinaryPrimitives.ReadUInt32BigEndian(rawMemory.Span[..4]);
                     if (spi == 0)
                     {
+                        // Before NAT-T floating these bytes may be the high
+                        // half of a legitimate IKE SPI, not a Non-ESP marker.
+                        if (!_isFloated && TryDeliverIkeResponse(rawMemory.Span)) continue;
                         TryDeliverIkeResponse(rawMemory.Span[4..]);
                     }
                     else if (spi == inboundSpi || inboundSpi == 0)
                     {
-                        Console.WriteLine($"[IKE ESP RX] {rawMemory.Length} bytes, SPI=0x{spi:x8}");
                         _espChannel.Writer.TryWrite(rawMemory.ToArray());
                     }
                     else if (!TryDeliverIkeResponse(rawMemory.Span))
@@ -458,7 +449,7 @@ public sealed class IkeTransport : IDisposable
             (IkeExchangeType)ikePacket[18]);
         if (_pendingIkeResponses.TryGetValue(key, out var pending))
         {
-            pending.TrySetResult(ikePacket.ToArray());
+            pending.Deliver(ikePacket.ToArray());
             return true;
         }
         return false;
@@ -512,7 +503,7 @@ public sealed class IkeTransport : IDisposable
         _cts.Cancel();
         Volatile.Write(ref _incomingIkeRequestHandler, null);
         foreach (var pending in _pendingIkeResponses.Values)
-            pending.TrySetCanceled();
+            pending.Cancel();
         _pendingIkeResponses.Clear();
         _espChannel.Writer.TryComplete();
         _socket?.Dispose();

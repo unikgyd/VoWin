@@ -61,6 +61,7 @@ namespace VoWin.Services
         private static Window? _mainWindow;
         private static bool _isCreated = false;
         private static bool _isExiting = false;
+        private static bool _allowClose;
 
         public static void Initialize(Window mainWindow)
         {
@@ -90,11 +91,12 @@ namespace VoWin.Services
 
             mainWindow.Closing += (s, e) =>
             {
+                if (_isExiting && !_allowClose) { e.Cancel = true; RestoreMainWindow(); return; }
                 if (!_isExiting)
                 {
                     e.Cancel = true;
                     mainWindow.Hide();
-                    ShowNotification("VoWin 已最小化到托盘", "有来电时将在屏幕右上角自动弹出悬浮窗。");
+                    ShowNotification("VoWin 已最小化到托盘", "后台继续维护已启用的通信线路；来电按当前接听方式处理。");
                 }
             };
 
@@ -121,13 +123,34 @@ namespace VoWin.Services
 
         public static void ExitApplication()
         {
+            if (Application.Current is App app) _ = app.ShutdownGracefullyAsync();
+            else { CompleteExit(); Application.Current.Shutdown(); }
+        }
+
+        internal static void BeginExit()
+        {
             _isExiting = true;
+            UpdateStatus("VoWin · 正在安全退出，请等待通信资源回收");
+        }
+
+        internal static void CompleteExit()
+        {
+            _allowClose = true;
             if (_isCreated)
             {
                 Shell_NotifyIcon(NIM_DELETE, ref _nid);
                 _isCreated = false;
             }
-            Application.Current.Shutdown();
+        }
+
+        public static void UpdateStatus(string status)
+        {
+            if (!_isCreated) return;
+            var tip = status.Length > 127 ? status[..127] : status;
+            if (_nid.szTip == tip) return;
+            _nid.szTip = tip;
+            _nid.uFlags = NIF_TIP;
+            Shell_NotifyIcon(NIM_MODIFY, ref _nid);
         }
 
         public static void RestoreMainWindow(bool navigateToPhone = false)
@@ -157,7 +180,7 @@ namespace VoWin.Services
                     // Left click: restore or toggle window
                     if (_mainWindow != null)
                     {
-                        if (_mainWindow.IsVisible && _mainWindow.WindowState != WindowState.Minimized)
+                        if (!_isExiting && _mainWindow.IsVisible && _mainWindow.WindowState != WindowState.Minimized)
                         {
                             _mainWindow.Hide();
                         }
@@ -188,7 +211,7 @@ namespace VoWin.Services
 
             menu.Items.Add(new System.Windows.Controls.Separator());
 
-            var itemExit = new System.Windows.Controls.MenuItem { Header = "彻底退出 VoWin" };
+            var itemExit = new System.Windows.Controls.MenuItem { Header = _isExiting ? "正在安全退出…" : "彻底退出 VoWin", IsEnabled = !_isExiting };
             itemExit.Click += (s, e) => ExitApplication();
             menu.Items.Add(itemExit);
 

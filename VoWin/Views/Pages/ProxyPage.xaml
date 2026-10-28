@@ -8,6 +8,9 @@
   xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
   xmlns:vm="clr-namespace:VoWin.ViewModels.Pages"
   Title="网络分流与代理"
+  Background="{DynamicResource AppSurfaceBrush}"
+  UseLayoutRounding="True" SnapsToDevicePixels="True"
+  TextOptions.TextFormattingMode="Display" TextOptions.TextRenderingMode="ClearType"
   d:DataContext="{d:DesignInstance vm:ProxyViewModel, IsDesignTimeCreatable=False}"
   d:DesignHeight="720"
   d:DesignWidth="1100"
@@ -38,7 +41,9 @@
 
       <StackPanel Grid.Column="0" VerticalAlignment="Center">
         <TextBlock Style="{DynamicResource AppPageTitleStyle}" Text="代理分流" />
-        <TextBlock Style="{DynamicResource AppPageSubtitleStyle}" Text="ICCID 卡规则优先；未配置时按 IMSI MCC/PLMN 选择国家出口" />
+        <TextBlock Style="{DynamicResource AppPageSubtitleStyle}" Text="VoWiFi 互联网出口：ICCID 规则优先，再按 IMSI MCC/PLMN 匹配。" TextWrapping="Wrap" />
+        <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,4,16,0"
+                   Text="Host IMS 使用模组蜂窝承载；这里的代理不替代 QMI 控制通道，也不改变模组语音桥接。" TextWrapping="Wrap" />
       </StackPanel>
 
       <ui:Button
@@ -61,9 +66,6 @@
       BorderThickness="1"
       CornerRadius="8"
     >
-      <Border.Effect>
-        <DropShadowEffect BlurRadius="8" Direction="270" Opacity="0.04" ShadowDepth="1" Color="{DynamicResource AppShadowColor}" />
-      </Border.Effect>
       <Grid>
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="Auto" />
@@ -218,9 +220,6 @@
             CornerRadius="12"
             Padding="16,14"
           >
-            <Border.Effect>
-              <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-            </Border.Effect>
             <Grid>
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
@@ -324,9 +323,6 @@
             CornerRadius="12"
             Padding="16"
           >
-            <Border.Effect>
-              <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-            </Border.Effect>
             <Grid>
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
@@ -397,9 +393,6 @@
                             CornerRadius="8"
                             Padding="12,10"
                           >
-                            <Border.Effect>
-                              <DropShadowEffect BlurRadius="4" Direction="270" Opacity="0.03" ShadowDepth="1" Color="{DynamicResource AppShadowColor}" />
-                            </Border.Effect>
                             <ContentPresenter />
                           </Border>
                           <ControlTemplate.Triggers>
@@ -530,9 +523,6 @@
             CornerRadius="12"
             Padding="14"
           >
-            <Border.Effect>
-              <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-            </Border.Effect>
             <Grid>
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
@@ -578,9 +568,6 @@
                             CornerRadius="8"
                             Padding="12,10"
                           >
-                            <Border.Effect>
-                              <DropShadowEffect BlurRadius="4" Direction="270" Opacity="0.03" ShadowDepth="1" Color="{DynamicResource AppShadowColor}" />
-                            </Border.Effect>
                             <ContentPresenter />
                           </Border>
                           <ControlTemplate.Triggers>
@@ -667,9 +654,6 @@
               Padding="16"
               Margin="0,0,0,14"
             >
-              <Border.Effect>
-                <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-              </Border.Effect>
               <StackPanel>
                 <TextBlock FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource AppTextPrimaryBrush}" Text="➕ 添加代理节点" Margin="0,0,0,8" />
 
@@ -751,9 +735,6 @@
               CornerRadius="12"
               Padding="16"
             >
-              <Border.Effect>
-                <DropShadowEffect BlurRadius="10" Direction="270" Opacity="0.04" ShadowDepth="2" Color="{DynamicResource AppShadowColor}" />
-              </Border.Effect>
               <StackPanel>
                 <TextBlock FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource AppTextPrimaryBrush}" Text="分流优先级" Margin="0,0,0,8" />
                 <TextBlock FontSize="12" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="1. ICCID 卡规则（最高）" Margin="0,0,0,4" />
@@ -791,9 +772,6 @@
         CornerRadius="16"
         Padding="24,20"
       >
-        <Border.Effect>
-          <DropShadowEffect BlurRadius="32" Direction="270" Opacity="0.30" ShadowDepth="8" Color="{DynamicResource AppShadowColor}" />
-        </Border.Effect>
 
         <Grid>
           <Grid.RowDefinitions>

@@ -13,6 +13,8 @@ namespace VoWin.ViewModels.Pages
     public partial class MessagesViewModel : ObservableObject
     {
         private readonly IVoKernelService _kernelService;
+        public IVoKernelService GatewayService => _kernelService;
+        private bool _needsExplicitSlotSelection;
 
         public MessagesViewModel ViewModel => this;
         public ObservableCollection<SmsConversationModel> Conversations => _kernelService.Conversations;
@@ -96,10 +98,17 @@ namespace VoWin.ViewModels.Pages
 
             Slots.CollectionChanged += (s, e) =>
             {
-                if (SelectedSlot == null && Slots.Count > 0)
+                if (SelectedSlot != null && !Slots.Contains(SelectedSlot))
+                {
+                    _needsExplicitSlotSelection = true;
+                    SelectedSlot = null;
+                    StatusMessage = "所选模组已断开，请重新选择发送短信的模组 / SIM。";
+                }
+                else if (SelectedSlot == null && Slots.Count > 0 && !_needsExplicitSlotSelection)
                 {
                     SelectedSlot = Slots.FirstOrDefault();
                 }
+                SendMessageCommand.NotifyCanExecuteChanged();
             };
 
             if (Conversations.Count > 0)
@@ -166,7 +175,14 @@ namespace VoWin.ViewModels.Pages
         private Task SendMessageAsync() => SendSmsAsync();
 
         private bool CanSendMessage() =>
-            !IsSending && SelectedConversation != null && !string.IsNullOrWhiteSpace(MessageText);
+            !IsSending && SelectedConversation != null && !string.IsNullOrWhiteSpace(MessageText)
+            && SelectedSlot != null && Slots.Contains(SelectedSlot);
+
+        partial void OnSelectedSlotChanged(ModemSlot? value)
+        {
+            if (value != null && Slots.Contains(value)) _needsExplicitSlotSelection = false;
+            SendMessageCommand.NotifyCanExecuteChanged();
+        }
 
         partial void OnSelectedConversationChanged(SmsConversationModel? value)
         {
@@ -303,7 +319,17 @@ namespace VoWin.ViewModels.Pages
         [RelayCommand]
         private async Task RetryMessageAsync(SmsMessageModel? msg)
         {
-            if (msg == null || SelectedConversation == null) return;
+            if (msg == null || SelectedConversation == null || IsSending || !msg.IsFailed) return;
+            if (SelectedSlot == null || !Slots.Contains(SelectedSlot))
+            {
+                StatusMessage = "请先选择发送短信的模组 / SIM。";
+                return;
+            }
+            if (!string.IsNullOrEmpty(msg.SlotId) && !msg.SlotId.Equals(SelectedSlot.Id, StringComparison.OrdinalIgnoreCase))
+            {
+                StatusMessage = "请先选择这条短信原先使用的模组 / SIM，再重试。";
+                return;
+            }
             MessageText = msg.Text;
             await SendSmsAsync();
         }
@@ -375,9 +401,21 @@ namespace VoWin.ViewModels.Pages
 
         private async Task SendSmsAsync()
         {
-            if (SelectedConversation == null || string.IsNullOrWhiteSpace(MessageText)) return;
+            if (!CanSendMessage()) return;
+            // Pin both the conversation and SIM before the first await. Never
+            // silently move an in-flight submission to another module.
+            var conversation = SelectedConversation!;
+            var targetSlot = SelectedSlot!;
             var text = MessageText.Trim();
-            var recipient = SelectedConversation.ContactNumber;
+            var recipient = conversation.ContactNumber;
+            var requestDeliveryReport = RequestDeliveryReport;
+            var forceCellular = ForceCellular;
+
+            void RestoreDraft()
+            {
+                if (ReferenceEquals(SelectedConversation, conversation) && string.IsNullOrEmpty(MessageText))
+                    MessageText = text;
+            }
 
             IsSending = true;
             StatusMessage = "正在发送短信...";
@@ -385,23 +423,27 @@ namespace VoWin.ViewModels.Pages
             try
             {
                 MessageText = string.Empty;
-                var targetSlot = SelectedSlot ?? Slots.FirstOrDefault();
                 var res = await _kernelService.SendSmsAsync(
                     recipient,
                     text,
-                    RequestDeliveryReport,
-                    targetSlot?.Id,
-                    forceVowifi: !ForceCellular,
-                    forceCellular: ForceCellular);
+                    requestDeliveryReport,
+                    targetSlot.Id,
+                    forceVowifi: false,
+                    forceCellular: forceCellular);
 
-                StatusMessage = res.AllPartsAccepted ? "短信已成功提交发送。" : $"部分发送: {res.SubmissionStatus}";
+                if (res.AllPartsAccepted)
+                    StatusMessage = "短信已成功提交发送（不代表已送达）。";
+                else if (res.PartsAccepted > 0)
+                    StatusMessage = $"部分提交（{res.PartsAccepted}/{res.PartsTotal}）：{res.SubmissionStatus}。请勿重复发送整条短信。";
+                else
+                {
+                    RestoreDraft();
+                    StatusMessage = $"发送失败: {res.SubmissionStatus}";
+                }
             }
             catch (Exception ex)
             {
-                if (string.IsNullOrWhiteSpace(MessageText))
-                {
-                    MessageText = text;
-                }
+                RestoreDraft();
                 StatusMessage = $"发送失败: {ex.Message}";
             }
             finally

@@ -6,6 +6,7 @@
   xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
   xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
   xmlns:converters="clr-namespace:VoWin.Helpers"
+  xmlns:controls="clr-namespace:VoWin.Views.Controls"
   Title="ModemManagerPage"
   d:DesignHeight="850"
   d:DesignWidth="1200"
@@ -126,10 +127,6 @@
         <TextBlock
           Style="{DynamicResource AppPageTitleStyle}"
           Text="设备管理"
-        />
-        <TextBlock
-          Style="{DynamicResource AppPageSubtitleStyle}"
-          Text="管理 Modem、SIM、eSIM 与 VoWiFi 连接状态"
         />
       </StackPanel>
 
@@ -307,16 +304,13 @@
                   <TextBlock Grid.Row="2" FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="16,3,0,0" TextTrimming="CharacterEllipsis">
                     <Run Text="{Binding CarrierName, Mode=OneWay, FallbackValue='未识别运营商'}" />
                     <Run Text=" · " />
-                    <Run Text="{Binding Signal.Rat, Mode=OneWay, FallbackValue='LTE/NR'}" />
+                    <Run Text="{Binding Signal.Rat, Mode=OneWay, FallbackValue='制式未知', TargetNullValue='制式未知'}" />
                     <Run Text=" · " />
-                    <Run Text="{Binding Sim.Imsi, Mode=OneWay, FallbackValue='SIM 就绪'}" />
+                    <Run Text="{Binding PortName, Mode=OneWay}" />
                   </TextBlock>
 
-                  <!-- Line 4: VoWiFi State Summary -->
-                  <TextBlock Grid.Row="3" FontSize="10" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="16,2,0,0" TextTrimming="CharacterEllipsis">
-                    <Run Text="VoWiFi: " />
-                    <Run Text="{Binding VoWifi.State, Mode=OneWay, FallbackValue='Disconnected'}" />
-                  </TextBlock>
+                  <controls:GatewayStatusPanel Grid.Row="3" Margin="16,5,0,0" IsCompact="True" Slot="{Binding}"
+                      Service="{Binding DataContext.GatewayService, RelativeSource={RelativeSource AncestorType=Page}}" />
                 </Grid>
               </DataTemplate>
             </ListBox.ItemTemplate>
@@ -368,16 +362,14 @@
                 <Grid.RowDefinitions>
                   <RowDefinition Height="Auto" />
                   <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <!-- Row 1: Title + Health Badges + Action Buttons -->
                 <Grid Grid.Row="0" Margin="0,0,0,8">
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                  </Grid.ColumnDefinitions>
+                  <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
 
-                  <!-- Left: Device Title & Semantic Health Badges -->
+                  <!-- Device title; actions wrap on their own row. -->
                   <WrapPanel Grid.Column="0" VerticalAlignment="Center">
                     <!-- Device Name -->
                     <TextBlock
@@ -414,28 +406,26 @@
                       </TextBlock>
                     </Border>
 
-                    <!-- Badge 5: VoWiFi Status -->
-                    <Border Padding="7,2" Background="{Binding SelectedSlotVoWifiBg, Mode=OneWay}" CornerRadius="6" VerticalAlignment="Center">
-                      <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding SelectedSlotVoWifiBrush, Mode=OneWay}" Text="{Binding SelectedSlotVoWifiStateText, Mode=OneWay}" VerticalAlignment="Center" />
-                    </Border>
                   </WrapPanel>
 
                   <!-- Right: Unified Action Buttons -->
-                  <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                  <WrapPanel Grid.Row="1" Margin="0,10,0,0" VerticalAlignment="Center">
+                    <TextBlock Text="独立 VoWiFi：" VerticalAlignment="Center" FontSize="11" Margin="0,0,6,0"
+                               Foreground="{DynamicResource AppTextSecondaryBrush}" />
                     <!-- Action Button when Connected (Danger style: 断开连接) -->
                     <ui:Button
                       Margin="0,0,8,0"
                       Appearance="Danger"
                       Command="{Binding ExecuteVoWifiActionCommand}"
                       Icon="{ui:SymbolIcon Symbol=Stop24}"
-                      Content="断开连接"
+                      Content="断开 VoWiFi"
                       Visibility="{Binding IsVoWifiRunning, Converter={StaticResource BoolToVis}}"
                     />
 
                     <!-- Action Button when Not Connected (Primary style: 连接 VoWiFi / 取消连接 / 重新连接) -->
                     <ui:Button
                       Margin="0,0,8,0"
-                      Appearance="Primary"
+                      Appearance="Secondary"
                       Command="{Binding ExecuteVoWifiActionCommand}"
                       Icon="{ui:SymbolIcon Symbol=Play24}"
                       Content="{Binding VoWifiActionText, Mode=OneWay}"
@@ -447,7 +437,7 @@
                       Margin="0,0,8,0"
                       Appearance="Secondary"
                       Command="{Binding ReconnectVoWifiCommand}"
-                      Content="重新协商"
+                      Content="重连 VoWiFi"
                       ToolTip="重新协商并建立该卡槽的 VoWiFi IPsec 隧道"
                     />
 
@@ -460,7 +450,7 @@
                       ToolTip="安全软重启射频基带（PC/SC 读卡器不支持）"
                       IsEnabled="{Binding SelectedSlot.SupportsAtCommands}"
                     />
-                  </StackPanel>
+                  </WrapPanel>
                 </Grid>
 
                 <!-- Row 2: Secondary Identity & Port Details with Quick Copy -->
@@ -523,6 +513,9 @@
                     <Run Text=" bps" />
                   </TextBlock>
                 </WrapPanel>
+                <!-- Persistent across all tabs; never use VoWiFi alone as the device's health badge. -->
+                <controls:GatewayStatusPanel x:Name="HeaderGatewayStatus" Grid.Row="2" Margin="0,10,0,0"
+                    IsCompact="True" Service="{Binding GatewayService}" Slot="{Binding SelectedSlot}" />
               </Grid>
             </Border>
 
@@ -535,7 +528,15 @@
                 <ScrollViewer Margin="0,10,0,0" VerticalScrollBarVisibility="Auto">
                   <StackPanel>
 
-                    <!-- Card 1: 蜂窝网络与射频 (Cellular Network & Radio) -->
+                    <Border Background="{DynamicResource AppInputBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}"
+                            BorderThickness="1" CornerRadius="10" Padding="16,14" Margin="0,0,0,12">
+                      <StackPanel>
+                        <TextBlock FontSize="14" FontWeight="SemiBold" Text="网关通信状态" Margin="0,0,0,12" />
+                        <controls:GatewayStatusPanel x:Name="GatewayStatus" ShowSms="True"
+                            Service="{Binding GatewayService}" Slot="{Binding SelectedSlot}" />
+                      </StackPanel>
+                    </Border>
+                    <!-- Cellular network and radio diagnostics -->
                     <Border
                       Background="{DynamicResource AppInputBrush}"
                       BorderBrush="{DynamicResource AppCardBorderBrush}"
@@ -623,7 +624,7 @@
                           <StackPanel Grid.Column="0" Margin="0,0,10,0">
                             <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="SIM 识别码 (ICCID)" />
                             <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
-                              <TextBlock FontSize="13" FontFamily="Consolas" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.Sim.Iccid, Mode=OneWay, FallbackValue='未插卡'}" VerticalAlignment="Center" />
+                              <TextBlock FontSize="13" FontFamily="Consolas" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.Sim.Iccid, Mode=OneWay, FallbackValue='未读取', TargetNullValue='未读取'}" VerticalAlignment="Center" />
                               <ui:Button Appearance="Transparent" Padding="4,2" Margin="4,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.Sim.Iccid, Mode=OneWay}" ToolTip="复制 ICCID">
                                 <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" />
                               </ui:Button>
@@ -655,67 +656,12 @@
                       </StackPanel>
                     </Border>
 
-                    <!-- Card 3: VoWiFi 与 IMS 核心网状态 (VoWiFi & IMS Session) -->
-                    <Border
-                      Background="{DynamicResource AppInputBrush}"
-                      BorderBrush="{DynamicResource AppCardBorderBrush}"
-                      BorderThickness="1"
-                      CornerRadius="10"
-                      Padding="16,14"
-                    >
-                      <StackPanel>
-                        <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
-                          <ui:SymbolIcon Symbol="Pulse24" FontSize="16" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,8,0" VerticalAlignment="Center" />
-                          <TextBlock FontSize="14" FontWeight="SemiBold" Text="VoWiFi 隧道与 IMS 会话质量" VerticalAlignment="Center" />
-                        </StackPanel>
-
-                        <Grid>
-                          <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="*" />
-                          </Grid.ColumnDefinitions>
-
-                          <!-- 1. VoWiFi State -->
-                          <StackPanel Grid.Column="0" Margin="0,0,8,0">
-                            <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="VoWiFi 状态" />
-                            <TextBlock FontSize="15" FontWeight="Bold" Margin="0,4,0,0" Foreground="{Binding SelectedSlotVoWifiBrush, Mode=OneWay}" Text="{Binding SelectedSlotVoWifiStateText, Mode=OneWay}" />
-                            <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" Text="3GPP TS 24.302" />
-                          </StackPanel>
-
-                          <!-- 2. IMS Registration -->
-                          <StackPanel Grid.Column="1" Margin="4,0,8,0">
-                            <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="IMS 注册状态" />
-                            <TextBlock FontSize="14" FontWeight="SemiBold" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.VoWifiDiag.Ims.RegistrationState, Mode=OneWay, FallbackValue='未注册 (Offline)'}" />
-                            <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" Text="SIP 核心网响应" />
-                          </StackPanel>
-
-                          <!-- 3. P-CSCF & IP -->
-                          <StackPanel Grid.Column="2" Margin="4,0,8,0">
-                            <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="虚拟内网 IP" />
-                            <TextBlock FontSize="13" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.VoWifiDiag.Tunnel.AssignedIPv4, Mode=OneWay, FallbackValue='--'}" />
-                            <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0">
-                              <Run Text="P-CSCF: " /><Run Text="{Binding SelectedSlot.VoWifiDiag.Ims.PcscfEndpoint, Mode=OneWay, FallbackValue='--'}" />
-                            </TextBlock>
-                          </StackPanel>
-
-                          <!-- 4. Proxy Route -->
-                          <StackPanel Grid.Column="3" Margin="4,0,0,0">
-                            <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="出站代理路由" />
-                            <TextBlock FontSize="12" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SelectedSlot.ProxyUrl, Mode=OneWay, FallbackValue='跟随国家码分流'}" />
-                            <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" Text="UDP 5060 直连/代理" />
-                          </StackPanel>
-                        </Grid>
-                      </StackPanel>
-                    </Border>
-
                   </StackPanel>
                 </ScrollViewer>
               </TabItem>
 
               <!-- ================= TAB 2: IMS / VoWiFi (4-Stage Chain & Key-Value Matrix) ================= -->
-              <TabItem Header="IMS / VoWiFi" Width="auto">
+              <TabItem Header="VoWiFi 诊断" Width="auto">
                 <ScrollViewer Margin="0,10,0,0" VerticalScrollBarVisibility="Auto">
                   <StackPanel>
 
@@ -840,7 +786,7 @@
                           <!-- Field 2: Home Domain with Copy -->
                           <TextBlock Grid.Row="2" Grid.Column="0" Text="归属域 (Home Domain)" Foreground="{DynamicResource AppTextSecondaryBrush}" VerticalAlignment="Center" />
                           <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                            <TextBlock FontFamily="Consolas" FontWeight="Medium" Text="{Binding SelectedSlot.VoWifiDiag.Ims.HomeDomain, Mode=OneWay, FallbackValue='ims.mnc000.mcc460.3gppnetwork.org'}" VerticalAlignment="Center" />
+                            <TextBlock FontFamily="Consolas" FontWeight="Medium" Text="{Binding SelectedSlot.VoWifiDiag.Ims.HomeDomain, Mode=OneWay, FallbackValue='—', TargetNullValue='—'}" VerticalAlignment="Center" />
                             <ui:Button Appearance="Transparent" Padding="4,2" Margin="6,0,0,0" Command="{Binding CopyToClipboardCommand}" CommandParameter="{Binding SelectedSlot.VoWifiDiag.Ims.HomeDomain, Mode=OneWay}" ToolTip="复制域名">
                               <ui:SymbolIcon Symbol="Copy16" FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" />
                             </ui:Button>
@@ -1269,7 +1215,7 @@
               <TabItem Header="卡槽资料">
                 <ScrollViewer Margin="0,10,0,0" VerticalScrollBarVisibility="Auto">
                   <StackPanel>
-                    <TextBlock FontSize="13" FontWeight="SemiBold" Text="硬件与 SIM 卡资料（VoWiFi、飞行模式、漫游和数据开关请在首页“开关”中操作）" Margin="0,0,0,12" />
+                    <TextBlock FontSize="13" FontWeight="SemiBold" Text="硬件与 SIM 卡资料（蜂窝 IMS、独立 VoWiFi 与默认呼出请在「系统状态」管理）" TextWrapping="Wrap" Margin="0,0,0,12" />
 
                     <TextBlock FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource AppAccentBrush}" Text="模组资料" Margin="0,0,0,8" />
 

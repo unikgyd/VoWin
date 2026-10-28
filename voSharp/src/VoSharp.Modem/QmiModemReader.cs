@@ -49,8 +49,9 @@ public sealed record QmiImsPdn(byte? ProfileIndex, string Apn,
 
 /// <summary>
 /// A per-AT-port QMI endpoint. The standard Windows WWAN/AT ports are never
-/// treated as raw QMUX devices; an actual device path or local QMI proxy must
-/// be configured explicitly with VOWIN_QMI_ENDPOINT_COMx.
+/// treated as raw QMUX devices. A single Qualcomm/Quectel qcusbwwan private
+/// control file can be discovered automatically; explicit raw device/proxy
+/// endpoints remain available through VOWIN_QMI_ENDPOINT_COMx.
 /// </summary>
 public sealed class QmiModemReader : IQmiModemReader, IQmiIsimReader, IQmiUsimReader, IQmiImsProfileReader
 {
@@ -66,7 +67,12 @@ public sealed class QmiModemReader : IQmiModemReader, IQmiIsimReader, IQmiUsimRe
         ArgumentException.ThrowIfNullOrWhiteSpace(atPort);
         var key = $"VOWIN_QMI_ENDPOINT_{atPort.ToUpperInvariant()}";
         var endpoint = Environment.GetEnvironmentVariable(key);
-        if (string.IsNullOrWhiteSpace(endpoint)) return null;
+        if (string.IsNullOrWhiteSpace(endpoint))
+        {
+            var nativePath = QualcommWwanTransport.FindControlPathForAtPort(atPort);
+            return nativePath is null ? null :
+                new QmiModemReader(() => new QualcommWwanTransport(nativePath));
+        }
         if (endpoint.StartsWith("device:", StringComparison.OrdinalIgnoreCase))
         {
             var path = endpoint[7..];
@@ -227,15 +233,16 @@ public sealed class QmiModemReader : IQmiModemReader, IQmiIsimReader, IQmiUsimRe
                     token).ConfigureAwait(false);
                 apn = profile.ApnName;
             }
+            var local = settings.Ipv4Address ?? settings.Ipv6Address;
             if (string.IsNullOrWhiteSpace(apn) || !HostImsPdnParser.IsImsApn(apn) ||
-                settings.Ipv4Address is null || settings.Ipv4Address.Equals(IPAddress.Any))
+                local is null || local.Equals(IPAddress.Any) || local.Equals(IPAddress.IPv6Any))
                 return null;
             var pcscf = settings.PcscfServers
                 .Where(address => !address.Equals(IPAddress.Any) &&
-                    address.AddressFamily == settings.Ipv4Address.AddressFamily)
+                    address.AddressFamily == local.AddressFamily)
                 .Distinct().ToArray();
             if (pcscf.Length == 0) return null;
-            return new QmiImsPdn(settings.ProfileIndex, apn, settings.Ipv4Address, pcscf);
+            return new QmiImsPdn(settings.ProfileIndex, apn, local, pcscf);
         }, ct);
 
     public Task<IReadOnlyList<QmiImsProfile>> GetConfiguredImsProfilesAsync(CancellationToken ct = default) =>

@@ -6,7 +6,14 @@ using VoSharp.Sip;
 
 namespace VoSharp.Telephony.VoWifi;
 
-public sealed record SipDatagram(byte[] Payload, IPEndPoint LocalEndPoint, IPEndPoint RemoteEndPoint);
+public sealed record SipDatagramRoute(IPEndPoint LocalEndPoint, IPEndPoint RemoteEndPoint, long? SecurityGeneration = null);
+
+public sealed record SipDatagram(byte[] Payload, IPEndPoint LocalEndPoint, IPEndPoint RemoteEndPoint)
+{
+    // Trusted transport metadata, never SIP headers or network-supplied values.
+    public SipDatagramRoute? ResponseRoute { get; init; }
+    public long? SecurityGeneration { get; init; }
+}
 
 /// <summary>
 /// Robust SIP over UDP transport for IMS/VoWiFi signaling.
@@ -18,17 +25,24 @@ public class SipTransport : IDisposable
     private sealed record SipTransaction(
         TaskCompletionSource<SipMessage> FinalTcs,
         Action<SipMessage>? OnProvisional,
-        string SentBy
+        string SentBy,
+        Action<SipMessage>? OnObserved = null
     )
-    { public volatile bool ReceivedProvisional; }
+    {
+        public volatile bool ReceivedProvisional;
+        private int _registrationOutcome; // 0 pending, 1 response, -1 no-response failure committed
+        public bool ObserveResponse() => Interlocked.CompareExchange(ref _registrationOutcome, 1, 0) != -1;
+        public bool CommitSilence() => Interlocked.CompareExchange(ref _registrationOutcome, -1, 0) == 0;
+    }
 
-    private sealed record DialogAck(byte[] Bytes, string SentBy, DateTimeOffset CreatedAt);
+    private sealed record DialogAck(byte[] Bytes, string SentBy, DateTimeOffset CreatedAt, SipDatagramRoute? Route);
 
     private sealed class ServerTransaction
     {
         public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
         public SipDatagram? CachedResponse { get; set; }
         public string? AckKey { get; set; }
+        public string? ReliableProvisionalKey { get; set; }
         public CancellationTokenSource? RetransmitCts { get; set; }
         public bool RetransmitStarted { get; set; }
     }
@@ -46,6 +60,7 @@ public class SipTransport : IDisposable
     private Func<SipDatagram, CancellationToken, Task>? _datagramSender;
     private Func<CancellationToken, Task<SipDatagram>>? _datagramReceiver;
     private IPEndPoint? _localEp;
+    private long? _securityGeneration;
     private int? _boundInterfaceIndex;
     private readonly CancellationTokenSource _cts = new();
     private readonly object _connectionGate = new();
@@ -59,6 +74,8 @@ public class SipTransport : IDisposable
     public IPEndPoint? RemoteEndPoint => _remoteEp;
     public IPEndPoint? ProtectedServerEndPoint => _protectedServerLocalEp;
     public int? BoundInterfaceIndex => _boundInterfaceIndex;
+    /// <summary>Local transport lifetime only; not proof of remote reachability.</summary>
+    public bool IsDisposed => Volatile.Read(ref _disposed);
     public event EventHandler<SipMessage>? IncomingRequestReceived;
     public event EventHandler<string>? ReceiveError;
     public event Action<SipMessage>? PreparingOutgoingRequest;
@@ -242,6 +259,54 @@ public class SipTransport : IDisposable
         }
     }
 
+    /// <summary>
+    /// Switches a pinned Host IMS socket from the initial unprotected REGISTER
+    /// exchange to a user-space ESP packet transport. The reserved protected
+    /// UDP sockets stay bound only to own their ports; they never send or feed
+    /// SIP after this transition. Every later SIP datagram uses the delegates.
+    /// </summary>
+    public void ActivateUserspaceProtectedPortsOnInterface(
+        int localClientPort, int localServerPort, int pcscfServerPort,
+        Func<SipDatagram, CancellationToken, Task> sender,
+        Func<CancellationToken, Task<SipDatagram>> receiver)
+    {
+        ArgumentNullException.ThrowIfNull(sender);
+        ArgumentNullException.ThrowIfNull(receiver);
+        if (!SecurityAgreementBuilder.IsValidProtectedPort(localClientPort) ||
+            !SecurityAgreementBuilder.IsValidProtectedPort(localServerPort) ||
+            localClientPort == localServerPort ||
+            !SecurityAgreementBuilder.IsValidProtectedPort(pcscfServerPort))
+            throw new ArgumentOutOfRangeException(nameof(localClientPort));
+        lock (_connectionGate)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(SipTransport));
+            if (_boundInterfaceIndex is not > 0 || _udp is null ||
+                _localEp is null || _remoteEp is null ||
+                _protectedServerLocalEp is not null ||
+                _datagramSender is not null || _datagramReceiver is not null ||
+                _reservedProtectedClientUdp is null || _reservedProtectedServerUdp is null)
+                throw new InvalidOperationException("User-space IMS ESP requires one pinned initial socket and two reserved protected ports.");
+            if (!_transactions.IsEmpty)
+                throw new InvalidOperationException("Cannot switch IMS SIP transport during a client transaction.");
+            var client = (IPEndPoint)_reservedProtectedClientUdp.Client.LocalEndPoint!;
+            var server = (IPEndPoint)_reservedProtectedServerUdp.Client.LocalEndPoint!;
+            if (client.Port != localClientPort || server.Port != localServerPort ||
+                !client.Address.Equals(_localEp.Address) ||
+                !server.Address.Equals(_localEp.Address))
+                throw new InvalidOperationException("User-space IMS ESP ports differ from the pre-bound reservation.");
+
+            _localEp = client;
+            _protectedServerLocalEp = server;
+            _remoteEp = new IPEndPoint(_remoteEp.Address, pcscfServerPort);
+            _datagramSender = sender;
+            _datagramReceiver = receiver;
+            // The receive pump blocked on the initial socket wakes and then
+            // selects _datagramReceiver. Keep the disposed reference until
+            // Dispose so its rebinding exception takes the existing path.
+            _udp.Dispose();
+        }
+    }
+
     /// <summary>Connects via a custom sender/receiver delegate (e.g. userspace ESP encapsulation).</summary>
     public void ConnectCustom(Func<byte[], Task> sender, Func<CancellationToken, Task<byte[]>> receiver, int timeoutMs = 15000)
     {
@@ -285,11 +350,26 @@ public class SipTransport : IDisposable
         if (_rxTask != null) throw new InvalidOperationException("SipTransport is already connected.");
     }
 
-    public void SetEndpoints(IPEndPoint local, IPEndPoint remote)
+    public void SetEndpoints(IPEndPoint local, IPEndPoint remote, long? securityGeneration = null)
     {
         if (_datagramSender == null) throw new InvalidOperationException("Endpoint switching requires a datagram transport.");
-        _localEp = local;
-        _remoteEp = remote;
+        lock (_connectionGate)
+        {
+            _localEp = local;
+            _remoteEp = remote;
+            _securityGeneration = securityGeneration;
+        }
+    }
+
+    private SipDatagramRoute? CaptureRequestRoute(SipMessage request)
+    {
+        if (request.OutgoingRoute is { } route)
+        {
+            if (_datagramSender is null) throw new InvalidOperationException("A transaction route requires a datagram transport.");
+            return route;
+        }
+        lock (_connectionGate)
+            return _datagramSender is null ? null : new(_localEp!, _remoteEp!, _securityGeneration);
     }
 
     private static string GetTxKey(SipMessage message)
@@ -361,13 +441,43 @@ public class SipTransport : IDisposable
         if (rport)
             top = Regex.Replace(top, @";\s*rport(?:\s*=\s*\d*)?(?=\s*;|\s*$)", $";rport={packet.RemoteEndPoint.Port}", RegexOptions.IgnoreCase);
         response.Headers["Via"][0] = top + ";received=" + packet.RemoteEndPoint.Address + tail;
-        var reply = new SipDatagram(response.ToBytes(), packet.LocalEndPoint, new IPEndPoint(packet.RemoteEndPoint.Address, port));
+        // 3GPP TS 33.203 UDP mode is asymmetric: the UE receives on its
+        // protected server port from the P-CSCF client port, but sends *all*
+        // requests and responses from its protected client port to the P-CSCF
+        // server port. Replying on the received 4-tuple makes the ESP packet
+        // cryptographically valid yet undeliverable to the P-CSCF SIP server.
+        var protectedHostLeg = _boundInterfaceIndex is not null &&
+            _protectedServerLocalEp is not null;
+        var (localReply, remoteReply) = SelectResponseEndpoints(
+            protectedHostLeg, packet.LocalEndPoint,
+            new IPEndPoint(packet.RemoteEndPoint.Address, port),
+            _localEp, _remoteEp);
+        var generation = packet.ResponseRoute?.SecurityGeneration;
+        if (packet.ResponseRoute is { } negotiatedRoute)
+        {
+            if (!negotiatedRoute.LocalEndPoint.Address.Equals(packet.LocalEndPoint.Address) ||
+                !negotiatedRoute.RemoteEndPoint.Address.Equals(packet.RemoteEndPoint.Address) ||
+                negotiatedRoute.LocalEndPoint.Port is < 1 or > 65535 || negotiatedRoute.RemoteEndPoint.Port is < 1 or > 65535)
+                throw new InvalidOperationException("Protected response route is not pinned to the received UE/P-CSCF.");
+            localReply = negotiatedRoute.LocalEndPoint;
+            remoteReply = negotiatedRoute.RemoteEndPoint;
+        }
+        var reply = new SipDatagram(response.ToBytes(), localReply, remoteReply) { SecurityGeneration = generation };
+        if (Environment.GetEnvironmentVariable("VOWIN_HOST_IMS_SIP_META_TRACE") == "1")
+            Console.Error.WriteLine($"[IMS SIP TX] status={response.StatusCode} bytes={reply.Payload.Length} local-port={reply.LocalEndPoint.Port} remote-port={reply.RemoteEndPoint.Port}");
         if (_serverTransactions.TryGetValue(serverTransactionKey, out var transaction))
         {
-            transaction.CachedResponse = reply;
             var cseqMethod = (response.GetHeader("CSeq") ?? string.Empty)
                 .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
                 .LastOrDefault();
+            if (response.StatusCode >= 200 &&
+                cseqMethod?.Equals("INVITE", StringComparison.OrdinalIgnoreCase) == true &&
+                transaction.ReliableProvisionalKey is not null)
+            {
+                StopServerRetransmission(transaction);
+                transaction.ReliableProvisionalKey = null;
+            }
+            transaction.CachedResponse = reply;
             if (response.StatusCode is >= 200 and < 300 &&
                 cseqMethod?.Equals("INVITE", StringComparison.OrdinalIgnoreCase) == true)
             {
@@ -377,13 +487,40 @@ public class SipTransport : IDisposable
                     transaction.RetransmitCts ??= CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
                 }
             }
+            else if (response.StatusCode is > 100 and < 200 &&
+                cseqMethod?.Equals("INVITE", StringComparison.OrdinalIgnoreCase) == true &&
+                (response.GetHeader("Require") ?? string.Empty).Split(',')
+                    .Any(option => option.Trim().Equals("100rel", StringComparison.OrdinalIgnoreCase)) &&
+                int.TryParse(response.GetHeader("RSeq"), out var rseq))
+            {
+                lock (transaction)
+                {
+                    transaction.ReliableProvisionalKey = $"{GetAckKey(response)}:{rseq}";
+                    transaction.RetransmitCts ??= CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+                }
+            }
         }
         await SendDatagramAsync(reply, ct).ConfigureAwait(false);
+        if (response.StatusCode is >= 200 and < 300 &&
+            (response.GetHeader("CSeq") ?? string.Empty).EndsWith(" PRACK", StringComparison.OrdinalIgnoreCase))
+            AcknowledgeReliableProvisional(SipMessage.Parse(packet.Payload));
         if (transaction?.RetransmitCts != null)
-            StartInviteFinalRetransmission(transaction);
+            StartServerRetransmission(transaction);
     }
 
-    private void StartInviteFinalRetransmission(ServerTransaction transaction)
+    internal static (IPEndPoint Local, IPEndPoint Remote) SelectResponseEndpoints(
+        bool protectedHostLeg, IPEndPoint receivedLocal, IPEndPoint viaDestination,
+        IPEndPoint? protectedClient, IPEndPoint? pcscfServer)
+    {
+        if (!protectedHostLeg) return (receivedLocal, viaDestination);
+        if (protectedClient is null || pcscfServer is null ||
+            !protectedClient.Address.Equals(receivedLocal.Address) ||
+            !pcscfServer.Address.Equals(viaDestination.Address))
+            throw new InvalidOperationException("Protected IMS response endpoints are not pinned to the received bearer/P-CSCF.");
+        return (protectedClient, pcscfServer);
+    }
+
+    private void StartServerRetransmission(ServerTransaction transaction)
     {
         CancellationToken token;
         lock (transaction)
@@ -416,10 +553,31 @@ public class SipTransport : IDisposable
     private void AcknowledgeInviteFinal(SipMessage ack)
     {
         var ackKey = GetAckKey(ack);
+        if (Environment.GetEnvironmentVariable("VOWIN_HOST_IMS_SIP_META_TRACE") == "1")
+            Console.Error.WriteLine("[IMS SIP RX] ACK");
         foreach (var transaction in _serverTransactions.Values)
         {
             if (!string.Equals(transaction.AckKey, ackKey, StringComparison.Ordinal)) continue;
             StopServerRetransmission(transaction);
+        }
+    }
+
+    private void AcknowledgeReliableProvisional(SipMessage prack)
+    {
+        var rack = Regex.Match(prack.GetHeader("RAck") ?? string.Empty,
+            @"^\s*(\d+)\s+(\d+)\s+INVITE\s*$", RegexOptions.IgnoreCase);
+        if (!rack.Success) return;
+        var invite = new SipMessage();
+        invite.SetHeader("Call-ID", prack.GetHeader("Call-ID") ?? string.Empty);
+        invite.SetHeader("From", prack.GetHeader("From") ?? string.Empty);
+        invite.SetHeader("To", prack.GetHeader("To") ?? string.Empty);
+        invite.SetHeader("CSeq", $"{rack.Groups[2].Value} INVITE");
+        var key = $"{GetAckKey(invite)}:{rack.Groups[1].Value}";
+        foreach (var transaction in _serverTransactions.Values)
+        {
+            if (!string.Equals(transaction.ReliableProvisionalKey, key, StringComparison.Ordinal)) continue;
+            StopServerRetransmission(transaction);
+            transaction.ReliableProvisionalKey = null;
         }
     }
 
@@ -430,6 +588,7 @@ public class SipTransport : IDisposable
         {
             cts = transaction.RetransmitCts;
             transaction.RetransmitCts = null;
+            transaction.RetransmitStarted = false;
         }
         if (cts == null) return;
         try { cts.Cancel(); } catch (ObjectDisposedException) { }
@@ -448,11 +607,12 @@ public class SipTransport : IDisposable
         }
     }
 
-    private async Task SendRequestBytesAsync(byte[] bytes, CancellationToken ct)
+    private async Task SendRequestBytesAsync(byte[] bytes, CancellationToken ct, SipDatagramRoute? route = null)
     {
         if (_datagramSender != null)
         {
-            await _datagramSender(new SipDatagram(bytes, _localEp!, _remoteEp!), ct).ConfigureAwait(false);
+            await _datagramSender(new SipDatagram(bytes, route?.LocalEndPoint ?? _localEp!, route?.RemoteEndPoint ?? _remoteEp!)
+                { SecurityGeneration = route?.SecurityGeneration }, ct).ConfigureAwait(false);
             return;
         }
         if (_customSender != null)
@@ -523,6 +683,26 @@ public class SipTransport : IDisposable
                 {
                     if (sipMsg.Method.Equals("ACK", StringComparison.OrdinalIgnoreCase))
                         AcknowledgeInviteFinal(sipMsg);
+                    if (sipMsg.Method.Equals("INVITE", StringComparison.OrdinalIgnoreCase) &&
+                        Environment.GetEnvironmentVariable("VOWIN_HOST_IMS_SIP_META_TRACE") == "1")
+                    {
+                        // Only SDP precondition attributes are logged. Full SIP/SDP
+                        // would expose the subscriber identity and caller details.
+                        var qos = Regex.Matches(sipMsg.Body, @"(?im)^a=(?:curr|des|conf):qos[^\r\n]*")
+                            .Select(match => match.Value)
+                            .ToArray();
+                        Console.Error.WriteLine($"[IMS SIP RX] INVITE bytes={buffer.Length} require={sipMsg.GetHeader("Require") ?? "none"} supported={sipMsg.GetHeader("Supported") ?? "none"} session-timer={(sipMsg.GetHeader("Session-Expires") is null ? "none" : "present")} qos=[{string.Join(" | ", qos)}]");
+                    }
+                    if (Environment.GetEnvironmentVariable("VOWIN_HOST_IMS_SIP_META_TRACE") == "1" &&
+                        sipMsg.Method.Equals("PRACK", StringComparison.OrdinalIgnoreCase))
+                        Console.Error.WriteLine($"[IMS SIP RX] PRACK rack={sipMsg.GetHeader("RAck") ?? "none"} body-bytes={sipMsg.RawBody?.Length ?? 0}");
+                    if (Environment.GetEnvironmentVariable("VOWIN_HOST_IMS_SIP_META_TRACE") == "1" &&
+                        sipMsg.Method.Equals("UPDATE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var qos = Regex.Matches(sipMsg.Body, @"(?im)^a=(?:curr|des|conf):qos[^\r\n]*")
+                            .Select(match => match.Value).ToArray();
+                        Console.Error.WriteLine($"[IMS SIP RX] UPDATE body-bytes={sipMsg.RawBody?.Length ?? 0} qos=[{string.Join(" | ", qos)}]");
+                    }
                     if (packet != null)
                     {
                         var context = packet;
@@ -548,6 +728,8 @@ public class SipTransport : IDisposable
                     if (_transactions.TryGetValue(key, out var tx) &&
                         string.Equals(sentBy, tx.SentBy, StringComparison.OrdinalIgnoreCase))
                     {
+                        if (!tx.ObserveResponse()) continue;
+                        tx.OnObserved?.Invoke(sipMsg);
                         if (sipMsg.StatusCode < 200)
                         {
                             tx.ReceivedProvisional = true;
@@ -558,12 +740,12 @@ public class SipTransport : IDisposable
                             tx.FinalTcs.TrySetResult(sipMsg);
                         }
                     }
-                    else if (sipMsg.StatusCode is >= 200 and < 300 &&
+                    else if (sipMsg.StatusCode is >= 200 and < 700 &&
                              (sipMsg.GetHeader("CSeq") ?? string.Empty).EndsWith(" INVITE", StringComparison.OrdinalIgnoreCase) &&
                              _dialogAcks.TryGetValue(GetAckKey(sipMsg), out var ack) &&
                              string.Equals(sentBy, ack.SentBy, StringComparison.OrdinalIgnoreCase))
                     {
-                        await SendRequestBytesAsync(ack.Bytes, _cts.Token).ConfigureAwait(false);
+                        await SendRequestBytesAsync(ack.Bytes, _cts.Token, ack.Route).ConfigureAwait(false);
                     }
                 }
             }
@@ -630,16 +812,17 @@ public class SipTransport : IDisposable
 
         if (request.IsRequest)
             PreparingOutgoingRequest?.Invoke(request);
+        var route = CaptureRequestRoute(request);
         var rawBytes = request.ToBytes();
         if (request.IsRequest && request.Method.Equals("ACK", StringComparison.OrdinalIgnoreCase))
         {
             var sentBy = GetViaSentBy(request);
             if (sentBy != null)
-                _dialogAcks[GetAckKey(request)] = new DialogAck(rawBytes, sentBy, DateTimeOffset.UtcNow);
+                _dialogAcks[GetAckKey(request)] = new DialogAck(rawBytes, sentBy, DateTimeOffset.UtcNow, route);
         }
         if (_datagramSender != null)
         {
-            await _datagramSender(new SipDatagram(rawBytes, _localEp!, _remoteEp!), ct).ConfigureAwait(false);
+            await SendRequestBytesAsync(rawBytes, ct, route).ConfigureAwait(false);
             return;
         }
         if (_customSender != null)
@@ -654,28 +837,76 @@ public class SipTransport : IDisposable
     /// <summary>
     /// Sends a SIP request and processes responses via transaction registration.
     /// </summary>
-    public async Task<SipMessage> SendAndReceiveFinalAsync(
+    public Task<SipMessage> SendAndReceiveFinalAsync(
         SipMessage request,
         Action<SipMessage>? onProvisional = null,
         int timeoutMs = 30000,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int provisionalTimeoutMs = 0)
+        => SendAndReceiveFinalCoreAsync(request, onProvisional, timeoutMs, ct, provisionalTimeoutMs, null, null);
+
+    internal Task<SipMessage> SendRegistrationAsync(SipMessage request, Action<SipMessage> observeResponse,
+        Func<bool> hasObservedResponse, CancellationToken ct)
+    {
+        if (!request.IsRequest || !request.Method.Equals("REGISTER", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Registration proof is only valid for REGISTER.", nameof(request));
+        return SendAndReceiveFinalCoreAsync(request, null, _timeoutMs, ct, 0, hasObservedResponse, observeResponse);
+    }
+
+    private async Task<SipMessage> SendAndReceiveFinalCoreAsync(SipMessage request,
+        Action<SipMessage>? onProvisional, int timeoutMs, CancellationToken ct, int provisionalTimeoutMs,
+        Func<bool>? registrationResponseObserved, Action<SipMessage>? registrationObserver)
     {
         if (_udp == null && _customSender == null && _datagramSender == null)
             throw new InvalidOperationException("SipTransport not connected.");
+        if (timeoutMs <= 0 || provisionalTimeoutMs < 0)
+            throw new ArgumentOutOfRangeException(nameof(timeoutMs));
 
         PreparingOutgoingRequest?.Invoke(request);
+        var route = CaptureRequestRoute(request);
         var key = GetTxKey(request);
         var sentBy = GetViaSentBy(request) ?? throw new FormatException("SIP transaction requires a top Via sent-by value.");
         var finalTcs = new TaskCompletionSource<SipMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var tx = new SipTransaction(finalTcs, onProvisional, sentBy);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
+        var extendedAfterProvisional = 0;
+        var tx = new SipTransaction(finalTcs, provisional =>
+        {
+            // INVITE Timer B only governs the Calling state. Once the network
+            // replies provisionally, keep the early dialog alive while it rings.
+            if (request.Method == "INVITE" && provisionalTimeoutMs > 0 &&
+                Interlocked.Exchange(ref extendedAfterProvisional, 1) == 0)
+                cts.CancelAfter(provisionalTimeoutMs);
+            onProvisional?.Invoke(provisional);
+        }, sentBy, registrationObserver);
         if (!_transactions.TryAdd(key, tx)) throw new InvalidOperationException($"SIP transaction already active: {key}");
+
+        bool CanIssueRegistrationProof() => registrationResponseObserved is not null &&
+            !ct.IsCancellationRequested && !_cts.IsCancellationRequested &&
+            !registrationResponseObserved() && tx.CommitSilence();
+
+        async Task SendTransactionBytesAsync(byte[] bytes)
+        {
+            try { await SendRequestBytesAsync(bytes, cts.Token, route).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (registrationResponseObserved is not null &&
+                cts.IsCancellationRequested && !ct.IsCancellationRequested && !_cts.IsCancellationRequested)
+            {
+                var timeout = new TimeoutException("IMS REGISTER send deadline expired.");
+                if (CanIssueRegistrationProof()) throw new SipRegistrationTransportException(timeout);
+                throw timeout;
+            }
+            catch (Exception error) when (registrationResponseObserved is not null &&
+                SipRegistrationTransportException.IsNetworkFailure(error))
+            {
+                if (CanIssueRegistrationProof()) throw new SipRegistrationTransportException(error);
+                throw;
+            }
+        }
 
         try
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
             cts.CancelAfter(timeoutMs);
             var encodedRequest = request.ToBytes();
-            await SendRequestBytesAsync(encodedRequest, cts.Token).ConfigureAwait(false);
+            await SendTransactionBytesAsync(encodedRequest).ConfigureAwait(false);
             int interval = 500;
             try
             {
@@ -688,14 +919,18 @@ public class SipTransport : IDisposable
                     // the timer. Never emit one more INVITE after completion.
                     if (finalTcs.Task.IsCompleted) break;
                     if (!(tx.ReceivedProvisional && request.Method == "INVITE"))
-                        await SendRequestBytesAsync(encodedRequest, cts.Token).ConfigureAwait(false);
+                        await SendTransactionBytesAsync(encodedRequest).ConfigureAwait(false);
                     interval = tx.ReceivedProvisional ? 4000 : Math.Min(interval * 2, 4000);
                 }
                 return await finalTcs.Task.ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested && !_cts.IsCancellationRequested)
             {
-                throw new TimeoutException($"SIP: no final response for {key} within {timeoutMs} ms.");
+                var elapsedLimit = Volatile.Read(ref extendedAfterProvisional) != 0
+                    ? provisionalTimeoutMs : timeoutMs;
+                var timeout = new TimeoutException($"SIP: no final response for {key} within {elapsedLimit} ms.");
+                if (CanIssueRegistrationProof()) throw new SipRegistrationTransportException(timeout);
+                throw timeout;
             }
         }
         finally

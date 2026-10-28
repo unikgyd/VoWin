@@ -27,9 +27,18 @@ public sealed class AmrNativeCodec : IDisposable
 
             NativeLibrary.SetDllImportResolver(typeof(AmrNativeCodec).Assembly, (libName, assembly, searchPath) =>
             {
-                if (libName.Equals("opencore-amr", StringComparison.OrdinalIgnoreCase) ||
+                if (libName.Equals("opencore-amrwb", StringComparison.OrdinalIgnoreCase) ||
+                    libName.Equals("opencore-amr", StringComparison.OrdinalIgnoreCase) ||
                     libName.Equals("opencore-amr.dll", StringComparison.OrdinalIgnoreCase))
                 {
+                    if (!OperatingSystem.IsWindows())
+                    {
+                        // Linux distributions ship narrowband and wideband as
+                        // separate SONAMEs. Never try/extract the Windows PE DLL.
+                        foreach (var name in GetUnixLibraryNames(libName.Equals("opencore-amrwb", StringComparison.OrdinalIgnoreCase), OperatingSystem.IsMacOS()))
+                            if (NativeLibrary.TryLoad(name, assembly, searchPath, out var unixHandle)) return unixHandle;
+                        return IntPtr.Zero;
+                    }
                     string[] candidates =
                     [
                         ExtractEmbeddedLibrary(),
@@ -54,6 +63,10 @@ public sealed class AmrNativeCodec : IDisposable
             _dllResolverRegistered = true;
         }
     }
+
+    internal static string[] GetUnixLibraryNames(bool wideband, bool macOS = false) => macOS
+        ? [wideband ? "libopencore-amrwb.0.dylib" : "libopencore-amrnb.0.dylib", wideband ? "libopencore-amrwb.dylib" : "libopencore-amrnb.dylib"]
+        : [wideband ? "libopencore-amrwb.so.0" : "libopencore-amrnb.so.0", wideband ? "libopencore-amrwb.so" : "libopencore-amrnb.so"];
 
     // A single-file publish cannot load this codec directly from the bundle. Keep
     // it as an assembly resource and materialize it only for the Windows loader.
@@ -109,13 +122,13 @@ public sealed class AmrNativeCodec : IDisposable
     [DllImport("opencore-amr", CallingConvention = CallingConvention.Cdecl)]
     private static extern int Encoder_Interface_Encode(IntPtr state, int mode, short[] inPcm, byte[] outFrame, int forceSpeech);
 
-    [DllImport("opencore-amr", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("opencore-amrwb", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr D_IF_init();
 
-    [DllImport("opencore-amr", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("opencore-amrwb", CallingConvention = CallingConvention.Cdecl)]
     private static extern void D_IF_exit(IntPtr state);
 
-    [DllImport("opencore-amr", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport("opencore-amrwb", CallingConvention = CallingConvention.Cdecl)]
     private static extern void D_IF_decode(IntPtr state, byte[] inFrame, short[] outPcm, int bfi);
 
     private IntPtr _nbDecState = IntPtr.Zero;
@@ -128,6 +141,7 @@ public sealed class AmrNativeCodec : IDisposable
     private bool _isDisposed;
 
     public bool IsAvailable { get; private set; }
+    public bool IsWidebandAvailable => _wbDecState != IntPtr.Zero && !_isDisposed;
 
     public AmrNativeCodec(bool initEncoder = true)
     {
@@ -138,14 +152,16 @@ public sealed class AmrNativeCodec : IDisposable
             {
                 _nbEncState = Encoder_Interface_init(0);
             }
-            _wbDecState = D_IF_init();
             IsAvailable = _nbDecState != IntPtr.Zero;
         }
-        catch (Exception ex)
+        catch
         {
             IsAvailable = false;
-            Console.WriteLine($"[AmrNativeCodec] Native opencore-amr initialization warning: {ex.Message}");
+            Console.Error.WriteLine("[AmrNativeCodec] AMR-NB native codec unavailable.");
         }
+        // Optional wideband support must not disable a working NB decoder/encoder.
+        try { _wbDecState = D_IF_init(); }
+        catch { Console.Error.WriteLine("[AmrNativeCodec] AMR-WB native codec unavailable; narrowband availability is unchanged."); }
     }
 
     /// <summary>
@@ -153,7 +169,7 @@ public sealed class AmrNativeCodec : IDisposable
     /// </summary>
     public short[] DecodeAmrNbFrame(byte[] amrFrame, bool bfi = false)
     {
-        if (!IsAvailable || _nbDecState == IntPtr.Zero || amrFrame == null || amrFrame.Length == 0)
+        if (!IsAvailable || _nbDecState == IntPtr.Zero || !AmrNbDecoder.IsStorageFrameValid(amrFrame))
             return new short[160];
 
         var pcm = new short[160];
@@ -162,7 +178,7 @@ public sealed class AmrNativeCodec : IDisposable
             if (_isDisposed || _nbDecState == IntPtr.Zero) return pcm;
             try
             {
-                Decoder_Interface_Decode(_nbDecState, amrFrame, pcm, bfi ? 1 : 0);
+                Decoder_Interface_Decode(_nbDecState, amrFrame.ToArray(), pcm, bfi || (amrFrame[0] & 4) == 0 ? 1 : 0);
             }
             catch
             {
@@ -177,7 +193,7 @@ public sealed class AmrNativeCodec : IDisposable
     /// </summary>
     public short[] DecodeAmrWbFrame(byte[] amrWbFrame, bool bfi = false)
     {
-        if (!IsAvailable || _wbDecState == IntPtr.Zero || amrWbFrame == null || amrWbFrame.Length == 0)
+        if (!IsWidebandAvailable || !AmrNbDecoder.IsStorageFrameValid(amrWbFrame, wideband: true))
             return new short[160];
 
         var pcm16k = new short[320];
@@ -186,7 +202,7 @@ public sealed class AmrNativeCodec : IDisposable
             if (_isDisposed || _wbDecState == IntPtr.Zero) return new short[160];
             try
             {
-                D_IF_decode(_wbDecState, amrWbFrame, pcm16k, bfi ? 1 : 0);
+                D_IF_decode(_wbDecState, amrWbFrame.ToArray(), pcm16k, bfi || (amrWbFrame[0] & 4) == 0 ? 1 : 0);
             }
             catch
             {
@@ -211,7 +227,7 @@ public sealed class AmrNativeCodec : IDisposable
     /// </summary>
     public byte[] EncodeAmrNbFrame(short[] pcmSamples, int mode = 7)
     {
-        if (!IsAvailable || _nbEncState == IntPtr.Zero || pcmSamples == null || pcmSamples.Length < 160)
+        if (!IsAvailable || _nbEncState == IntPtr.Zero || pcmSamples == null || pcmSamples.Length < 160 || mode is < 0 or > 7)
             return Array.Empty<byte>();
 
         byte[] outBuffer = new byte[64];
@@ -221,7 +237,9 @@ public sealed class AmrNativeCodec : IDisposable
             if (_isDisposed || _nbEncState == IntPtr.Zero) return Array.Empty<byte>();
             try
             {
-                encodedBytes = Encoder_Interface_Encode(_nbEncState, mode, pcmSamples, outBuffer, 0);
+                // OpenCORE preprocesses its input in place despite the C
+                // wrapper's const signature. Never mutate caller-owned audio.
+                encodedBytes = Encoder_Interface_Encode(_nbEncState, mode, pcmSamples[..160], outBuffer, 0);
             }
             catch
             {
@@ -243,7 +261,7 @@ public sealed class AmrNativeCodec : IDisposable
     /// </summary>
     public static byte[] AmrFrameToRtpPayload(byte[] amrFrame, bool octetAligned = false)
     {
-        if (amrFrame == null || amrFrame.Length == 0)
+        if (!AmrNbDecoder.IsStorageFrameValid(amrFrame))
             return Array.Empty<byte>();
 
         if (octetAligned)
@@ -252,6 +270,10 @@ public sealed class AmrNativeCodec : IDisposable
             var payload = new byte[1 + amrFrame.Length];
             payload[0] = 0xF0; // CMR: 1111 (no mode request), reserved: 0000
             Buffer.BlockCopy(amrFrame, 0, payload, 1, amrFrame.Length);
+            payload[1] &= 0x7c;
+            ReadOnlySpan<int> bits = [95, 103, 118, 134, 148, 159, 204, 244, 39, -1, -1, -1, -1, -1, -1, 0];
+            var alignedSpeechBits = bits[amrFrame[0] >> 3 & 15];
+            if (alignedSpeechBits % 8 != 0) payload[^1] &= (byte)(0xff << (8 - alignedSpeechBits % 8));
             return payload;
         }
 
@@ -265,28 +287,24 @@ public sealed class AmrNativeCodec : IDisposable
         byte ft = (byte)((toc >> 3) & 0x0F);
         byte q = (byte)((toc >> 2) & 0x01);
 
-        int speechBytes = amrFrame.Length - 1;
-        // Total bits = 4 (CMR) + 1 (F) + 4 (FT) + 1 (Q) + speechBytes * 8 = 10 + speechBytes * 8
-        int totalPayloadBytes = (10 + speechBytes * 8 + 7) / 8;
+        // Storage frames pad each speech frame to an octet. BE RTP must not
+        // copy that padding: RFC 4867 Table 1 and section 4.3.4 allow only
+        // 0..7 padding bits at the end of the complete payload.
+        ReadOnlySpan<int> frameBits = [95, 103, 118, 134, 148, 159, 204, 244, 39];
+        if (ft is >= 9 and <= 14) return Array.Empty<byte>();
+        int speechBits = ft == 15 ? 0 : frameBits[ft];
+        if (amrFrame.Length != 1 + (speechBits + 7) / 8) return Array.Empty<byte>();
+        int totalPayloadBytes = (10 + speechBits + 7) / 8;
         var outRtp = new byte[totalPayloadBytes];
 
         // Byte 0: CMR[3..0] (1111) | F (0) | FT[3..1]
         outRtp[0] = (byte)(0xF0 | ((ft >> 1) & 0x07));
-        // Byte 1: FT[0] | Q | speech bits 0..5
-        byte firstSpeechByte = speechBytes > 0 ? amrFrame[1] : (byte)0;
-        outRtp[1] = (byte)(((ft & 0x01) << 7) | ((q & 0x01) << 6) | ((firstSpeechByte >> 2) & 0x3F));
-
-        // Remaining speech bits
-        for (int i = 1; i < speechBytes; i++)
+        outRtp[1] = (byte)(((ft & 0x01) << 7) | ((q & 0x01) << 6));
+        for (int bit = 0; bit < speechBits; bit++)
         {
-            byte cur = amrFrame[i];
-            byte next = (i + 1 < amrFrame.Length) ? amrFrame[i + 1] : (byte)0;
-            outRtp[i + 1] = (byte)(((cur & 0x03) << 6) | ((next >> 2) & 0x3F));
-        }
-
-        if (speechBytes > 0 && 1 + speechBytes < totalPayloadBytes)
-        {
-            outRtp[1 + speechBytes] = (byte)((amrFrame[^1] & 0x03) << 6);
+            var value = (amrFrame[1 + bit / 8] >> (7 - bit % 8)) & 1;
+            var target = 10 + bit;
+            outRtp[target / 8] |= (byte)(value << (7 - target % 8));
         }
 
         return outRtp;

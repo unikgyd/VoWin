@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "cases": [
+    { "text": "A", "repeat": 0, "encoding": "gsm7", "units": 0, "segments": 0 },
+    { "text": "A", "repeat": 160, "encoding": "gsm7", "units": 160, "segments": 1 },
+    { "text": "A", "repeat": 161, "encoding": "gsm7", "units": 161, "segments": 2 },
+    { "text": "Δ", "repeat": 160, "encoding": "gsm7", "units": 160, "segments": 1 },
+    { "text": "€", "repeat": 80, "encoding": "gsm7", "units": 160, "segments": 1 },
+    { "text": "€", "repeat": 81, "encoding": "gsm7", "units": 162, "segments": 2 },
+    { "text": "^", "repeat": 153, "encoding": "gsm7", "units": 306, "segments": 3 },
+    { "text": "中", "repeat": 70, "encoding": "ucs2", "units": 70, "segments": 1 },
+    { "text": "中", "repeat": 71, "encoding": "ucs2", "units": 71, "segments": 2 },
+    { "text": "😀", "repeat": 35, "encoding": "ucs2", "units": 70, "segments": 1 },
+    { "text": "😀", "repeat": 36, "encoding": "ucs2", "units": 72, "segments": 2 },
+    { "text": "😀", "repeat": 67, "encoding": "ucs2", "units": 134, "segments": 3 },
+    { "text": "\u001b", "repeat": 1, "encoding": "ucs2", "units": 1, "segments": 1 },
+    { "text": "\u0000", "repeat": 1, "encoding": "ucs2", "units": 1, "segments": 1 }
+  ]
+}

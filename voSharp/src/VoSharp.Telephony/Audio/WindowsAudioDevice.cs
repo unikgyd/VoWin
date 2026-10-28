@@ -4,6 +4,10 @@ using System.Text;
 
 namespace VoSharp.Telephony.Audio;
 
+public sealed record AudioPlaybackStats(
+    bool IsOpen, int OpenResult, long FramesQueued, long FramesWritten,
+    long FramesDropped, long WriteErrors);
+
 /// <summary>
 /// High-performance, zero-allocation, deadlock-free real-time audio playback device.
 /// Uses WinMM waveOut with event-driven synchronization (CALLBACK_EVENT) on a dedicated managed thread,
@@ -77,7 +81,21 @@ public class WindowsAudioDevice : IDisposable
     private PlayBufferSlot[]? _slots;
     private Thread? _playbackThread;
     private volatile bool _isDisposed;
-    private bool _isOpen;
+    private volatile bool _isOpen;
+    private volatile bool _recordingEnabled = true;
+    private int _openResult = -1;
+    private long _framesQueued;
+    private long _framesWritten;
+    private long _framesDropped;
+    private long _writeErrors;
+
+    public AudioPlaybackStats GetPlaybackStats() => new(
+        _isOpen && !_isDisposed,
+        Volatile.Read(ref _openResult),
+        Interlocked.Read(ref _framesQueued),
+        Interlocked.Read(ref _framesWritten),
+        Interlocked.Read(ref _framesDropped),
+        Interlocked.Read(ref _writeErrors));
 
     public WindowsAudioDevice(int sampleRate = 8000)
     {
@@ -101,9 +119,11 @@ public class WindowsAudioDevice : IDisposable
             };
 
             int res = waveOutOpen(out _hWaveOut, WAVE_MAPPER, ref format, _bufferEvent.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, CALLBACK_EVENT);
+            Volatile.Write(ref _openResult, res);
             if (res != 0 || _hWaveOut == IntPtr.Zero)
             {
                 _isOpen = false;
+                Console.WriteLine($"[WindowsAudioDevice] waveOutOpen failed: MMRESULT={res}.");
                 return;
             }
 
@@ -186,11 +206,17 @@ public class WindowsAudioDevice : IDisposable
                                 if (waveOutWrite(_hWaveOut, slot.HeaderPtr, slot.HeaderSize) == 0)
                                 {
                                     slot.InFlight = true;
+                                    Interlocked.Increment(ref _framesWritten);
                                 }
                                 else
                                 {
+                                    Interlocked.Increment(ref _writeErrors);
                                     waveOutUnprepareHeader(_hWaveOut, slot.HeaderPtr, slot.HeaderSize);
                                 }
+                            }
+                            else
+                            {
+                                Interlocked.Increment(ref _writeErrors);
                             }
                         }
                     }
@@ -199,7 +225,7 @@ public class WindowsAudioDevice : IDisposable
                 // Wait up to 20ms for buffer completion or new data
                 _bufferEvent.WaitOne(20);
             }
-            catch { }
+            catch { Interlocked.Increment(ref _writeErrors); }
         }
     }
 
@@ -225,15 +251,26 @@ public class WindowsAudioDevice : IDisposable
             Buffer.BlockCopy(samples, 0, byteBuffer, 0, byteBuffer.Length);
         }
 
-        lock (_lock)
+        if (_recordingEnabled)
         {
-            _recordedPcm.AddRange(byteBuffer);
+            lock (_lock)
+            {
+                if (_recordingEnabled) _recordedPcm.AddRange(byteBuffer);
+            }
+        }
+
+        if (!_isOpen)
+        {
+            Interlocked.Increment(ref _framesDropped);
+            return;
         }
 
         // Keep maximum 50 chunks (1s) in queue to prevent buffer build-up / latency
-        while (_queue.Count > 50 && _queue.TryDequeue(out _)) { }
+        while (_queue.Count > 50 && _queue.TryDequeue(out _))
+            Interlocked.Increment(ref _framesDropped);
 
         _queue.Enqueue(byteBuffer);
+        Interlocked.Increment(ref _framesQueued);
         _bufferEvent.Set();
     }
 
@@ -246,14 +283,36 @@ public class WindowsAudioDevice : IDisposable
         while (_queue.TryDequeue(out _)) { }
     }
 
+    public void SetRecordingEnabled(bool enabled)
+    {
+        lock (_lock)
+        {
+            _recordingEnabled = enabled;
+            if (!enabled) _recordedPcm.Clear();
+        }
+    }
+
+    /// <summary>Detach the completed call's PCM before the next call clears the shared device.</summary>
+    public byte[] TakeRecording()
+    {
+        lock (_lock)
+        {
+            var recording = _recordedPcm.ToArray();
+            _recordedPcm.Clear();
+            return recording;
+        }
+    }
+
     public void SaveToWavFile(string outputPath)
     {
         byte[] pcmData;
-        lock (_lock)
-        {
-            pcmData = _recordedPcm.ToArray();
-        }
+        lock (_lock) pcmData = _recordedPcm.ToArray();
+        SavePcmToWavFile(outputPath, pcmData);
+    }
 
+    public void SavePcmToWavFile(string outputPath, byte[] pcmData)
+    {
+        ArgumentNullException.ThrowIfNull(pcmData);
         if (pcmData.Length == 0) return;
 
         try

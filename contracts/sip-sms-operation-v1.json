@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "description": "SHA256 of NUL-separated sip-sms-v1, ASCII-lowercase realm/account, exact Call-ID and canonical decimal CSeq; no network address or body in identity",
+  "cases": [
+    {"realm":"lab.local","account":"1001","callId":"synthetic-call","cseq":0,"operationId":"188f468bb45250c061cd596cf915f7b8dd1453092cae887538fb9d2bd6fee001"},
+    {"realm":"Lab.Local","account":"USER","callId":"call@lab.local","cseq":1,"operationId":"c4d5934897eb29923d22c437806ee023b09cfa64d604c87b0c205dbc4b74e892"},
+    {"realm":"lab.local","account":"1001","callId":"synthetic-call","cseq":2147483647,"operationId":"7a92ee824ea7cfbb0c8d84877e7a7a133652f9dc6b2f68fb60bb2db76705ddb0"}
+  ]
+}

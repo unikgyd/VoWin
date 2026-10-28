@@ -1,0 +1,13 @@
+[Unit]
+Description=VoWin Asterisk LAN and WireGuard SIP/RTP guard
+After=network-pre.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /opt/vowin-asterisk/vowin-sip-guard.nft
+ExecReload=/usr/sbin/nft -f /opt/vowin-asterisk/vowin-sip-guard.nft
+
+[Install]
+WantedBy=multi-user.target

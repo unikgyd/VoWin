@@ -1,12 +1,16 @@
 using System.IO;
+using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 using VoSharp.Telephony.Calls;
 using VoWin.Helpers;
 using VoWin.Models;
+using VoSharp.Telephony.Sms;
+using VoSharp.Kernel.SipGateway;
+using VoSharp.Kernel.Persistence;
 
 namespace VoWin.Services
 {
-    public class PreferenceDatabaseService : IPreferenceDatabaseService
+    public partial class PreferenceDatabaseService : IPreferenceDatabaseService
     {
         private readonly string _connectionString;
         private readonly SemaphoreSlim _lock = new(1, 1);
@@ -23,9 +27,8 @@ namespace VoWin.Services
             }
             else
             {
-                var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VoWin");
-                Directory.CreateDirectory(folder);
-                dbPath = Path.Combine(folder, "preferences.db");
+                dbPath = IkeRetryStorage.DefaultPreferencesDatabasePath;
+                Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
             }
             _connectionString = $"Data Source={dbPath};Cache=Shared";
         }
@@ -39,8 +42,14 @@ namespace VoWin.Services
             {
                 if (_isInitialized) return;
 
-                using var conn = new SqliteConnection(_connectionString);
+                // A private schema connection avoids shared-cache schema locks
+                // during independent initializers. Keep the normal startup
+                // timeout and avoid retaining a separate schema pool or imposing
+                // the journal's file-only admission rule.
+                using var conn = new SqliteConnection(new SqliteConnectionStringBuilder(_connectionString)
+                    { Cache = SqliteCacheMode.Private, Pooling = false }.ToString());
                 await conn.OpenAsync();
+                await ConfigureSipSmsDurabilityAsync(conn, CancellationToken.None);
 
                 var sql = @"
                     CREATE TABLE IF NOT EXISTS ModulePreferences (
@@ -95,7 +104,10 @@ namespace VoWin.Services
                         DeliveryStatus TEXT,
                         MessageReference INTEGER,
                         SlotId TEXT,
-                        RawPdu TEXT
+                        RawPdu TEXT,
+                        SimBinding TEXT,
+                        SourceMessageId TEXT,
+                        SipReplyNumberSnapshot TEXT
                     );
                     CREATE INDEX IF NOT EXISTS IX_SmsMessages_RemoteNumber ON SmsMessages(RemoteNumber);
                     CREATE INDEX IF NOT EXISTS IX_SmsMessages_Timestamp ON SmsMessages(Timestamp ASC);
@@ -134,8 +146,20 @@ namespace VoWin.Services
                     );
                 ";
 
-                using var cmd = new SqliteCommand(sql, conn);
-                await cmd.ExecuteNonQueryAsync();
+                // Acquire the writer lock before preparing the multi-statement
+                // schema command, not halfway through concurrent CREATEs.
+                using (var baseSchema = conn.BeginTransaction(deferred: false))
+                {
+                    using var cmd = new SqliteCommand(sql, conn, baseSchema);
+                    await cmd.ExecuteNonQueryAsync();
+                    baseSchema.Commit();
+                }
+                await EnsureSmsSourceColumnsAsync(conn);
+                using (var forwardingSchema = conn.BeginTransaction(deferred: false))
+                {
+                    await EnsureSipSmsForwardTableAsync(conn, forwardingSchema, CancellationToken.None);
+                    forwardingSchema.Commit();
+                }
 
                 // Safe schema migration for existing databases
                 try
@@ -167,6 +191,27 @@ namespace VoWin.Services
             {
                 _lock.Release();
             }
+        }
+
+        private static async Task EnsureSmsSourceColumnsAsync(SqliteConnection connection)
+        {
+            // Serialize schema discovery and ALTER across independent store instances.
+            // Legacy rows intentionally stay NULL: the current card is not their source.
+            using var transaction = connection.BeginTransaction(deferred: false);
+            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var command = new SqliteCommand("PRAGMA table_info(SmsMessages)", connection, transaction))
+            using (var reader = await command.ExecuteReaderAsync())
+                while (await reader.ReadAsync()) columns.Add(reader.GetString(1));
+            foreach (var name in new[] { "SimBinding", "SourceMessageId", "SipReplyNumberSnapshot" })
+                if (!columns.Contains(name))
+                {
+                    using var alter = new SqliteCommand($"ALTER TABLE SmsMessages ADD COLUMN {name} TEXT", connection, transaction);
+                    await alter.ExecuteNonQueryAsync();
+                }
+            using (var index = new SqliteCommand(
+                "CREATE INDEX IF NOT EXISTS IX_SmsMessages_ReceiveSource ON SmsMessages(SlotId,SimBinding,SourceMessageId) WHERE IsOutgoing=0", connection, transaction))
+                await index.ExecuteNonQueryAsync();
+            transaction.Commit();
         }
 
         private static async Task NormalizeStoredTimestampsAsync(SqliteConnection conn)
@@ -605,6 +650,7 @@ namespace VoWin.Services
 
         public async Task SaveSmsMessageAsync(SmsMessageModel message)
         {
+            ValidateSmsSourceMetadata(message);
             await InitializeAsync();
             await _lock.WaitAsync();
             try
@@ -613,8 +659,8 @@ namespace VoWin.Services
                 await conn.OpenAsync();
 
                 var sql = @"
-                    INSERT INTO SmsMessages (Id, RemoteNumber, Text, Timestamp, IsOutgoing, DeliveryState, DeliveryStatus, MessageReference, SlotId, RawPdu)
-                    VALUES (@id, @remote, @text, @time, @outgoing, @state, @status, @ref, @slot, @pdu)
+                    INSERT INTO SmsMessages (Id, RemoteNumber, Text, Timestamp, IsOutgoing, DeliveryState, DeliveryStatus, MessageReference, SlotId, RawPdu, SimBinding, SourceMessageId, SipReplyNumberSnapshot)
+                    VALUES (@id, @remote, @text, @time, @outgoing, @state, @status, @ref, @slot, @pdu, @binding, @source, @reply)
                     ON CONFLICT(Id) DO UPDATE SET
                         RemoteNumber = excluded.RemoteNumber,
                         Text = excluded.Text,
@@ -623,8 +669,12 @@ namespace VoWin.Services
                         DeliveryState = excluded.DeliveryState,
                         DeliveryStatus = excluded.DeliveryStatus,
                         MessageReference = excluded.MessageReference,
-                        SlotId = excluded.SlotId,
-                        RawPdu = excluded.RawPdu;
+                        SlotId = CASE WHEN SmsMessages.SimBinding IS NOT NULL OR SmsMessages.SourceMessageId IS NOT NULL OR SmsMessages.SipReplyNumberSnapshot IS NOT NULL
+                            THEN SmsMessages.SlotId ELSE excluded.SlotId END,
+                        RawPdu = COALESCE(SmsMessages.RawPdu, excluded.RawPdu),
+                        SimBinding = SmsMessages.SimBinding,
+                        SourceMessageId = SmsMessages.SourceMessageId,
+                        SipReplyNumberSnapshot = SmsMessages.SipReplyNumberSnapshot;
                 ";
                 using var cmd = new SqliteCommand(sql, conn);
                 cmd.Parameters.AddWithValue("@id", message.Id);
@@ -637,7 +687,144 @@ namespace VoWin.Services
                 cmd.Parameters.AddWithValue("@ref", (object?)message.MessageReference ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@slot", (object?)message.SlotId ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@pdu", (object?)message.RawPdu ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@binding", (object?)message.SimBinding ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@source", string.IsNullOrEmpty(message.SourceMessageId) ? DBNull.Value : message.SourceMessageId);
+                cmd.Parameters.AddWithValue("@reply", (object?)message.SipReplyNumberSnapshot ?? DBNull.Value);
                 await cmd.ExecuteNonQueryAsync();
+            }
+            finally { _lock.Release(); }
+        }
+
+        public async Task<bool> SaveIncomingSmsIfNewAsync(SmsMessageModel message, CancellationToken ct = default) =>
+            (await SaveIncomingSmsWithForwardsAsync(message, [], ct).ConfigureAwait(false)).IsNew;
+
+        public async Task<IncomingSmsPersistenceResult> SaveIncomingSmsWithForwardsAsync(SmsMessageModel message,
+            IReadOnlyList<SipSmsForwardRecipient> recipients, CancellationToken ct = default)
+        {
+            ValidateSmsSourceMetadata(message);
+            ValidateForwardRecipients(message, recipients);
+            if (message.IsOutgoing || string.IsNullOrEmpty(message.Id))
+                throw new ArgumentException("Invalid incoming SMS source metadata.");
+            var sourceId = string.IsNullOrEmpty(message.SourceMessageId) ? null : message.SourceMessageId;
+            await InitializeAsync().WaitAsync(ct).ConfigureAwait(false);
+            using var connection = NewSipSmsConnection();
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await ConfigureSipSmsDurabilityAsync(connection, ct).ConfigureAwait(false);
+            // This lock is a SQLite writer transaction, not only the per-object
+            // semaphore: two services sharing this file still admit just one row.
+            using var transaction = connection.BeginTransaction(deferred: false);
+            var receipt = await RememberSmsForwardReceiptAsync(connection, transaction, message, ct).ConfigureAwait(false);
+            var duplicate = false;
+            using (var check = new SqliteCommand("""
+                SELECT Timestamp,SourceMessageId,RawPdu FROM SmsMessages
+                WHERE IsOutgoing=0 AND SlotId IS $slot AND SimBinding IS $binding
+                  AND (($source IS NOT NULL AND SourceMessageId=$source)
+                    OR ($pdu IS NOT NULL AND $pdu<>'' AND RawPdu=$pdu)
+                    OR ($source IS NULL AND RemoteNumber=$remote AND Text=$text))
+                """, connection, transaction))
+            {
+                check.Parameters.AddWithValue("$slot", (object?)message.SlotId ?? DBNull.Value);
+                check.Parameters.AddWithValue("$binding", (object?)message.SimBinding ?? DBNull.Value);
+                check.Parameters.AddWithValue("$source", (object?)sourceId ?? DBNull.Value);
+                check.Parameters.AddWithValue("$pdu", (object?)message.RawPdu ?? DBNull.Value);
+                check.Parameters.AddWithValue("$remote", message.SenderOrRecipient.Trim());
+                check.Parameters.AddWithValue("$text", message.Text);
+                using var reader = await check.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    var sameSource = sourceId is not null && !reader.IsDBNull(1) && reader.GetString(1) == sourceId;
+                    var samePdu = !string.IsNullOrEmpty(message.RawPdu) && !reader.IsDBNull(2) && reader.GetString(2) == message.RawPdu;
+                    if (sameSource || samePdu || !TimestampDisplayHelper.TryParseStoredUtc(reader.GetString(0), out var stored) ||
+                        Math.Abs((stored - TimestampDisplayHelper.ToUtcStorageTime(message.Timestamp)).TotalSeconds) <= 60)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+            }
+            if (duplicate)
+            {
+                transaction.Commit(); // Remember an empty plan for migrated old inbox rows as well.
+                return new(false, 0, false); // Duplicate events cannot acquire newly configured recipients.
+            }
+            using var insert = new SqliteCommand("""
+                INSERT INTO SmsMessages(Id,RemoteNumber,Text,Timestamp,IsOutgoing,DeliveryState,DeliveryStatus,MessageReference,SlotId,RawPdu,SimBinding,SourceMessageId,SipReplyNumberSnapshot)
+                VALUES($id,$remote,$text,$time,0,$state,$status,$reference,$slot,$pdu,$binding,$source,$reply)
+                ON CONFLICT(Id) DO NOTHING
+                """, connection, transaction);
+            insert.Parameters.AddWithValue("$id", message.Id);
+            insert.Parameters.AddWithValue("$remote", message.SenderOrRecipient.Trim());
+            insert.Parameters.AddWithValue("$text", message.Text);
+            insert.Parameters.AddWithValue("$time", TimestampDisplayHelper.ToUtcStorageTime(message.Timestamp).ToString("o", System.Globalization.CultureInfo.InvariantCulture));
+            insert.Parameters.AddWithValue("$state", (int)message.DeliveryState);
+            insert.Parameters.AddWithValue("$status", (object?)message.DeliveryStatus ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$reference", (object?)message.MessageReference ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$slot", (object?)message.SlotId ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$pdu", (object?)message.RawPdu ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$binding", (object?)message.SimBinding ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$source", (object?)sourceId ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$reply", (object?)message.SipReplyNumberSnapshot ?? DBNull.Value);
+            var inserted = await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+            var forwards = inserted && receipt.First ? await EnqueueSmsForwardsAsync(connection, transaction, message, recipients, ct).ConfigureAwait(false)
+                : (0, inserted && recipients.Count > 0 && receipt.CapacityHold, false);
+            transaction.Commit();
+            return new(inserted, forwards.Item1, forwards.Item2, forwards.Item3);
+        }
+
+        private static void ValidateSmsSourceMetadata(SmsMessageModel message)
+        {
+            ArgumentNullException.ThrowIfNull(message);
+            if (message.SimBinding is not null && !SmsSubscriptionIdentity.IsValid(message.SimBinding) ||
+                message.SourceMessageId is { Length: > 512 } || message.SourceMessageId?.Any(char.IsControl) == true ||
+                !IsSmsReplySnapshotValue(message.SipReplyNumberSnapshot))
+                throw new ArgumentException("Invalid SMS source metadata.");
+        }
+
+        private static bool IsSmsReplySnapshotValue(string? value) => value is null or "" ||
+            Regex.IsMatch(value, @"\A\+[1-9][0-9]{6,14}\z");
+
+        public async Task<SmsInboxQueryResult> QueryIncomingSmsAsync(SmsInboxQuery query, CancellationToken ct = default)
+        {
+            if (query.Limit is < 1 or > 100 || query.SinceUtc.Kind != DateTimeKind.Utc || query.UntilUtc.Kind != DateTimeKind.Utc ||
+                query.UntilUtc < query.SinceUtc || (query.Keyword?.Length ?? 0) > 200 || (query.Sender?.Length ?? 0) > 100 || (query.SlotId?.Length ?? 0) > 128)
+                throw new ArgumentException("无效的短信查询条件。");
+            await InitializeAsync().WaitAsync(ct).ConfigureAwait(false);
+            await _lock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                using var conn = new SqliteConnection(_connectionString);
+                await conn.OpenAsync(ct).ConfigureAwait(false);
+                conn.CreateFunction<string, string, bool>("sms_contains", (text, keyword) => text.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+                using var cmd = new SqliteCommand("""
+                    SELECT Id, RemoteNumber, Text, Timestamp, SlotId, SimBinding, SourceMessageId, SipReplyNumberSnapshot FROM SmsMessages
+                    WHERE IsOutgoing = 0 AND julianday(Timestamp) >= julianday(@since) AND julianday(Timestamp) <= julianday(@until)
+                      AND (@keyword = '' OR sms_contains(Text, @keyword))
+                      AND (@sender = '' OR RemoteNumber = @sender)
+                      AND (@slot = '' OR SlotId = @slot)
+                    ORDER BY julianday(Timestamp) DESC, Id DESC LIMIT @limit;
+                    """, conn);
+                cmd.Parameters.AddWithValue("@since", query.SinceUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture));
+                cmd.Parameters.AddWithValue("@until", query.UntilUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture));
+                cmd.Parameters.AddWithValue("@keyword", query.Keyword ?? "");
+                cmd.Parameters.AddWithValue("@sender", query.Sender ?? "");
+                cmd.Parameters.AddWithValue("@slot", query.SlotId ?? "");
+                cmd.Parameters.AddWithValue("@limit", query.OtpOnly ? 1000 : query.Limit);
+                var messages = new List<SmsMessageModel>(); var scanned = 0;
+                using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    ct.ThrowIfCancellationRequested(); scanned++;
+                    if (!TimestampDisplayHelper.TryParseStoredUtc(reader.GetString(3), out var timestamp)) continue;
+                    var message = new SmsMessageModel { Id = reader.GetString(0), SenderOrRecipient = reader.GetString(1),
+                        Text = reader.GetString(2), Timestamp = timestamp, SlotId = reader.IsDBNull(4) ? null : reader.GetString(4),
+                        SimBinding = reader.IsDBNull(5) ? null : reader.GetString(5),
+                        SourceMessageId = reader.IsDBNull(6) ? null : reader.GetString(6),
+                        SipReplyNumberSnapshot = reader.IsDBNull(7) ? null : reader.GetString(7) };
+                    if (query.OtpOnly && !message.HasOtpCode) continue;
+                    messages.Add(message);
+                    if (messages.Count == query.Limit) break;
+                }
+                return new(messages, query.OtpOnly && scanned >= 1000 && messages.Count < query.Limit);
             }
             finally { _lock.Release(); }
         }
@@ -652,7 +839,7 @@ namespace VoWin.Services
                 using var conn = new SqliteConnection(_connectionString);
                 await conn.OpenAsync();
 
-                var sql = "SELECT Id, RemoteNumber, Text, Timestamp, IsOutgoing, DeliveryState, DeliveryStatus, MessageReference, SlotId, RawPdu FROM SmsMessages ORDER BY Timestamp ASC;";
+                var sql = "SELECT Id, RemoteNumber, Text, Timestamp, IsOutgoing, DeliveryState, DeliveryStatus, MessageReference, SlotId, RawPdu, SimBinding, SourceMessageId, SipReplyNumberSnapshot FROM SmsMessages ORDER BY Timestamp ASC;";
                 using var cmd = new SqliteCommand(sql, conn);
                 using var reader = await cmd.ExecuteReaderAsync();
                 while (await reader.ReadAsync())
@@ -668,7 +855,10 @@ namespace VoWin.Services
                         DeliveryStatus = reader.IsDBNull(6) ? null : reader.GetString(6),
                         MessageReference = reader.IsDBNull(7) ? null : reader.GetInt32(7),
                         SlotId = reader.IsDBNull(8) ? null : reader.GetString(8),
-                        RawPdu = reader.IsDBNull(9) ? null : reader.GetString(9)
+                        RawPdu = reader.IsDBNull(9) ? null : reader.GetString(9),
+                        SimBinding = reader.IsDBNull(10) ? null : reader.GetString(10),
+                        SourceMessageId = reader.IsDBNull(11) ? null : reader.GetString(11),
+                        SipReplyNumberSnapshot = reader.IsDBNull(12) ? null : reader.GetString(12)
                     });
                 }
                 return list;
@@ -686,7 +876,7 @@ namespace VoWin.Services
                 using var conn = new SqliteConnection(_connectionString);
                 await conn.OpenAsync();
 
-                var sql = "SELECT Id, RemoteNumber, Text, Timestamp, IsOutgoing, DeliveryState, DeliveryStatus, MessageReference, SlotId, RawPdu FROM SmsMessages WHERE RemoteNumber = @num ORDER BY Timestamp ASC;";
+                var sql = "SELECT Id, RemoteNumber, Text, Timestamp, IsOutgoing, DeliveryState, DeliveryStatus, MessageReference, SlotId, RawPdu, SimBinding, SourceMessageId, SipReplyNumberSnapshot FROM SmsMessages WHERE RemoteNumber = @num ORDER BY Timestamp ASC;";
                 using var cmd = new SqliteCommand(sql, conn);
                 cmd.Parameters.AddWithValue("@num", remoteNumber);
                 using var reader = await cmd.ExecuteReaderAsync();
@@ -703,7 +893,10 @@ namespace VoWin.Services
                         DeliveryStatus = reader.IsDBNull(6) ? null : reader.GetString(6),
                         MessageReference = reader.IsDBNull(7) ? null : reader.GetInt32(7),
                         SlotId = reader.IsDBNull(8) ? null : reader.GetString(8),
-                        RawPdu = reader.IsDBNull(9) ? null : reader.GetString(9)
+                        RawPdu = reader.IsDBNull(9) ? null : reader.GetString(9),
+                        SimBinding = reader.IsDBNull(10) ? null : reader.GetString(10),
+                        SourceMessageId = reader.IsDBNull(11) ? null : reader.GetString(11),
+                        SipReplyNumberSnapshot = reader.IsDBNull(12) ? null : reader.GetString(12)
                     });
                 }
                 return list;

@@ -1,0 +1,230 @@
+{
+  "schema": 1,
+  "source": "RFC 7296 3.15 and 3GPP P-CSCF attribute codes; 16-byte INTERNAL_IP6_ADDRESS is bounded legacy compatibility",
+  "cases": [
+    {
+      "id": "empty-reply",
+      "hex": "02000000",
+      "accepted": true,
+      "assigned": [],
+      "dns": [],
+      "pcscf": [],
+      "subnets": []
+    },
+    {
+      "id": "ipv4-pair-dns",
+      "hex": "0200000000010004c000020100140004c00002020003000408080808",
+      "accepted": true,
+      "assigned": [
+        "192.0.2.1"
+      ],
+      "dns": [
+        "8.8.8.8"
+      ],
+      "pcscf": [
+        "192.0.2.2"
+      ],
+      "subnets": []
+    },
+    {
+      "id": "ipv6-pair",
+      "hex": "020000000008001120010db8000000000000000000000001400015001020010db8000000000000000000000002",
+      "accepted": true,
+      "assigned": [
+        "2001:db8::1"
+      ],
+      "dns": [],
+      "pcscf": [
+        "2001:db8::2"
+      ],
+      "subnets": []
+    },
+    {
+      "id": "ipv6-legacy-no-prefix",
+      "hex": "020000000008001020010db8000000000000000000000001000a001020010db8000000000000000000000002",
+      "accepted": true,
+      "assigned": [
+        "2001:db8::1"
+      ],
+      "dns": [
+        "2001:db8::2"
+      ],
+      "pcscf": [],
+      "subnets": []
+    },
+    {
+      "id": "subnet-is-not-host-assignment",
+      "hex": "02000000000f001120010db8000000000000000000000001400015001020010db8000000000000000000000002",
+      "accepted": true,
+      "assigned": [],
+      "dns": [],
+      "pcscf": [
+        "2001:db8::2"
+      ],
+      "subnets": [
+        [
+          "2001:db8::1",
+          64
+        ]
+      ]
+    },
+    {
+      "id": "dual-order-preserved",
+      "hex": "0200000000010004c000020100140004c00002020008001120010db8000000000000000000000001800015001020010db8000000000000000000000002",
+      "accepted": true,
+      "assigned": [
+        "192.0.2.1",
+        "2001:db8::1"
+      ],
+      "dns": [],
+      "pcscf": [
+        "192.0.2.2",
+        "2001:db8::2"
+      ],
+      "subnets": []
+    },
+    {
+      "id": "reserved-type-bit-ignored",
+      "hex": "0200000080010004c000020180140004c0000202",
+      "accepted": true,
+      "assigned": [
+        "192.0.2.1"
+      ],
+      "dns": [],
+      "pcscf": [
+        "192.0.2.2"
+      ],
+      "subnets": []
+    },
+    {
+      "id": "unknown-framed-value",
+      "hex": "0200000061a8000301234500010004c000020100140004c0000202",
+      "accepted": true,
+      "assigned": [
+        "192.0.2.1"
+      ],
+      "dns": [],
+      "pcscf": [
+        "192.0.2.2"
+      ],
+      "subnets": []
+    },
+    {
+      "id": "unknown-empty",
+      "hex": "0200000061a80000",
+      "accepted": true,
+      "assigned": [],
+      "dns": [],
+      "pcscf": [],
+      "subnets": []
+    },
+    {
+      "id": "reserved-header-ignored",
+      "hex": "02ffffff00010004c000020100140004c0000202",
+      "accepted": true,
+      "assigned": [
+        "192.0.2.1"
+      ],
+      "dns": [],
+      "pcscf": [
+        "192.0.2.2"
+      ],
+      "subnets": []
+    },
+    {
+      "id": "empty",
+      "hex": "",
+      "accepted": false
+    },
+    {
+      "id": "short-header",
+      "hex": "020000",
+      "accepted": false
+    },
+    {
+      "id": "not-cfg-reply",
+      "hex": "0100000000010004c000020100140004c0000202",
+      "accepted": false
+    },
+    {
+      "id": "trailing-one",
+      "hex": "0200000000010004c000020100140004c000020200",
+      "accepted": false
+    },
+    {
+      "id": "trailing-two",
+      "hex": "0200000000010004c000020100140004c00002020003",
+      "accepted": false
+    },
+    {
+      "id": "trailing-three",
+      "hex": "0200000000010004c000020100140004c0000202000300",
+      "accepted": false
+    },
+    {
+      "id": "lying-length-after-valid-pair",
+      "hex": "0200000000010004c000020100140004c0000202000300040808",
+      "accepted": false
+    },
+    {
+      "id": "unknown-truncated",
+      "hex": "0200000000010004c000020100140004c0000202600000050102",
+      "accepted": false
+    },
+    {
+      "id": "ipv4-empty",
+      "hex": "0200000000010000",
+      "accepted": false
+    },
+    {
+      "id": "ipv4-long",
+      "hex": "0200000000010005c000020100",
+      "accepted": false
+    },
+    {
+      "id": "pcscf4-short",
+      "hex": "0200000000140003c00002",
+      "accepted": false
+    },
+    {
+      "id": "dns4-short",
+      "hex": "02000000000300020808",
+      "accepted": false
+    },
+    {
+      "id": "ipv6-short",
+      "hex": "020000000008000f20010db80000000000000000000000",
+      "accepted": false
+    },
+    {
+      "id": "ipv6-long",
+      "hex": "020000000008001220010db80000000000000000000000014000",
+      "accepted": false
+    },
+    {
+      "id": "ipv6-prefix129",
+      "hex": "020000000008001120010db800000000000000000000000181",
+      "accepted": false
+    },
+    {
+      "id": "pcscf6-prefix-not-allowed",
+      "hex": "020000000015001120010db800000000000000000000000240",
+      "accepted": false
+    },
+    {
+      "id": "dns6-short",
+      "hex": "02000000000a00020000",
+      "accepted": false
+    },
+    {
+      "id": "subnet-no-prefix",
+      "hex": "02000000000f001020010db8000000000000000000000001",
+      "accepted": false
+    },
+    {
+      "id": "subnet-prefix129",
+      "hex": "02000000000f001120010db800000000000000000000000181",
+      "accepted": false
+    }
+  ]
+}

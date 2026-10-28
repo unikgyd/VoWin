@@ -1,0 +1,14 @@
+<Window x:Class="VoWin.Views.Windows.RuntimeSetupWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="VoWin · 准备运行组件" Width="440" Height="190"
+        ResizeMode="NoResize" WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource AppSurfaceBrush}" Foreground="{DynamicResource AppTextPrimaryBrush}">
+  <StackPanel Margin="28,24">
+    <TextBlock Text="VoWin" FontSize="24" FontWeight="SemiBold" />
+    <TextBlock x:Name="Status" Text="正在准备内置运行组件…" Margin="0,10,0,12" TextWrapping="Wrap" />
+    <ProgressBar Height="4" IsIndeterminate="True" />
+    <TextBlock Text="首次启动需要释放组件；不下载文件，不改变模组设置。" FontSize="11"
+               Margin="0,12,0,0" Foreground="{DynamicResource AppTextSecondaryBrush}" TextWrapping="Wrap" />
+  </StackPanel>
+</Window>

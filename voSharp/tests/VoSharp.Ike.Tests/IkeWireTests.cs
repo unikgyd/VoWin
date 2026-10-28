@@ -236,6 +236,7 @@ public class IkeWireTests
         {
             new IkeProposal
             {
+                ProposalNumber = 1,
                 Protocol = IkeProtocolId.Ike,
                 Transforms = { new IkeTransform(IkeTransformType.Encryption, IkeEncryptionId.AesCbc, 128) }
             }

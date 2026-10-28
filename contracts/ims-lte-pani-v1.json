@@ -1,0 +1,15 @@
+{
+  "schema": "ims-lte-pani-v1",
+  "cases": [
+    {"id":"fdd-two-digit-mnc","duplex":"FDD","mcc":"111","mnc":"22","tac":"33C4","cell":"76B4321","pani":"3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=1112233C476B4321"},
+    {"id":"tdd-three-digit-mnc","duplex":"TDD","mcc":"310","mnc":"260","tac":"4","cell":"A12","pani":"3GPP-E-UTRAN-TDD;utran-cell-id-3gpp=31026000040000A12"},
+    {"id":"preserve-mnc-zero","duplex":"FDD","mcc":"001","mnc":"01","tac":"0","cell":"1","pani":"3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100000000001"},
+    {"id":"preserve-third-mnc-zero","duplex":"FDD","mcc":"001","mnc":"001","tac":"0","cell":"1","pani":"3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=00100100000000001"},
+    {"id":"upper-hex-boundary","duplex":"TDD","mcc":"999","mnc":"99","tac":"ffff","cell":"fffffff","pani":"3GPP-E-UTRAN-TDD;utran-cell-id-3gpp=99999FFFFFFFFFFF"},
+    {"id":"no-guessed-duplex","duplex":"LTE","mcc":"111","mnc":"22","tac":"1","cell":"1","pani":null},
+    {"id":"no-short-mnc","duplex":"FDD","mcc":"111","mnc":"2","tac":"1","cell":"1","pani":null},
+    {"id":"no-mcc-injection","duplex":"FDD","mcc":"111\r\nX:1","mnc":"22","tac":"1","cell":"1","pani":null},
+    {"id":"no-cell-overflow","duplex":"FDD","mcc":"111","mnc":"22","tac":"1","cell":"10000000","pani":null},
+    {"id":"no-tac-overflow","duplex":"FDD","mcc":"111","mnc":"22","tac":"10000","cell":"1","pani":null}
+  ]
+}

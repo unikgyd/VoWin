@@ -1,5 +1,7 @@
 using VoSharp.Telephony.Calls;
 using VoSharp.Telephony.VoWifi;
+using System.Collections.Concurrent;
+using VoSharp.Telephony.Sms;
 
 namespace VoSharp.Kernel.SipGateway;
 
@@ -11,36 +13,68 @@ public interface ISipGatewayCallController
     event EventHandler<CallEndedEventArgs>? CallEnded;
 
     Task<SipGatewayCarrierCall> DialCarrierAsync(string number, string? slotId, CancellationToken ct);
+    Task<SipGatewayCarrierCall> DialCarrierAsync(string number, string? slotId, CancellationToken ct,
+        Action<string, string?> onStarted) => DialCarrierAsync(number, slotId, ct);
     Task<SipGatewayCarrierCall> AnswerCarrierAsync(string? slotId, CancellationToken ct);
+    Task<SipGatewayCarrierCall> AnswerCarrierCallAsync(string callId, string? slotId, CancellationToken ct) => AnswerCarrierAsync(slotId, ct);
+    Task HangupCarrierCallAsync(string callId, string? slotId, CancellationToken ct) => HangupAsync(slotId, ct);
     Task HangupAsync(string? slotId, CancellationToken ct);
     Task SendDtmfAsync(char digit, string? slotId, CancellationToken ct);
     ImsCallManager? GetImsMedia(string? slotId);
 }
 
-internal sealed class KernelSipGatewayCallController : ISipGatewayCallController, IDisposable
+internal sealed class KernelSipGatewayCallController : ISipGatewayCallController, ISipGatewaySimBoundMessageController, IDisposable
 {
     private readonly IVoKernel _kernel;
-    private readonly SemaphoreSlim _dialAdmission = new(1, 1);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _dialAdmissions = new(StringComparer.OrdinalIgnoreCase);
+    internal SemaphoreSlim GetDialAdmission(string? slotId) =>
+        _dialAdmissions.GetOrAdd(slotId ?? "\0legacy-default", _ => new(1, 1));
 
     public KernelSipGatewayCallController(IVoKernel kernel)
     {
         _kernel = kernel;
         _kernel.IncomingCall += ForwardIncoming;
         _kernel.CallEnded += ForwardEnded;
+        _kernel.SmsReceived += ForwardSms;
     }
 
     public event EventHandler<IncomingCallEventArgs>? IncomingCall;
     public event EventHandler<CallEndedEventArgs>? CallEnded;
-
-    public async Task<SipGatewayCarrierCall> DialCarrierAsync(string number, string? slotId, CancellationToken ct)
+    public event EventHandler<SmsReceivedEventArgs>? SmsReceived;
+    public string? GetSmsSimBinding(string slotId) => _kernel.GetSmsSimBinding(slotId);
+    public Task<SmsSubmitResult> SendSmsForSimAsync(string number, string text, string slotId, string expectedBinding, CancellationToken ct) =>
+        _kernel.SendSmsForSimAsync(number, text, slotId, expectedBinding, ct);
+    public Task<SmsSubmitResult> SendSmsAsync(string number, string text, string? slotId, CancellationToken ct)
     {
-        await _dialAdmission.WaitAsync(ct).ConfigureAwait(false);
+        // Resolve once. Never fall back to a different SIM after hotplug.
+        var slot = ResolveSlot(slotId, number) ?? throw new InvalidOperationException("No SMS modem is configured.");
+        return _kernel.SendSmsAsync(number, text, requestStatusReport: slot.PreferredTelephonyMode != TelephonyMode.HostIms,
+            slotId: slot.Id, ct: ct);
+    }
+
+    public Task<SipGatewayCarrierCall> DialCarrierAsync(string number, string? slotId, CancellationToken ct) =>
+        DialCarrierAsync(number, slotId, ct, (_, _) => { });
+
+    public async Task<SipGatewayCarrierCall> DialCarrierAsync(string number, string? slotId, CancellationToken ct,
+        Action<string, string?> onStarted)
+    {
+        var slot = ResolveSlot(slotId, number);
+        var admission = GetDialAdmission(slot?.Id);
+        await admission.WaitAsync(ct).ConfigureAwait(false);
+        var ownedCalls = slot?.Calls ?? _kernel.Calls;
+        void Started(object? sender, CallStateChangedEventArgs e)
+        {
+            if (e.IsOutgoing && e.NewState == CallState.Dialing) onStarted(e.CallId, slot?.Id);
+        }
+        ownedCalls.CallStateChanged += Started;
         try
         {
-        var slot = ResolveSlot(slotId, number);
+        if (slot is not null && (!_kernel.Pool.Slots.TryGetValue(slot.Id, out var current) || !ReferenceEquals(current, slot)))
+            throw new KeyNotFoundException("The original SIP carrier modem is no longer available; no other line was used.");
         var voWifi = slot?.VoWifi ?? _kernel.VoWifi;
         var calls = slot?.Calls ?? _kernel.Calls;
-        if (voWifi.State == VoWifiState.ImsRegistered)
+        var route = ResolveCarrierRoute(slot);
+        if (route == TelephonyMode.VoWifi)
         {
             if (calls.State is not (CallState.Idle or CallState.Ended))
                 throw new InvalidOperationException("The selected IMS line already has a call.");
@@ -60,7 +94,7 @@ internal sealed class KernelSipGatewayCallController : ISipGatewayCallController
                 throw;
             }
         }
-        if (slot?.GetHostImsRegistrationStatus().IsRegistered == true)
+        if (route == TelephonyMode.HostIms && slot != null)
         {
             if (calls.State is not (CallState.Idle or CallState.Ended))
                 throw new InvalidOperationException("The selected Host IMS line already has a call.");
@@ -106,7 +140,8 @@ internal sealed class KernelSipGatewayCallController : ISipGatewayCallController
         }
         finally
         {
-            _dialAdmission.Release();
+            ownedCalls.CallStateChanged -= Started;
+            admission.Release();
         }
     }
 
@@ -117,8 +152,21 @@ internal sealed class KernelSipGatewayCallController : ISipGatewayCallController
         if (calls.State == CallState.Ringing && calls.IsIncoming)
         {
             calls.ExternalMediaBridgeEnabled = true;
-            var imsCall = await calls.AnswerAsync(ct).ConfigureAwait(false);
-            return new SipGatewayCarrierCall(imsCall, slot?.Id, calls);
+            var expectedId = calls.ActiveCall?.CallId;
+            var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void Connected(object? sender, CallConnectedEventArgs e) { if (e.CallId == expectedId) ready.TrySetResult(); }
+            void Ended(object? sender, CallEndedEventArgs e) { if (e.CallId == expectedId) ready.TrySetException(new InvalidOperationException("Carrier call ended before ACK.")); }
+            calls.CallConnected += Connected;
+            calls.CallEnded += Ended;
+            try
+            {
+                await calls.AnswerAsync(ct).ConfigureAwait(false);
+                // AnswerAsync sends 200; media is not active until the operator ACK.
+                await ready.Task.WaitAsync(TimeSpan.FromSeconds(32), ct).ConfigureAwait(false);
+                return new SipGatewayCarrierCall(calls.ActiveCall ?? throw new InvalidOperationException("Carrier call ended."), slot?.Id, calls);
+            }
+            catch { calls.ExternalMediaBridgeEnabled = false; throw; }
+            finally { calls.CallConnected -= Connected; calls.CallEnded -= Ended; }
         }
         if (slot == null || !slot.HasCellularCall || _kernel.CellularSipMediaProvider is not { } provider)
             throw new InvalidOperationException("No bridgeable incoming carrier call is available.");
@@ -141,6 +189,23 @@ internal sealed class KernelSipGatewayCallController : ISipGatewayCallController
         }
     }
 
+    private bool IsCurrentCall(string callId, string? slotId)
+    {
+        var slot = ResolveSlot(slotId, null);
+        return string.Equals((slot?.Calls ?? _kernel.Calls).ActiveCall?.CallId, callId, StringComparison.OrdinalIgnoreCase) ||
+            slot?.IsCurrentCellularCall(callId) == true;
+    }
+
+    public Task<SipGatewayCarrierCall> AnswerCarrierCallAsync(string callId, string? slotId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (!IsCurrentCall(callId, slotId)) throw new InvalidOperationException("The original incoming carrier call is no longer available.");
+        return AnswerCarrierAsync(slotId, ct);
+    }
+
+    public Task HangupCarrierCallAsync(string callId, string? slotId, CancellationToken ct) =>
+        IsCurrentCall(callId, slotId) ? HangupAsync(slotId, ct) : Task.CompletedTask;
+
     public async Task HangupAsync(string? slotId, CancellationToken ct)
     {
         var provider = _kernel.CellularSipMediaProvider;
@@ -156,6 +221,12 @@ internal sealed class KernelSipGatewayCallController : ISipGatewayCallController
         _ = await _kernel.SendDtmfAsync(digit, slotId, ct).ConfigureAwait(false);
 
     public ImsCallManager? GetImsMedia(string? slotId) => ResolveSlot(slotId, null)?.Calls ?? _kernel.Calls;
+
+    internal TelephonyMode ResolveCarrierRoute(Pool.ModemSlot? slot) =>
+        TelephonyRoutePolicy.Resolve(slot?.PreferredTelephonyMode, slot?.TelephonyEnabled ?? true,
+            (slot?.VoWifi ?? _kernel.VoWifi).State == VoWifiState.ImsRegistered,
+            slot?.GetHostImsRegistrationStatus().IsRegistered == true, slot?.Modem?.IsOpen == true,
+            cellularImsMode: slot?.CellularImsMode);
 
     private Pool.ModemSlot? ResolveSlot(string? slotId, string? number)
     {
@@ -200,10 +271,12 @@ internal sealed class KernelSipGatewayCallController : ISipGatewayCallController
 
     private void ForwardIncoming(object? sender, IncomingCallEventArgs e) => IncomingCall?.Invoke(this, e);
     private void ForwardEnded(object? sender, CallEndedEventArgs e) => CallEnded?.Invoke(this, e);
+    private void ForwardSms(object? sender, SmsReceivedEventArgs e) => SmsReceived?.Invoke(this, e);
 
     public void Dispose()
     {
         _kernel.IncomingCall -= ForwardIncoming;
         _kernel.CallEnded -= ForwardEnded;
+        _kernel.SmsReceived -= ForwardSms;
     }
 }

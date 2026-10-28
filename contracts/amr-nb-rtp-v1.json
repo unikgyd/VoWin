@@ -1,0 +1,284 @@
+{
+  "version": 1,
+  "source": "Independent RFC 4867 string-bit construction; synthetic speech, no subscriber audio",
+  "cases": [
+    {
+      "name": "be-mode-0",
+      "octet": false,
+      "payloadHex": "f041c3854708ca8c4e0fd1935500",
+      "accepted": true,
+      "framesHex": [
+        "04070e151c232a31383f464d54"
+      ]
+    },
+    {
+      "name": "be-mode-1",
+      "octet": false,
+      "payloadHex": "f0c1c3854708ca8c4e0fd193551680",
+      "accepted": true,
+      "framesHex": [
+        "0c070e151c232a31383f464d545a"
+      ]
+    },
+    {
+      "name": "be-mode-2",
+      "octet": false,
+      "payloadHex": "f141c3854708ca8c4e0fd1935516d89a",
+      "accepted": true,
+      "framesHex": [
+        "14070e151c232a31383f464d545b6268"
+      ]
+    },
+    {
+      "name": "be-mode-3",
+      "octet": false,
+      "payloadHex": "f1c1c3854708ca8c4e0fd1935516d89a5c1d",
+      "accepted": true,
+      "framesHex": [
+        "1c070e151c232a31383f464d545b62697074"
+      ]
+    },
+    {
+      "name": "be-mode-4",
+      "octet": false,
+      "payloadHex": "f241c3854708ca8c4e0fd1935516d89a5c1ddfa0",
+      "accepted": true,
+      "framesHex": [
+        "24070e151c232a31383f464d545b626970777e80"
+      ]
+    },
+    {
+      "name": "be-mode-5",
+      "octet": false,
+      "payloadHex": "f2c1c3854708ca8c4e0fd1935516d89a5c1ddfa16300",
+      "accepted": true,
+      "framesHex": [
+        "2c070e151c232a31383f464d545b626970777e858c"
+      ]
+    },
+    {
+      "name": "be-mode-6",
+      "octet": false,
+      "payloadHex": "f341c3854708ca8c4e0fd1935516d89a5c1ddfa16324e6a86a2bec",
+      "accepted": true,
+      "framesHex": [
+        "34070e151c232a31383f464d545b626970777e858c939aa1a8afb0"
+      ]
+    },
+    {
+      "name": "be-mode-7",
+      "octet": false,
+      "payloadHex": "f3c1c3854708ca8c4e0fd1935516d89a5c1ddfa16324e6a86a2bedaf7132f4b4",
+      "accepted": true,
+      "framesHex": [
+        "3c070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d0"
+      ]
+    },
+    {
+      "name": "be-mode-8",
+      "octet": false,
+      "payloadHex": "f441c385470880",
+      "accepted": true,
+      "framesHex": [
+        "44070e151c22"
+      ]
+    },
+    {
+      "name": "be-mode-15",
+      "octet": false,
+      "payloadHex": "f7c0",
+      "accepted": true,
+      "framesHex": [
+        "7c"
+      ]
+    },
+    {
+      "name": "be-compound",
+      "octet": false,
+      "payloadHex": "f86fc5f070e151c232a31383f464d540e1c2a38465462707e8c9aa8b6c4d2e0eefd0b19273543515f6d7b8997a5a0e1c2a3844",
+      "accepted": true,
+      "framesHex": [
+        "04070e151c232a31383f464d54",
+        "3c070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d0",
+        "44070e151c22",
+        "7c"
+      ]
+    },
+    {
+      "name": "be-truncated",
+      "octet": false,
+      "payloadHex": "f86fc5f070e151c232a31383f464d540e1c2a38465462707e8c9aa8b6c4d2e0eefd0b19273543515f6d7b8997a5a0e1c2a38",
+      "accepted": false,
+      "framesHex": []
+    },
+    {
+      "name": "be-trailing",
+      "octet": false,
+      "payloadHex": "f86fc5f070e151c232a31383f464d540e1c2a38465462707e8c9aa8b6c4d2e0eefd0b19273543515f6d7b8997a5a0e1c2a384400",
+      "accepted": false,
+      "framesHex": []
+    },
+    {
+      "name": "be-bad-ft",
+      "octet": false,
+      "payloadHex": "f4c0",
+      "accepted": false,
+      "framesHex": []
+    },
+    {
+      "name": "be-toc-continuation",
+      "octet": false,
+      "payloadHex": "f840",
+      "accepted": false,
+      "framesHex": []
+    },
+    {
+      "name": "be-ignored-padding",
+      "octet": false,
+      "payloadHex": "f041c3854708ca8c4e0fd1935507",
+      "accepted": true,
+      "framesHex": [
+        "04070e151c232a31383f464d54"
+      ]
+    },
+    {
+      "name": "oa-mode-0",
+      "octet": true,
+      "payloadHex": "f004070e151c232a31383f464d54",
+      "accepted": true,
+      "framesHex": [
+        "04070e151c232a31383f464d54"
+      ]
+    },
+    {
+      "name": "oa-mode-1",
+      "octet": true,
+      "payloadHex": "f00c070e151c232a31383f464d545a",
+      "accepted": true,
+      "framesHex": [
+        "0c070e151c232a31383f464d545a"
+      ]
+    },
+    {
+      "name": "oa-mode-2",
+      "octet": true,
+      "payloadHex": "f014070e151c232a31383f464d545b6268",
+      "accepted": true,
+      "framesHex": [
+        "14070e151c232a31383f464d545b6268"
+      ]
+    },
+    {
+      "name": "oa-mode-3",
+      "octet": true,
+      "payloadHex": "f01c070e151c232a31383f464d545b62697074",
+      "accepted": true,
+      "framesHex": [
+        "1c070e151c232a31383f464d545b62697074"
+      ]
+    },
+    {
+      "name": "oa-mode-4",
+      "octet": true,
+      "payloadHex": "f024070e151c232a31383f464d545b626970777e80",
+      "accepted": true,
+      "framesHex": [
+        "24070e151c232a31383f464d545b626970777e80"
+      ]
+    },
+    {
+      "name": "oa-mode-5",
+      "octet": true,
+      "payloadHex": "f02c070e151c232a31383f464d545b626970777e858c",
+      "accepted": true,
+      "framesHex": [
+        "2c070e151c232a31383f464d545b626970777e858c"
+      ]
+    },
+    {
+      "name": "oa-mode-6",
+      "octet": true,
+      "payloadHex": "f034070e151c232a31383f464d545b626970777e858c939aa1a8afb0",
+      "accepted": true,
+      "framesHex": [
+        "34070e151c232a31383f464d545b626970777e858c939aa1a8afb0"
+      ]
+    },
+    {
+      "name": "oa-mode-7",
+      "octet": true,
+      "payloadHex": "f03c070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d0",
+      "accepted": true,
+      "framesHex": [
+        "3c070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d0"
+      ]
+    },
+    {
+      "name": "oa-mode-8",
+      "octet": true,
+      "payloadHex": "f044070e151c22",
+      "accepted": true,
+      "framesHex": [
+        "44070e151c22"
+      ]
+    },
+    {
+      "name": "oa-mode-15",
+      "octet": true,
+      "payloadHex": "f07c",
+      "accepted": true,
+      "framesHex": [
+        "7c"
+      ]
+    },
+    {
+      "name": "oa-compound",
+      "octet": true,
+      "payloadHex": "f084bcc47c070e151c232a31383f464d54070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d0070e151c22",
+      "accepted": true,
+      "framesHex": [
+        "04070e151c232a31383f464d54",
+        "3c070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d0",
+        "44070e151c22",
+        "7c"
+      ]
+    },
+    {
+      "name": "oa-truncated",
+      "octet": true,
+      "payloadHex": "f084bcc47c070e151c232a31383f464d54070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d0070e151c",
+      "accepted": false,
+      "framesHex": []
+    },
+    {
+      "name": "oa-trailing",
+      "octet": true,
+      "payloadHex": "f084bcc47c070e151c232a31383f464d54070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d0070e151c2200",
+      "accepted": false,
+      "framesHex": []
+    },
+    {
+      "name": "oa-bad-ft",
+      "octet": true,
+      "payloadHex": "f04c",
+      "accepted": false,
+      "framesHex": []
+    },
+    {
+      "name": "oa-toc-continuation",
+      "octet": true,
+      "payloadHex": "f084",
+      "accepted": false,
+      "framesHex": []
+    },
+    {
+      "name": "oa-ignored-padding",
+      "octet": true,
+      "payloadHex": "ff07070e151c232a31383f464d55",
+      "accepted": true,
+      "framesHex": [
+        "04070e151c232a31383f464d54"
+      ]
+    }
+  ]
+}

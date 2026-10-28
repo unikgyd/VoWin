@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -87,7 +88,7 @@ public record VoWifiDiagnosticInfo(
     string? FailureCategory = null
 );
 
-public class VoWifiManager : IDisposable
+public partial class VoWifiManager : IDisposable
 {
     public VoWifiState State { get; private set; } = VoWifiState.Disconnected;
     public IkeProposalSuite CurrentSuite { get; private set; } = IkeProposalSuite.Auto;
@@ -105,9 +106,16 @@ public class VoWifiManager : IDisposable
     /// </summary>
     public string? DeviceImei { get; set; }
     public EpdgResolutionResult? EpdgInfo { get; private set; }
+    public EpdgSuccessfulSelection? LastSuccessfulEpdg { get; private set; }
+    public string NetworkPathStatus { get; private set; } = "网络协议栈：连接时自动检测 IPv4 / IPv6";
+    private readonly EpdgConnectionHistoryStore _epdgHistory;
+    private EpdgResolvedEndpoint? _retryGatewayEndpoint;
+    private bool _canTryNextIdentity;
     public string? AssignedIp { get; private set; }
     public DateTime? ConnectedAt { get; private set; }
     public string? LastError { get; private set; }
+    public bool RemoteDeregistered { get; private set; }
+    public string? LastDeregistrationError { get; private set; }
     public string? LastFailureStage { get; private set; }
     public string? LastFailureCategory { get; private set; }
 
@@ -128,6 +136,9 @@ public class VoWifiManager : IDisposable
         }
     }
     public bool KeepOnlineRequested => Volatile.Read(ref _keepOnlineRequested) != 0;
+    public bool AutomaticRecoveryPaused => Volatile.Read(ref _automaticRecoveryPauseReason) is not null || Volatile.Read(ref _ikeRetryPaused);
+    private readonly SipRegistrationRetryGate _imsRetryGate = new();
+    public DateTime? ImsRetryNotBeforeUtc => _lastStartOptions is { } options ? _imsRetryGate.RetryNotBeforeUtc(options.Sim.Iccid) : null;
     public ulong IkeInitiatorSpi { get; private set; }
     public ulong IkeResponderSpi { get; private set; }
     public VoWifiIpsecTunnelInfo? TunnelInfo { get; private set; }
@@ -192,6 +203,7 @@ public class VoWifiManager : IDisposable
 
     private SipTransport? _sipTransport;
     private SipRegisterSession? _registerSession;
+    private Func<byte[], byte[], CancellationToken, Task<(byte[] Res, byte[] Ck, byte[] Ik)>>? _deregisterAkaProvider;
     private ImsIpsecTransport? _imsIpsec;
     private CancellationTokenSource? _sessionCts;
     private CancellationTokenSource? _healthCts;
@@ -199,7 +211,10 @@ public class VoWifiManager : IDisposable
     private int _healthFailures;
     private int _recoveryQueued;
     private int _keepOnlineRequested;
+    private string? _automaticRecoveryPauseReason;
     private CancellationTokenSource? _recoveryCts;
+    private Task? _recoveryTask;
+    private readonly object _recoveryGate = new();
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly SemaphoreSlim _recoveryWake = new(0, 1);
     private bool _disposed;
@@ -224,6 +239,28 @@ public class VoWifiManager : IDisposable
     /// The explicit StartVoWifiAsync custom ePDG still has the highest priority.
     /// </summary>
     public EpdgDiscoveryOptions EpdgDiscovery { get; set; } = new();
+    public EpdgUserConfiguration? UserEpdgConfiguration { get; set; }
+
+    internal EpdgDiscoveryOptions BuildEpdgDiscoveryOptions(string? customEpdg, string? effectiveProxy, IPAddress? localAddress)
+    {
+        var discovery = UserEpdgConfiguration?.ApplyTo(EpdgDiscovery) ?? EpdgDiscovery;
+        var viaProxy = !string.IsNullOrWhiteSpace(effectiveProxy) && !effectiveProxy.Equals("direct", StringComparison.OrdinalIgnoreCase);
+        var preference = discovery.AddressPreference;
+        if (preference is not (EpdgAddressPreference.Ipv4Only or EpdgAddressPreference.Ipv6Only))
+            preference = (viaProxy ? null : localAddress)?.AddressFamily switch
+            {
+                System.Net.Sockets.AddressFamily.InterNetwork => EpdgAddressPreference.Ipv4Preferred,
+                System.Net.Sockets.AddressFamily.InterNetworkV6 => EpdgAddressPreference.Ipv6Preferred,
+                _ => preference
+            };
+        return discovery with
+        {
+            CustomEpdg = customEpdg ?? discovery.CustomEpdg,
+            AddressPreference = preference,
+            RequiredAddressFamily = (viaProxy ? null : localAddress?.AddressFamily) ?? discovery.RequiredAddressFamily,
+            NetworkContext = $"{discovery.NetworkContext}\n{effectiveProxy?.Trim()}\n{localAddress}"
+        };
+    }
     public bool SmsCapabilityConfirmed { get; private set; }
     private Ikev2Transport? _transport;
     private CancellationTokenSource? _ctsEspDispatch;
@@ -231,6 +268,58 @@ public class VoWifiManager : IDisposable
     private readonly Ipv4FragmentReassembler _innerIpv4Reassembler = new();
     private readonly Ipv6FragmentReassembler _innerIpv6Reassembler = new();
     private readonly SmsReassembler _smsReassembler = new();
+    private readonly object _smsSourceGate = new();
+    private SmsSource? _smsSource;
+    private long _smsSourceGeneration;
+    private long _smsStopGeneration;
+    private sealed class SmsSource
+    {
+        public SmsSource(SimIdentity sim, SipTransport transport, VoWifiImsSessionInfo info, string? smsCenter, SipRegisterSession? registration)
+        {
+            Sim = sim; Transport = transport; Info = info; SmsCenter = smsCenter; Registration = registration;
+            StopToken = Stop.Token;
+        }
+        public readonly SimIdentity Sim;
+        public readonly SipTransport Transport;
+        public readonly VoWifiImsSessionInfo Info;
+        public readonly string? SmsCenter;
+        public readonly SipRegisterSession? Registration;
+        public readonly CancellationTokenSource Stop = new();
+        public readonly CancellationToken StopToken;
+        public readonly SmsReassembler Reassembler = new();
+        public readonly ConcurrentDictionary<string, IncomingSmsTransaction> Transactions = new(StringComparer.Ordinal);
+    }
+    public event EventHandler<SmsReceivedEventArgs>? SmsReceived;
+    internal void PublishSmsSource(SimIdentity sim, SipTransport transport, VoWifiImsSessionInfo info, string? smsCenter, SipRegisterSession? registration = null, long? expectedGeneration = null, long? expectedStopGeneration = null)
+    {
+        SmsSource? old;
+        lock (_smsSourceGate)
+        {
+            if (expectedGeneration is { } expected && expected != _smsSourceGeneration ||
+                expectedStopGeneration is { } expectedStop && expectedStop != _smsStopGeneration)
+                throw new OperationCanceledException("The IMS SMS source was stopped while registration was pending.");
+            old = _smsSource;
+            _smsSource = new(sim, transport, info, smsCenter, registration);
+            _smsSourceGeneration++;
+        }
+        if (old != null) { try { old.Stop.Cancel(); } finally { old.Stop.Dispose(); } }
+    }
+    private void InvalidateSmsSource()
+    {
+        SmsSource? source;
+        lock (_smsSourceGate) { source = _smsSource; _smsSource = null; _smsSourceGeneration++; }
+        if (source != null) { try { source.Stop.Cancel(); } finally { source.Stop.Dispose(); } }
+    }
+    /// <summary>Immediate no-I/O fence when the owning slot's verified card or radio source is changing.</summary>
+    public void InvalidateSmsSubscription()
+    {
+        lock (_smsSourceGate) _smsStopGeneration++;
+        InvalidateSmsSource();
+    }
+    private SmsSource? CaptureSmsSource()
+    {
+        lock (_smsSourceGate) return _smsSource;
+    }
     // Inner protocols that are not UDP are logged once each; the tunnel sees the same control
     // packet every few seconds and repeating it would flood the log.
     private readonly ConcurrentDictionary<byte, byte> _ignoredInnerProtocols = new();
@@ -257,16 +346,33 @@ public class VoWifiManager : IDisposable
     // ── C# full-stack IKEv2 backend ─────────────────────────────────────
     private IIkeBackend? _csharpIkeBackend;
 
-    public VoWifiManager(AsyncEventBus? eventBus = null, ModemDriver? modem = null)
+    public VoWifiManager(AsyncEventBus? eventBus = null, ModemDriver? modem = null,
+        EpdgConnectionHistoryStore? epdgHistory = null, IkeRetryGate? ikeRetry = null, string? retryDeviceId = null)
     {
+        _epdgHistory = epdgHistory ?? new();
         EventBus = eventBus;
         Modem = modem;
+        _ikeRetry = ikeRetry ?? new(new MemoryIkeRetryJournalStore(), new WindowsIkeRetryClock());
+        _ikeRetryDeviceId = retryDeviceId ?? Guid.NewGuid().ToString("N");
         NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
+        NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
+    }
+
+    private void OnNetworkAddressChanged(object? sender, EventArgs e) => NotifyNetworkPathChanged();
+
+    internal void NotifyNetworkPathChanged()
+    {
+        // VPN/address changes need not toggle IsAvailable. Wake only offline
+        // recovery; never tear down a healthy session or touch another module.
+        if (_disposed || !KeepOnlineRequested || AutomaticRecoveryPaused ||
+            State is not (VoWifiState.Disconnected or VoWifiState.Failed)) return;
+        try { _recoveryWake.Release(); } catch (SemaphoreFullException) { }
+        QueueAutomaticRecovery("Network address/path changed while VoWiFi was offline; retrying configured DNS.");
     }
 
     private void OnNetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs e)
     {
-        if (!e.IsAvailable || _disposed || Volatile.Read(ref _keepOnlineRequested) == 0)
+        if (!e.IsAvailable || _disposed || Volatile.Read(ref _keepOnlineRequested) == 0 || AutomaticRecoveryPaused)
             return;
 
         if (Volatile.Read(ref _recoveryQueued) != 0)
@@ -300,6 +406,7 @@ public class VoWifiManager : IDisposable
         ArgumentNullException.ThrowIfNull(modem);
         ArgumentNullException.ThrowIfNull(sim);
         Modem = modem;
+        if (_lastStartOptions?.Sim.Iccid != sim.Iccid) ResetIkeRetryPresentation();
         if (_lastStartOptions is { } options)
             _lastStartOptions = options with { Sim = sim, ProxyUrl = ProxyUrl };
 
@@ -349,6 +456,17 @@ public class VoWifiManager : IDisposable
         if (candidates.Select(candidate => candidate.Iccid).Distinct(StringComparer.Ordinal).Count() != 1)
             throw new ArgumentException("All identity candidates must belong to the same live ICCID.", nameof(identityCandidates));
 
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ct.ThrowIfCancellationRequested();
+        Volatile.Write(ref _keepOnlineRequested, 0);
+        _lastStartOptions = null;
+        await CancelAutomaticRecoveryAsync().ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+        _imsRetryGate.ReleasePause(candidates[0].Iccid);
+        // Only an explicit new connection attempt releases a permanent
+        // carrier rejection. Network availability events must not bypass it.
+        Volatile.Write(ref _automaticRecoveryPauseReason, null);
+        ResetIkeRetryPresentation(); // Presentation only; never deletes persistent receipts.
         Volatile.Write(ref _keepOnlineRequested, 1);
         var started = false;
         for (var index = 0; index < candidates.Length; index++)
@@ -357,10 +475,28 @@ public class VoWifiManager : IDisposable
             _lastStartOptions = options;
             if (candidates.Length > 1)
                 EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
-                    $"Trying learned SIM identity candidate {index + 1}/{candidates.Length} for this ICCID.");
+                    $"Trying SIM identity candidate {index + 1}/{candidates.Length} for this ICCID; " +
+                    $"home-PLMN=[{string.Join(',', EpdgResolver.BuildHomePlmnCandidates(candidates[index]).Select(home => home.Mcc + "-" + home.Mnc))}]; source={candidates[index].ImsiSource}.");
 
-            started = await StartVoWifiAttemptAsync(options, ct).ConfigureAwait(false);
-            if (started || !CanTryNextIdentity(LastError))
+            (string Mcc, string Mnc)? authenticatedHome = null;
+            try
+            {
+                var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (var gatewayAttempt = 0; gatewayAttempt < 16; gatewayAttempt++)
+                {
+                    started = await StartVoWifiBoundAttemptAsync(options, ct, excluded, authenticatedHome).ConfigureAwait(false);
+                    if (started || _retryGatewayEndpoint is not { } failed || !excluded.Add(GatewayKey(failed))) break;
+                    authenticatedHome ??= (failed.HomeMcc, failed.HomeMnc);
+                    EventBus?.Publish(EventTopics.SystemLog, "VoWiFi", "IMS transport failed on this ePDG; trying the next discovery candidate.");
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                Volatile.Write(ref _keepOnlineRequested, 0);
+                _lastStartOptions = null;
+                throw;
+            }
+            if (started || !_canTryNextIdentity || authenticatedHome is not null)
                 break;
         }
 
@@ -369,12 +505,20 @@ public class VoWifiManager : IDisposable
         return started;
     }
 
-    private async Task<bool> StartVoWifiAttemptAsync(VoWifiStartOptions options, CancellationToken ct)
+    private Task<bool> StartVoWifiAttemptAsync(VoWifiStartOptions options, CancellationToken ct,
+        IReadOnlySet<string>? excludedGateways = null) =>
+        StartVoWifiBoundAttemptAsync(options, ct, excludedGateways, null);
+
+    private async Task<bool> StartVoWifiBoundAttemptAsync(VoWifiStartOptions options, CancellationToken ct,
+        IReadOnlySet<string>? excludedGateways, (string Mcc, string Mnc)? authenticatedHome)
     {
+        long stopGeneration;
+        lock (_smsSourceGate) stopGeneration = _smsStopGeneration; // Pin intent before queueing for lifecycle ownership.
         await _lifecycleGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            return await StartVoWifiCoreAsync(options, ct).ConfigureAwait(false);
+            if (!IsSmsStartIntentCurrent(options, stopGeneration)) return false;
+            return await StartVoWifiCoreAsync(options, ct, excludedGateways, stopGeneration, authenticatedHome).ConfigureAwait(false);
         }
         finally
         {
@@ -382,8 +526,19 @@ public class VoWifiManager : IDisposable
         }
     }
 
-    private async Task<bool> StartVoWifiCoreAsync(VoWifiStartOptions options, CancellationToken ct)
+    private bool IsSmsStartIntentCurrent(VoWifiStartOptions options, long stopGeneration)
     {
+        lock (_smsSourceGate)
+            return stopGeneration == _smsStopGeneration && Volatile.Read(ref _keepOnlineRequested) != 0 && ReferenceEquals(_lastStartOptions, options);
+    }
+
+    private async Task<bool> StartVoWifiCoreAsync(VoWifiStartOptions options, CancellationToken ct,
+        IReadOnlySet<string>? excludedGateways, long stopGeneration, (string Mcc, string Mnc)? authenticatedHome)
+    {
+        _retryGatewayEndpoint = null;
+        _canTryNextIdentity = false;
+        _typedIkeFailure = false;
+        NetworkPathStatus = "网络协议栈：准备自动检测 IPv4 / IPv6";
         try
         {
             var sim = options.Sim;
@@ -393,10 +548,24 @@ public class VoWifiManager : IDisposable
             _lastStartOptions = options;
             if (_sipTransport != null || _csharpIkeBackend != null)
                 await StopVoWifiCoreAsync(ct).ConfigureAwait(false);
+            if (!IsSmsStartIntentCurrent(options, stopGeneration)) return false;
+            long smsSourceGeneration;
+            lock (_smsSourceGate) smsSourceGeneration = _smsSourceGeneration;
+            // Retained by the manager, not the discarded SIP flow. Neither a
+            // new IKE tunnel nor a network wake is allowed to skip carrier backoff.
+            if (_imsRetryGate.RetryNotBeforeUtc(sim.Iccid) is { } retryAt)
+            {
+                LastError = $"IMS registrar Retry-After: waiting until {retryAt:O} before reconnecting.";
+                SetState(VoWifiState.Failed);
+                EventBus?.Publish(EventTopics.SystemLog, "IMS", LastError);
+            }
+            await _imsRetryGate.WaitUntilAllowedAsync(sim.Iccid, ct).ConfigureAwait(false);
             _sessionCts = new CancellationTokenSource();
             _sipOptionsRejectedByNetwork = false;
             SetState(VoWifiState.ResolvingEpdg);
             LastError = null;
+            RemoteDeregistered = false;
+            LastDeregistrationError = null;
             LastFailureStage = null;
             LastFailureCategory = null;
             var attemptTimer = System.Diagnostics.Stopwatch.StartNew();
@@ -421,21 +590,24 @@ public class VoWifiManager : IDisposable
             var homePlmnCandidates = EpdgResolver.BuildHomePlmnCandidates(sim);
             EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
                 $"Stage 1/4 ePDG discovery started; home-PLMN candidates=[{string.Join(',', homePlmnCandidates.Select(candidate => $"{candidate.Mcc}-{candidate.Mnc}"))}]; custom-ePDG={!string.IsNullOrWhiteSpace(customEpdg)}.");
-            var addressPreference = options.LocalAddress?.AddressFamily switch
-            {
-                System.Net.Sockets.AddressFamily.InterNetwork => EpdgAddressPreference.Ipv4Preferred,
-                System.Net.Sockets.AddressFamily.InterNetworkV6 => EpdgAddressPreference.Ipv6Preferred,
-                _ => EpdgAddressPreference.System
-            };
-            var discovery = EpdgDiscovery with
-            {
-                CustomEpdg = customEpdg ?? EpdgDiscovery.CustomEpdg,
-                AddressPreference = options.LocalAddress == null
-                    ? EpdgDiscovery.AddressPreference
-                    : addressPreference
-            };
-            EpdgInfo = await EpdgResolver.ResolveAsync(sim, discovery, ct)
+            var discovery = BuildEpdgDiscoveryOptions(customEpdg, effectiveProxy, options.LocalAddress);
+            LastSuccessfulEpdg = _epdgHistory.Get(sim);
+            discovery = discovery with { LastSuccessfulSelection = LastSuccessfulEpdg };
+            var admittedCandidates = await FilterIkeCandidatesAsync(sim, discovery, ct).ConfigureAwait(false);
+            EpdgInfo = await EpdgResolver.ResolveCandidatesAsync(sim, discovery, admittedCandidates, ct)
                                          .ConfigureAwait(false);
+            foreach (var query in EpdgInfo.DnsQueries ?? [])
+                EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                    $"ePDG DNS: method={query.Candidate.Method}; host={query.Candidate.Host}; PLMN={query.Candidate.Plmn ?? "home"}; status={query.Status}; addresses={query.Addresses.Length}; elapsed={query.ElapsedMs}ms; resolver={query.Resolver}; detail={query.Detail ?? "none"}; not proxy DNS.");
+            if (EpdgInfo.IpAddresses.Length == 0)
+            {
+                _canTryNextIdentity = true;
+                throw new InvalidOperationException(
+                    $"ePDG DNS resolution returned no addresses for '{EpdgInfo.Fqdn}'. " +
+                    string.Join("; ", (EpdgInfo.DnsQueries ?? []).Select(query => $"{query.Candidate.Host}: {query.Status} ({query.Detail})")) +
+                    $"; requested-family={discovery.RequiredAddressFamily?.ToString() ?? discovery.AddressPreference.ToString()}. " +
+                    "Check DNS/network connectivity and carrier ePDG provisioning; DNS failure alone does not prove the SIM lacks VoWiFi.");
+            }
             // TS 24.011 RP-DATA must use the SMSC provisioned by this SIM.  Do
             // not substitute a number from another carrier when the modem has
             // no value: VoCat likewise uses SIM-provided SMSC/PSI routing.
@@ -455,11 +627,13 @@ public class VoWifiManager : IDisposable
 
             var chosenSuite = suite == IkeProposalSuite.Auto ? EpdgInfo.PreferredSuite : suite;
 
-            var targetIps = EpdgInfo.IpAddresses.Distinct().ToArray();
-            if (targetIps.Length == 0)
-                throw new InvalidOperationException(
-                    $"ePDG DNS resolution returned no addresses for '{EpdgInfo.Fqdn}'. " +
-                    "Check network connectivity or provide a custom ePDG IP.");
+            var paths = EpdgNetworkPathSelector.Select(FilterGatewayRetryCandidates(EpdgInfo.Endpoints!, excludedGateways, authenticatedHome), effectiveProxy, options.LocalAddress,
+                log: message => EventBus?.Publish(EventTopics.SystemLog, "VoWiFi", message));
+            NetworkPathStatus = paths.Summary;
+            var targetEndpoints = await FilterIkeEndpointsAsync(sim, paths.Endpoints, EpdgInfo.Apn ?? "ims", ct).ConfigureAwait(false);
+            if (EpdgInfo.Endpoints!.Count > 0 && targetEndpoints.Length == 0 && excludedGateways?.Count is not > 0)
+                throw new IOException("No usable Windows route/source address to any resolved ePDG IPv4/IPv6 endpoint; check the network or explicit local bind.");
+            if (targetEndpoints.Length == 0) throw new InvalidOperationException("All ePDG candidates for this identity have been attempted.");
 
             // ── 2. Pick AKA Provider ─────────────────────────────────────────
             IAkaProvider akaProvider;
@@ -476,9 +650,15 @@ public class VoWifiManager : IDisposable
                 throw new InvalidOperationException(
                     "USIM is unavailable. Reinsert the card/reader, or reconnect the modem before starting VoWiFi.");
             }
-            if (!await akaProvider.CheckReadyAsync(sim.Iccid, ct).ConfigureAwait(false))
+            if (akaProvider is Ec25AkaProvider ec25)
+            {
+                var ready = await ec25.VerifyUsimReadyAsync(sim.Iccid, requireCardIccid: false, ct).ConfigureAwait(false);
+                if (!ready.Ready)
+                    throw new InvalidOperationException($"USIM preflight failed: {ready.Failure}. Authentication was blocked before EAP-AKA.");
+            }
+            else if (!await akaProvider.CheckReadyAsync(sim.Iccid, ct).ConfigureAwait(false))
                 throw new InvalidOperationException(
-                    "The live USIM ICCID does not match the identity selected for VoWiFi. Authentication was blocked before EAP-AKA; refresh the SIM identity after switching profiles.");
+                    "The selected USIM is not ready or its ICCID does not match. Authentication was blocked before EAP-AKA; refresh the SIM identity after switching profiles.");
             var deviceImei = await ResolveImeiAsync(ct).ConfigureAwait(false);
             EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
                 "Stage 2/4 USIM preflight completed; CPIN/ICCID verified and device identity is available (values redacted).");
@@ -496,9 +676,14 @@ public class VoWifiManager : IDisposable
             var attemptedSuites = new List<string>();
             var negotiationErrors = new List<string>();
             var stopEndpointFailover = false;
+            var authenticatedIkeHome = authenticatedHome;
+            var identityRetryProvenAcrossEndpoints = true;
             var suiteAttempts = GetIkeSuiteAttempts(suite, chosenSuite);
-            foreach (var targetIp in targetIps)
+            foreach (var endpoint in targetEndpoints)
             {
+                if (authenticatedIkeHome is { } pinned && (endpoint.HomeMcc != pinned.Mcc || endpoint.HomeMnc != pinned.Mnc)) continue;
+                var targetIp = endpoint.Address;
+                EpdgInfo = EpdgResolver.SelectEndpoint(EpdgInfo, sim, endpoint);
                 for (var suiteIndex = 0; suiteIndex < suiteAttempts.Count; suiteIndex++)
                 {
                     var attemptSuite = suiteAttempts[suiteIndex];
@@ -506,13 +691,11 @@ public class VoWifiManager : IDisposable
                     attemptedSuites.Add($"{targetIp}/{attemptSuite}");
                     CurrentSuite = attemptSuite;
                     EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
-                        $"Stage 2/4 IKE attempt {attemptedSuites.Count}; suite={attemptSuite}; endpoint-family={targetIp.AddressFamily}; address-family-order=IPv6,Dual,IPv4.");
+                        $"Stage 2/4 IKE attempt {attemptedSuites.Count}; fqdn={endpoint.Candidate.Host}; method={endpoint.Candidate.Method}; home-PLMN={endpoint.HomeMcc}-{endpoint.HomeMnc}; suite={attemptSuite}; outer-family={targetIp.AddressFamily}; inner-family-order=Dual,IPv6,IPv4 (independent of outer route).");
                     EventBus?.Publish("vowifi.ike.attempt", "VoWifiManager",
                         new { Endpoint = targetIp.ToString(), Suite = attemptSuite.ToString(), Attempt = attemptedSuites.Count });
 
-                    _csharpIkeBackend?.Dispose();
-                    _csharpIkeBackend = new CSharpIkeBackend();
-                    ikeResult = await _csharpIkeBackend.StartTunnelAsync(
+                    ikeResult = await StartGovernedIkeAsync(sim, endpoint, apn, backend => backend.StartTunnelAsync(
                         sim,
                         akaProvider,
                         targetIp.ToString(),
@@ -524,17 +707,25 @@ public class VoWifiManager : IDisposable
                         diagnosticLog: message => EventBus?.Publish(EventTopics.SystemLog, "IKE", message),
                         forceNatt: options.ForceNatt,
                         localAddress: options.LocalAddress,
-                        ct: ct).ConfigureAwait(false);
+                        ct: ct), () => IsSmsStartIntentCurrent(options, stopGeneration), ct).ConfigureAwait(false);
 
                     if (ikeResult.Success && !string.IsNullOrEmpty(ikeResult.AssignedIp) && !string.IsNullOrEmpty(ikeResult.PcscfIp))
                         break;
 
                     var error = ikeResult.ErrorMessage ?? "Unknown IKE negotiation error";
                     negotiationErrors.Add($"{targetIp}/{attemptSuite}: {error}");
-                    _csharpIkeBackend.Dispose();
+                    if (ikeResult.FinalAuthVerified) authenticatedIkeHome = (endpoint.HomeMcc, endpoint.HomeMnc);
+                    if (ikeResult.RetryableAddressFamilyFailure) identityRetryProvenAcrossEndpoints = false;
+                    _csharpIkeBackend?.Dispose();
                     _csharpIkeBackend = null;
 
-                    if (IsInitialIkeTimeout(error))
+                    if (ikeResult.RetryableTransportFailure || ikeResult.RetryableAddressFamilyFailure)
+                    {
+                        EventBus?.Publish(EventTopics.SystemLog, "VoWiFi", "ePDG route unavailable or no usable inner address-family configuration; trying the next IPv4/IPv6 endpoint.");
+                        break;
+                    }
+
+                    if (IsInitialIkeTimeout(ikeResult))
                     {
                         // A silent IKE_SA_INIT may mean either an unsupported proposal or a
                         // dead anycast/backend node. In Auto mode exhaust this endpoint's safe
@@ -552,7 +743,7 @@ public class VoWifiManager : IDisposable
                         break;
                     }
 
-                    if (IsProposalNegotiationFailure(error))
+                    if (IsProposalNegotiationFailure(ikeResult))
                     {
                         EventBus?.Publish("vowifi.ike.retry", "VoWifiManager",
                             new { Endpoint = targetIp.ToString(), FailedSuite = attemptSuite.ToString(), Reason = error });
@@ -562,7 +753,7 @@ public class VoWifiManager : IDisposable
                     // The peer rejected the permanent identity before it supplied RAND/AUTN.
                     // No USIM vector has been consumed. Different DNS nodes can be backed by
                     // independent AAA pools, so it is safe to try the next resolved address.
-                    if (IsPreAkaRejection(error))
+                    if (IsPreAkaRejection(ikeResult))
                     {
                         EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
                             $"ePDG {targetIp} rejected EAP before the AKA challenge; trying the next resolved address.");
@@ -574,7 +765,7 @@ public class VoWifiManager : IDisposable
                 }
 
                 if (ikeResult is not { Success: true, AssignedIp: not null, PcscfIp: not null } && !stopEndpointFailover)
-                    EpdgResolver.ReportConnectionFailure(targetIp);
+                    EpdgResolver.ReportConnectionFailure(EpdgInfo, targetIp);
 
                 if (ikeResult is { Success: true, AssignedIp: not null, PcscfIp: not null } || stopEndpointFailover)
                     break;
@@ -582,16 +773,25 @@ public class VoWifiManager : IDisposable
 
             if (ikeResult == null || !ikeResult.Success || string.IsNullOrEmpty(ikeResult.AssignedIp) || string.IsNullOrEmpty(ikeResult.PcscfIp))
             {
+                // Only exhausted, safe pre-AKA attempts may try another known
+                // identity. A post-AKA failure must not be hidden by an earlier
+                // timeout embedded in the aggregate diagnostic message.
+                _canTryNextIdentity = authenticatedIkeHome is null && identityRetryProvenAcrossEndpoints && !stopEndpointFailover;
                 throw new InvalidOperationException(
                     $"IKEv2 session failed after {string.Join(" -> ", attemptedSuites)}: " +
                     string.Join(" | ", negotiationErrors));
             }
 
             IkeInitiatorSpi = ikeResult.InboundSpi;
+            _typedIkeFailure = false; // Subsequent SIP policy is distinct from IKE evidence.
             IkeResponderSpi = ikeResult.OutboundSpi;
 
             AssignedIp = ikeResult.AssignedIp;
             var assignedAddress = IPAddress.Parse(ikeResult.AssignedIp);
+            NetworkPathStatus = (Transport?.Socks5Proxy == null
+                ? $"外层 {IpFamilyLabel(Transport?.RemoteEndpoint.Address.AddressFamily)}"
+                : $"中继链路 {IpFamilyLabel(Transport.LocalEndpoint?.Address.AddressFamily)} → ePDG {IpFamilyLabel(Transport.RemoteEndpoint.Address.AddressFamily)}") +
+                $" · IMS 隧道内 {IpFamilyLabel(assignedAddress.AddressFamily)}（自动协商）";
             TunnelInfo = new VoWifiIpsecTunnelInfo(
                 AccessStandard: "3GPP TS 24.302 (Untrusted Non-3GPP / S2b Interface)",
                 InboundSpi: ikeResult.InboundSpi,
@@ -708,7 +908,8 @@ public class VoWifiManager : IDisposable
                                 // types (errors/ND/status) are consumed without UDP parsing.
                                 continue;
                             }
-                            if (_imsIpsec != null) inner = _imsIpsec.Unprotect(inner);
+                            SipDatagramRoute? responseRoute = null;
+                            if (_imsIpsec != null) inner = _imsIpsec.Unprotect(inner, out responseRoute);
                             if (!IpPacketUtils.IsUdpInnerPacket(inner))
                             {
                                 // ICMPv6/ND/MLD, TCP, ESP and other non-UDP traffic is operator
@@ -718,7 +919,7 @@ public class VoWifiManager : IDisposable
                                 NoteIgnoredInnerProtocol(ignoredProtocol);
                                 continue;
                             }
-                            var packet = IpPacketUtils.ParseUdpPacket(inner);
+                            var packet = IpPacketUtils.ParseUdpPacket(inner) with { ResponseRoute = responseRoute };
                             if (!packet.LocalEndPoint.Address.Equals(assignedIp))
                                 throw new FormatException("Inner packet destination does not match assigned IP.");
                             if (_imsIpsec?.AcceptsPort(packet.LocalEndPoint.Port) ?? packet.LocalEndPoint.Port == imsProfile.LocalPort)
@@ -772,20 +973,41 @@ public class VoWifiManager : IDisposable
                 _sipTransport.Connect(pcscfAddr, remotePort: 5060, localPort: imsProfile.LocalPort);
             }
 
+            SipDatagramRoute? pendingRegistrationRoute = null;
             var session = new SipRegisterSession(_sipTransport, imsProfile, _imsIpsec?.Proposal,
                 _imsIpsec == null ? null : (agreement, ck, ik) =>
                 {
-                    _imsIpsec.Activate(agreement, ck, ik);
-                    _sipTransport.SetEndpoints(new IPEndPoint(IPAddress.Parse(AssignedIp!), agreement.Selected.PortClient),
-                        new IPEndPoint(pcscfAddr, agreement.PcscfServerPort));
+                    pendingRegistrationRoute = _imsIpsec.Stage(agreement, ck, ik);
                 },
-                diagnosticLog: message => EventBus?.Publish(EventTopics.SystemLog, "IMS", message));
+                diagnosticLog: message => EventBus?.Publish(EventTopics.SystemLog, "IMS", message),
+                retryGate: _imsRetryGate, retryScope: sim.Iccid,
+                createRenewalSecurityProposal: _imsIpsec is null ? null : _imsIpsec.CreateRenewalProposal,
+                registrationAccepted: _ =>
+                {
+                    if (pendingRegistrationRoute is not { } route) return;
+                    _imsIpsec!.Commit(route.SecurityGeneration!.Value);
+                    _sipTransport.SetEndpoints(route.LocalEndPoint, route.RemoteEndPoint, route.SecurityGeneration);
+                    pendingRegistrationRoute = null;
+                });
+            _sipTransport.PreparingOutgoingRequest += request =>
+            {
+                if (request.Method == "REGISTER" && pendingRegistrationRoute is { } negotiating)
+                    request.OutgoingRoute = negotiating;
+                else if (_imsIpsec?.GetActiveRoute() is { } active)
+                {
+                    // Capture route and Security-Verify together before a commit can
+                    // change the default; retransmission retains this exact generation.
+                    request.OutgoingRoute = active.Route;
+                    request.SetHeader("Security-Verify", active.SecurityVerify);
+                }
+            };
             _registerSession = session;
             async Task<(byte[] Res, byte[] Ck, byte[] Ik)> Authenticate(byte[] rand, byte[] autn, CancellationToken token)
             {
                 var akaRes = await akaProvider.AuthenticateAsync(AkaChallenge.Create(rand, autn), token).ConfigureAwait(false);
                 return (akaRes.Res!, akaRes.Ck!, akaRes.Ik!);
             }
+            _deregisterAkaProvider = Authenticate;
             EventBus?.Publish(EventTopics.SystemLog, "IMS",
                 $"REGISTER diagnostics started; P-CSCF={pcscfAddr}:5060; UE={assignedAddress}; transport={assignedAddress.AddressFamily}; IMS-IPsec={_imsIpsec is not null}.");
             var regResult = await session.RegisterAsync(Authenticate, ct).ConfigureAwait(false);
@@ -819,13 +1041,17 @@ public class VoWifiManager : IDisposable
             };
             session.RegistrationFailed += (_, error) =>
             {
-                QueueAutomaticRecovery($"IMS registration refresh failed after retries: {error}");
+                QueueAutomaticRecovery($"IMS registration refresh requires recovery: {error}");
             };
             if (!SmsCapabilityConfirmed)
                 EventBus?.Publish(EventTopics.SystemLog, "VoWiFi", "IMS registered, but this Contact's SMS capability was not confirmed by the registrar.");
             try { ImsRegistered?.Invoke(this, ImsInfo); } catch { }
+            PublishSmsSource(sim, _sipTransport, ImsInfo, EpdgInfo.SmsCenter, session, smsSourceGeneration, stopGeneration);
             SetState(VoWifiState.ImsRegistered);
             ConnectedAt = DateTime.UtcNow;
+            EpdgResolver.ReportConnectionSuccess(EpdgInfo, EpdgInfo.IpAddresses[0]);
+            _epdgHistory.MarkRegistered(sim, EpdgInfo);
+            LastSuccessfulEpdg = _epdgHistory.Get(sim);
             EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
                 $"Stage 4/4 IMS registration completed; elapsed={attemptTimer.ElapsedMilliseconds}ms; SIP registration accepted.");
             session.StartRefreshing(Authenticate);
@@ -833,21 +1059,67 @@ public class VoWifiManager : IDisposable
 
             return true;
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            try { await StopVoWifiCoreAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
+            throw;
+        }
         catch (Exception ex)
         {
-            var failure = ex.Message;
-            var failedState = State;
-            LastFailureStage = DescribeFailureStage(failedState);
-            LastFailureCategory = DescribeFailureCategory(failedState, failure);
-            EventBus?.Publish(EventTopics.SystemError, "IMS",
-                $"VoWiFi failure; stage={LastFailureStage}; category={LastFailureCategory}; state={failedState}; error={failure}");
-            try { await StopVoWifiCoreAsync(CancellationToken.None).ConfigureAwait(false); } catch { }
-            LastError = failure;
-            SetState(VoWifiState.Failed);
-            try { VoWifiError?.Invoke(this, failure); } catch { }
-            EventBus?.Publish("vowifi.error", "VoWifiManager", failure);
+            await CompleteFailedStartAsync(ex, State, EpdgInfo,
+                () => StopVoWifiCoreAsync(CancellationToken.None), ct, options.Sim.Iccid).ConfigureAwait(false);
             return false;
         }
+    }
+
+    // Called while the lifecycle owner is held. Selecting an endpoint to retry
+    // does not authorize a replacement until all local teardown has returned.
+    internal async Task CompleteFailedStartAsync(Exception error, VoWifiState failedState,
+        EpdgResolutionResult? failedDiscovery, Func<Task> cleanup, CancellationToken ct = default, string? retryIccid = null)
+    {
+        _retryGatewayEndpoint = null;
+        var pauseRegistration = error is SipRegistrationRetryBlockedException { AutomaticRecoveryPaused: true } ||
+            _registerSession?.LastFailure is { PauseAutomaticRecovery: true };
+        string? nextGatewayKey = null;
+        EpdgResolvedEndpoint? failedEndpoint = null;
+        if (CanFailOverImsTransport(failedState, error) && failedDiscovery is { IpAddresses.Length: > 0 })
+        {
+            failedEndpoint = failedDiscovery.Endpoints?.FirstOrDefault(endpoint => endpoint.Candidate.Host == failedDiscovery.Fqdn &&
+                endpoint.Address.Equals(failedDiscovery.IpAddresses[0]) && endpoint.HomeMcc == failedDiscovery.HomeMcc && endpoint.HomeMnc == failedDiscovery.HomeMnc);
+            if (failedEndpoint is not null) nextGatewayKey = GatewayKey(failedEndpoint);
+        }
+        var failure = error.Message;
+        if (error is IkeRetryGateException retryError)
+        {
+            SetIkeRetryFailure(retryError,retryIccid);
+            failure = DescribeIkeRetryFailure(retryError);
+        }
+        LastFailureStage = DescribeFailureStage(failedState);
+        LastFailureCategory = DescribeFailureCategory(failedState, failure);
+        try
+        {
+            await cleanup().ConfigureAwait(false);
+            if (!ct.IsCancellationRequested && nextGatewayKey is not null && failedEndpoint is not null)
+            {
+                EpdgResolver.ReportConnectionFailure(failedDiscovery!, failedEndpoint.Address);
+                _retryGatewayEndpoint = failedEndpoint;
+            }
+        }
+        catch (Exception cleanupError)
+        {
+            _canTryNextIdentity = false;
+            failure += " Cleanup incomplete; automatic retries are paused: " + cleanupError.Message;
+            Volatile.Write(ref _automaticRecoveryPauseReason, failure);
+        }
+        if (pauseRegistration)
+            Volatile.Write(ref _automaticRecoveryPauseReason, failure);
+        LastError = failure;
+        SetState(VoWifiState.Failed);
+        EventBus?.Publish(EventTopics.SystemError, "IMS",
+            $"VoWiFi failure; stage={LastFailureStage}; category={LastFailureCategory}; state={failedState}; error={failure}");
+        try { VoWifiError?.Invoke(this, failure); } catch { }
+        EventBus?.Publish("vowifi.error", "VoWifiManager", failure);
+        ct.ThrowIfCancellationRequested();
     }
 
     public async Task<(bool Success, long RttMs, string Status)> ProbeLivenessAsync(CancellationToken token = default)
@@ -1007,92 +1279,176 @@ public class VoWifiManager : IDisposable
 
     private void QueueAutomaticRecovery(string reason)
     {
-        if (Volatile.Read(ref _keepOnlineRequested) == 0 || _lastStartOptions == null)
+        if (Volatile.Read(ref _keepOnlineRequested) == 0 || _lastStartOptions == null || AutomaticRecoveryPaused)
             return;
-        if (IsNonRetryableEpdgRejection(reason))
+        if (!_typedIkeFailure && IsNonRetryableEpdgRejection(reason))
         {
-            LastError = reason;
-            EventBus?.Publish(EventTopics.SystemError, "VoWiFi",
-                reason + " Automatic retries are paused; retry manually after the network backoff or after correcting the SIM/APN authorization.");
+            PauseAutomaticRecovery(reason);
             return;
         }
-        if (Interlocked.Exchange(ref _recoveryQueued, 1) != 0)
-            return;
-
-        var recoveryCts = new CancellationTokenSource();
-        _recoveryCts = recoveryCts;
-        var token = recoveryCts.Token;
-        LastError = reason;
-        SmsCapabilityConfirmed = false;
-        SetState(VoWifiState.Failed);
-        EventBus?.Publish(EventTopics.SystemError, "VoWiFi", reason + " Reconnecting automatically.");
-
-        _ = Task.Run(async () =>
+        lock (_recoveryGate)
         {
-            try
+            if (_disposed || _recoveryQueued != 0 || !KeepOnlineRequested || _lastStartOptions is null || AutomaticRecoveryPaused)
+                return;
+            Volatile.Write(ref _recoveryQueued, 1);
+            var recoveryCts = new CancellationTokenSource();
+            _recoveryCts = recoveryCts;
+            var token = recoveryCts.Token;
+            _recoveryTask = Task.Run(async () =>
             {
-                await StopVoWifiAttemptAsync(token).ConfigureAwait(false);
-                var attempt = 0;
-                var waitingForModemLogged = false;
-                while (!token.IsCancellationRequested && Volatile.Read(ref _keepOnlineRequested) != 0)
+                try
                 {
-                    if (State == VoWifiState.ImsRegistered)
-                        return;
-
-                    if (Modem == null || !Modem.IsOpen)
+                    token.ThrowIfCancellationRequested();
+                    LastError = reason;
+                    SmsCapabilityConfirmed = false;
+                    SetState(VoWifiState.Failed);
+                    EventBus?.Publish(EventTopics.SystemError, "VoWiFi", reason + " Reconnecting automatically.");
+                    await StopVoWifiAttemptAsync(token).ConfigureAwait(false);
+                    var attempt = 0;
+                    while (!token.IsCancellationRequested && Volatile.Read(ref _keepOnlineRequested) != 0)
                     {
-                        if (!waitingForModemLogged)
+                        if (State == VoWifiState.ImsRegistered)
+                            return;
+
+                        var retryScope = _lastStartOptions?.Sim.Iccid;
+                        if (retryScope is null) return;
+                        await _imsRetryGate.WaitUntilAllowedAsync(retryScope, token).ConfigureAwait(false);
+                        if (!await WaitForIkeRetryAsync(token).ConfigureAwait(false)) return;
+
+                        // A PC/SC provider is a complete AKA source; it must not
+                        // wait forever for an unrelated AT modem. Re-read the
+                        // expected ICCID after hotplug, and poll even without URCs.
+                        if (!await WaitForRecoverySourceAsync(() => _lastStartOptions?.Sim.Iccid, token).ConfigureAwait(false))
+                            return;
+
+                        var delay = GetRecoveryDelay(attempt);
+                        // A Windows network-availability event wakes a backed-off retry
+                        // immediately after Wi-Fi/Ethernet returns from an outage or sleep.
+                        await _recoveryWake.WaitAsync(delay, token).ConfigureAwait(false);
+                        if (State == VoWifiState.ImsRegistered)
+                            return;
+                        var options = _lastStartOptions;
+                        if (options == null || Volatile.Read(ref _keepOnlineRequested) == 0)
+                            return;
+                        if (!await IsRecoverySourceReadyAsync(options.Sim.Iccid, token).ConfigureAwait(false))
                         {
-                            waitingForModemLogged = true;
-                            LastError = "VoWiFi registration is waiting for the USIM module to return.";
-                            EventBus?.Publish(EventTopics.SystemLog, "VoWiFi", LastError);
+                            attempt = 0;
+                            continue;
                         }
-                        await _recoveryWake.WaitAsync(token).ConfigureAwait(false);
-                        attempt = 0;
-                        continue;
-                    }
-                    waitingForModemLogged = false;
 
-                    var delay = GetRecoveryDelay(attempt);
-                    // A Windows network-availability event wakes a backed-off retry
-                    // immediately after Wi-Fi/Ethernet returns from an outage or sleep.
-                    await _recoveryWake.WaitAsync(delay, token).ConfigureAwait(false);
-                    if (State == VoWifiState.ImsRegistered)
-                        return;
-                    if (Modem == null || !Modem.IsOpen)
-                        continue;
-                    var options = _lastStartOptions;
-                    if (options == null || Volatile.Read(ref _keepOnlineRequested) == 0)
-                        return;
-
-                    attempt++;
-                    EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
-                        $"Starting automatic VoWiFi recovery attempt {attempt}.");
-                    if (await StartVoWifiAttemptAsync(options, token).ConfigureAwait(false))
-                    {
+                        attempt++;
                         EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
-                            $"Automatic VoWiFi recovery succeeded on attempt {attempt}.");
-                        return;
-                    }
+                            $"Starting automatic VoWiFi recovery attempt {attempt}.");
+                        if (await StartVoWifiAttemptAsync(options, token).ConfigureAwait(false))
+                        {
+                            EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                                $"Automatic VoWiFi recovery succeeded on attempt {attempt}.");
+                            return;
+                        }
 
-                    EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
-                        $"Automatic VoWiFi recovery attempt {attempt} failed; retrying while VoWiFi remains enabled.");
+                        if (PauseAutomaticRecoveryIfRejected(LastError)) return;
+                        EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
+                            $"Automatic VoWiFi recovery attempt {attempt} failed; retrying while VoWiFi remains enabled.");
+                    }
                 }
-            }
-            catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-            catch (Exception ex)
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+                catch (Exception ex)
+                {
+                    if (ex is SipRegistrationRetryBlockedException { AutomaticRecoveryPaused: true })
+                        Volatile.Write(ref _automaticRecoveryPauseReason, ex.Message);
+                    LastError = $"Automatic VoWiFi recovery failed: {ex.Message}";
+                    SetState(VoWifiState.Failed);
+                    EventBus?.Publish(EventTopics.SystemError, "VoWiFi", LastError);
+                }
+                finally
+                {
+                    lock (_recoveryGate)
+                    {
+                        if (ReferenceEquals(_recoveryCts, recoveryCts)) _recoveryCts = null;
+                        Volatile.Write(ref _recoveryQueued, 0);
+                    }
+                    recoveryCts.Dispose();
+                    if (KeepOnlineRequested && Volatile.Read(ref _automaticRecoveryPauseReason) is { } pausedReason)
+                        ReportRecoveryPaused(pausedReason);
+                }
+            });
+        }
+    }
+
+    internal Task RecoveryCompletion
+    {
+        get { lock (_recoveryGate) return _recoveryTask ?? Task.CompletedTask; }
+    }
+
+    private Task CancelAutomaticRecoveryAsync()
+    {
+        CancellationTokenSource? source;
+        Task? completion;
+        lock (_recoveryGate) { source = _recoveryCts; completion = _recoveryTask; }
+        // The worker can finish between the snapshot and cancellation.
+        try { source?.Cancel(); } catch (ObjectDisposedException) { }
+        return completion ?? Task.CompletedTask;
+    }
+
+    internal async Task<bool> IsRecoverySourceReadyAsync(string expectedIccid, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (AkaProvider is not { } provider)
+            return Modem is { IsOpen: true }; // Startup performs the full modem USIM check before IKE.
+        try
+        {
+            var ready = await provider.CheckReadyAsync(expectedIccid, ct).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            // A hotplug can replace the provider while its card read is in flight.
+            return ready && ReferenceEquals(AkaProvider, provider);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception) { return false; } // Unavailable/replaced card: no AKA and no network attempt.
+    }
+
+    internal async Task<bool> WaitForRecoverySourceAsync(Func<string?> expectedIccid,
+        CancellationToken ct, TimeSpan? pollInterval = null)
+    {
+        var logged = false;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var expected = expectedIccid();
+            if (expected is null) return false; // Explicit stop cleared the saved connection intent.
+            if (await IsRecoverySourceReadyAsync(expected, ct).ConfigureAwait(false)) return true;
+            if (!logged)
             {
-                LastError = $"Automatic VoWiFi recovery failed: {ex.Message}";
-                SetState(VoWifiState.Failed);
-                EventBus?.Publish(EventTopics.SystemError, "VoWiFi", LastError);
+                logged = true;
+                LastError = "VoWiFi recovery is waiting for the expected USIM in its card reader or module.";
+                EventBus?.Publish(EventTopics.SystemLog, "VoWiFi", LastError);
             }
-            finally
-            {
-                Interlocked.CompareExchange(ref _recoveryCts, null, recoveryCts);
-                recoveryCts.Dispose();
-                Interlocked.Exchange(ref _recoveryQueued, 0);
-            }
-        });
+            // Reader reinsertion does not generate a modem URC or necessarily
+            // a network event. Keep the readiness wait bounded and cancellable.
+            await _recoveryWake.WaitAsync(pollInterval ?? TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
+        }
+    }
+
+    internal bool PauseAutomaticRecoveryIfRejected(string? reason)
+    {
+        if (_typedIkeFailure) return false;
+        if (!IsNonRetryableEpdgRejection(reason)) return false;
+        PauseAutomaticRecovery(reason!);
+        return true;
+    }
+
+    private void PauseAutomaticRecovery(string reason)
+    {
+        Volatile.Write(ref _automaticRecoveryPauseReason, reason);
+        _ = CancelAutomaticRecoveryAsync(); // Also stop a worker already waiting for a returned card.
+        ReportRecoveryPaused(reason);
+    }
+
+    private void ReportRecoveryPaused(string reason)
+    {
+        SmsCapabilityConfirmed = false;
+        LastError = reason + " Automatic retries are paused; retry manually after the network backoff or after correcting the SIM/APN authorization.";
+        SetState(VoWifiState.Failed);
+        EventBus?.Publish(EventTopics.SystemError, "VoWiFi", LastError);
     }
 
     private static TimeSpan GetRecoveryDelay(int failedAttempts)
@@ -1146,14 +1502,18 @@ public class VoWifiManager : IDisposable
 
     public async Task StopVoWifiAsync(CancellationToken ct = default)
     {
+        InvalidateSmsSubscription(); // Fence intent before waiting even for a stalled recovery worker.
         Volatile.Write(ref _keepOnlineRequested, 0);
         _lastStartOptions = null;
-        _recoveryCts?.Cancel();
+        await CancelAutomaticRecoveryAsync().ConfigureAwait(false);
+        Volatile.Write(ref _automaticRecoveryPauseReason, null);
+        ResetIkeRetryPresentation();
         await StopVoWifiAttemptAsync(ct).ConfigureAwait(false);
     }
 
     private async Task StopVoWifiAttemptAsync(CancellationToken ct)
     {
+        InvalidateSmsSource(); // Never wait for a multipart sender before fencing its next part.
         await _lifecycleGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -1167,6 +1527,7 @@ public class VoWifiManager : IDisposable
 
     private async Task StopVoWifiCoreAsync(CancellationToken ct)
     {
+        InvalidateSmsSource();
         var healthCts = _healthCts;
         var healthTask = _healthTask;
         _healthCts = null;
@@ -1181,15 +1542,28 @@ public class VoWifiManager : IDisposable
         if (_registerSession != null)
         {
             await _registerSession.StopRefreshingAsync().ConfigureAwait(false);
-            try { await _registerSession.DeregisterAsync(ct).ConfigureAwait(false); }
+            var hadBinding = _registerSession.LastResult is not null;
+            try
+            {
+                if (hadBinding)
+                {
+                    if (_deregisterAkaProvider is { } authenticate)
+                        await _registerSession.DeregisterAsync(authenticate, ct).ConfigureAwait(false);
+                    else await _registerSession.DeregisterAsync(ct).ConfigureAwait(false);
+                }
+                RemoteDeregistered = hadBinding;
+                LastDeregistrationError = null;
+            }
             catch (Exception ex)
             {
+                RemoteDeregistered = false;
+                LastDeregistrationError = ex.Message;
                 EventBus?.Publish(EventTopics.SystemError, "IMS", $"Graceful SIP de-registration failed: {ex.Message}");
             }
-
-            EpdgResolver.ReportConnectionSuccess();
+            _registerSession.Dispose();
         }
         _registerSession = null;
+        _deregisterAkaProvider = null;
         _sessionCts?.Cancel();
         ClearRtpSessions();
         SmsCapabilityConfirmed = false;
@@ -1355,39 +1729,27 @@ public class VoWifiManager : IDisposable
         return "unclassified";
     }
 
-    private static bool IsProposalNegotiationFailure(string message)
+    private static bool IsProposalNegotiationFailure(IkeBackendResult result) => result.RetryableInitialProposal;
+
+    private static bool IsInitialIkeTimeout(IkeBackendResult result) => result.RetryableInitialTimeout;
+
+    private static bool IsPreAkaRejection(IkeBackendResult result) => result.RetryableIdentityRejection;
+
+    private static string GatewayKey(EpdgResolvedEndpoint endpoint) =>
+        $"{endpoint.Candidate.Host}|{endpoint.Address}|{endpoint.HomeMcc}|{endpoint.HomeMnc}";
+
+    internal static EpdgResolvedEndpoint[] FilterGatewayRetryCandidates(IReadOnlyList<EpdgResolvedEndpoint> endpoints,
+        IReadOnlySet<string>? excluded, (string Mcc, string Mnc)? authenticatedHome) => endpoints.Where(endpoint =>
+            excluded?.Contains(GatewayKey(endpoint)) != true && (authenticatedHome is null ||
+            endpoint.HomeMcc == authenticatedHome.Value.Mcc && endpoint.HomeMnc == authenticatedHome.Value.Mnc)).ToArray();
+
+    private static string IpFamilyLabel(AddressFamily? family) => family switch
     {
-        // This intentionally excludes EAP, AUTH, CHILD_SA and CP errors. Only an
-        // early proposal rejection is a reason to offer another algorithm family.
-        // Some ePDGs silently discard an unsupported IKE_SA_INIT instead of
-        // returning NO_PROPOSAL_CHOSEN. Message ID 0 is before EAP-AKA, so it is
-        // safe to retry that timeout with another suite without consuming an AKA
-        // vector or hiding an authentication failure.
-        return message.Contains("no proposal", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("NO_PROPOSAL_CHOSEN", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("missing SA payload", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("invalid_ke", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("invalid ke", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("DH group", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("Diffie-Hellman group", StringComparison.OrdinalIgnoreCase) ||
-               message.Contains("unsupported suite", StringComparison.OrdinalIgnoreCase) ||
-               (message.Contains("timed out", StringComparison.OrdinalIgnoreCase) &&
-                (message.Contains("Message ID 0", StringComparison.OrdinalIgnoreCase) ||
-                 message.Contains("IKE_SA_INIT", StringComparison.OrdinalIgnoreCase)));
-    }
+        AddressFamily.InterNetwork => "IPv4", AddressFamily.InterNetworkV6 => "IPv6", _ => "未确定"
+    };
 
-    private static bool IsInitialIkeTimeout(string message) =>
-        message.Contains("timed out", StringComparison.OrdinalIgnoreCase) &&
-        (message.Contains("Message ID 0", StringComparison.OrdinalIgnoreCase) ||
-         message.Contains("IKE_SA_INIT", StringComparison.OrdinalIgnoreCase));
-
-    private static bool IsPreAkaRejection(string message) =>
-        message.Contains("EAP-AKA authentication rejected", StringComparison.OrdinalIgnoreCase) &&
-        message.Contains("before AKA challenge response", StringComparison.OrdinalIgnoreCase);
-
-    private static bool CanTryNextIdentity(string? message) => message != null &&
-        (message.Contains("ePDG DNS resolution returned no addresses", StringComparison.OrdinalIgnoreCase) ||
-         message.Contains("IKEv2 session failed", StringComparison.OrdinalIgnoreCase));
+    internal static bool CanFailOverImsTransport(VoWifiState state, Exception error) =>
+        state == VoWifiState.ImsRegistering && SipRegistrationTransportException.HasUnmixedProof(error);
 
     /// <summary>
     /// Reads the device IMEI from the modem. IMS registration sends this in the instance ID,
@@ -1508,12 +1870,19 @@ public class VoWifiManager : IDisposable
     /// </summary>
     private void OnIncomingSipRequestReceived(object? sender, SipMessage request)
     {
+        if (request.Method.Equals("MESSAGE", StringComparison.OrdinalIgnoreCase))
+        {
+            var source = CaptureSmsSource();
+            if (source == null || !ReferenceEquals(sender, source.Transport)) return;
+            _ = RouteIncomingSipRequestAsync(request, source);
+            return;
+        }
         _ = RouteIncomingSipRequestAsync(request);
     }
 
-    private async Task RouteIncomingSipRequestAsync(SipMessage request)
+    private async Task RouteIncomingSipRequestAsync(SipMessage request, SmsSource? smsSource = null)
     {
-        var transport = _sipTransport;
+        var transport = smsSource?.Transport ?? _sipTransport;
         if (transport == null) return;
 
         Task Reply(SipMessage response) => transport.SendAsync(response);
@@ -1540,12 +1909,12 @@ public class VoWifiManager : IDisposable
             }
             if (request.Method.Equals("MESSAGE", StringComparison.OrdinalIgnoreCase))
             {
-                await HandleIncomingSipMessageAsync(request, Reply, ct: _sessionCts?.Token ?? default).ConfigureAwait(false);
+                await HandleIncomingSipMessageCoreAsync(request, Reply, null, smsSource?.StopToken ?? _sessionCts?.Token ?? default, smsSource).ConfigureAwait(false);
                 return;
             }
             if (request.Method.Equals("UPDATE", StringComparison.OrdinalIgnoreCase))
             {
-                if (Calls != null && (Calls.State is CallState.Active or CallState.Held))
+                if (Calls != null && (Calls.State is CallState.Incoming or CallState.Active or CallState.Held))
                     await Calls.HandleIncomingUpdateAsync(request, Reply).ConfigureAwait(false);
                 else
                     await Reply(request.CreateResponse(481, "Call/Transaction Does Not Exist")).ConfigureAwait(false);
@@ -1564,7 +1933,16 @@ public class VoWifiManager : IDisposable
                 }
                 return;
             }
-            if (request.Method.Equals("ACK", StringComparison.OrdinalIgnoreCase)) return;
+            if (request.Method.Equals("ACK", StringComparison.OrdinalIgnoreCase))
+            {
+                Calls?.HandleIncomingAck(request);
+                return;
+            }
+            if (request.Method.Equals("PRACK", StringComparison.OrdinalIgnoreCase))
+            {
+                if (Calls != null) await Calls.HandleIncomingPrackAsync(request, Reply).ConfigureAwait(false);
+                return;
+            }
 
             var status = request.Method.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase) ? 200 : 405;
             var reason = status == 200 ? "OK" : "Method Not Allowed";
@@ -1576,9 +1954,13 @@ public class VoWifiManager : IDisposable
         }
     }
 
-    public async Task HandleIncomingSipMessageAsync(
+    public Task HandleIncomingSipMessageAsync(
         SipMessage request, Func<SipMessage, Task> replySender,
-        Func<SipMessage, Task<SipMessage>>? reportSender = null, CancellationToken ct = default)
+        Func<SipMessage, Task<SipMessage>>? reportSender = null, CancellationToken ct = default) =>
+        HandleIncomingSipMessageCoreAsync(request, replySender, reportSender, ct, CaptureSmsSource());
+
+    private async Task HandleIncomingSipMessageCoreAsync(SipMessage request, Func<SipMessage, Task> replySender,
+        Func<SipMessage, Task<SipMessage>>? reportSender, CancellationToken ct, SmsSource? source)
     {
         var contentType = request.GetHeader("Content-Type");
         EventBus?.Publish(EventTopics.SystemLog, "VoWiFi",
@@ -1593,16 +1975,17 @@ public class VoWifiManager : IDisposable
         await replySender(ImsSmsHandler.BuildSipResponse(request, 200, "vowifi-sms")).ConfigureAwait(false);
         var key = $"{request.GetHeader("Call-ID")}|{request.GetHeader("CSeq")}|{request.GetHeader("Via")}";
         var now = DateTime.UtcNow;
-        foreach (var entry in _incomingSmsTransactions)
+        var transactions = source?.Transactions ?? _incomingSmsTransactions;
+        foreach (var entry in transactions)
             if (entry.Value.Work.IsValueCreated && entry.Value.Work.Value.IsCompleted && now - entry.Value.Created > TimeSpan.FromMinutes(2))
-                _incomingSmsTransactions.TryRemove(entry.Key, out _);
-        var transaction = _incomingSmsTransactions.GetOrAdd(key, _ => new IncomingSmsTransaction(now,
-            new Lazy<Task>(() => ProcessIncomingSmsAsync(request, reportSender, ct), LazyThreadSafetyMode.ExecutionAndPublication)));
+                transactions.TryRemove(entry.Key, out _);
+        var transaction = transactions.GetOrAdd(key, _ => new IncomingSmsTransaction(now,
+            new Lazy<Task>(() => ProcessIncomingSmsAsync(request, reportSender, ct, source), LazyThreadSafetyMode.ExecutionAndPublication)));
         await transaction.Work.Value.ConfigureAwait(false);
     }
 
     private async Task ProcessIncomingSmsAsync(SipMessage request,
-        Func<SipMessage, Task<SipMessage>>? reportSender, CancellationToken ct)
+        Func<SipMessage, Task<SipMessage>>? reportSender, CancellationToken ct, SmsSource? source)
     {
         byte reference = 0;
         byte[] report;
@@ -1624,10 +2007,18 @@ public class VoWifiManager : IDisposable
             }
             else
             {
-                var fullSms = _smsReassembler.ProcessIncomingPart(decoded);
+                var fullSms = (source?.Reassembler ?? _smsReassembler).ProcessIncomingPart(decoded);
                 if (fullSms != null)
                 {
-                    EventBus?.Publish(EventTopics.SmsIncoming, "VoWifiManager", fullSms);
+                    var handler = SmsReceived;
+                    if (handler != null)
+                    {
+                        var received = new SmsMessage(0, SmsStatus.Unread, fullSms.SenderNumber, fullSms.Text, fullSms.Timestamp,
+                            fullSms.RawPdu, ServiceCenterTimestamp: fullSms.ServiceCenterTimestamp, Concat: fullSms.Concat,
+                            Id: request.GetHeader("Call-ID") + ":" + request.GetHeader("CSeq"));
+                        handler.Invoke(this, new(received, simBinding: SmsSubscriptionIdentity.ForIccid(source?.Sim.Iccid)));
+                    }
+                    else EventBus?.Publish(EventTopics.SmsIncoming, "VoWifiManager", fullSms);
                     EventBus?.Publish(EventTopics.SmsReceived, "VoWifiManager", fullSms);
                     EventBus?.Publish("vowifi.sms.received", "VoWifiManager", fullSms);
                 }
@@ -1643,10 +2034,11 @@ public class VoWifiManager : IDisposable
 
         var target = FirstSipUri(request.GetHeader("P-Asserted-Identity")) ?? FirstSipUri(request.GetHeader("From"))
             ?? throw new FormatException("SMS delivery report has no IP-SM-GW target.");
-        var message = BuildSmsMessage(target, report, request.GetHeader("Call-ID"), FirstSipUri(request.GetHeader("To")));
+        ct.ThrowIfCancellationRequested();
+        var message = BuildSmsMessage(target, report, request.GetHeader("Call-ID"), FirstSipUri(request.GetHeader("To")), source);
         var response = reportSender != null
             ? await reportSender(message).ConfigureAwait(false)
-            : await (_sipTransport ?? throw new InvalidOperationException("SIP transport is unavailable."))
+            : await (source?.Transport ?? _sipTransport ?? throw new InvalidOperationException("SIP transport is unavailable."))
                 .SendAndReceiveFinalAsync(message, ct: ct).ConfigureAwait(false);
         if (response.StatusCode is < 200 or >= 300)
             throw new InvalidOperationException($"SMS delivery report rejected: SIP {response.StatusCode}.");
@@ -1662,11 +2054,13 @@ public class VoWifiManager : IDisposable
         return match.Groups[1].Value.Split(";tag=", StringSplitOptions.None)[0];
     }
 
-    private SipMessage BuildSmsMessage(string target, byte[] body, string? inReplyTo = null, string? fallbackIdentity = null)
+    private SipMessage BuildSmsMessage(string target, byte[] body, string? inReplyTo = null, string? fallbackIdentity = null, SmsSource? source = null)
     {
-        var local = _sipTransport?.LocalEndPoint ?? new IPEndPoint(IPAddress.Parse(AssignedIp ?? "127.0.0.1"), 5060);
-        var publicIdentity = FirstSipUri(ImsInfo?.PAssociatedUri) ?? FirstSipUri(ImsInfo?.Impu)
-            ?? (ImsInfo != null ? "sip:" + ImsInfo.Impu : fallbackIdentity)
+        var transport = source?.Transport ?? _sipTransport;
+        var info = source?.Info ?? ImsInfo;
+        var local = transport?.LocalEndPoint ?? new IPEndPoint(IPAddress.Parse(AssignedIp ?? "127.0.0.1"), 5060);
+        var publicIdentity = FirstSipUri(info?.PAssociatedUri) ?? FirstSipUri(info?.Impu)
+            ?? (info != null ? "sip:" + info.Impu : fallbackIdentity)
             ?? throw new InvalidOperationException("No IMS public identity.");
         var message = new SipMessage { IsRequest = true, Method = "MESSAGE", RequestUri = target, RawBody = body };
         message.SetHeader("Via", $"SIP/2.0/UDP {local};branch=z9hG4bK{Guid.NewGuid():N};rport");
@@ -1680,13 +2074,13 @@ public class VoWifiManager : IDisposable
         message.SetHeader("Request-Disposition", "no-fork");
         message.SetHeader("Allow", "MESSAGE");
         if (inReplyTo != null) message.SetHeader("In-Reply-To", inReplyTo);
-        if (!string.IsNullOrWhiteSpace(ImsInfo?.ServiceRoute)) message.SetHeader("Route", ImsInfo.ServiceRoute);
-        else if (_sipTransport?.RemoteEndPoint != null)
-            message.SetHeader("Route", $"<sip:{_sipTransport.RemoteEndPoint};transport=udp;lr>");
+        if (!string.IsNullOrWhiteSpace(info?.ServiceRoute)) message.SetHeader("Route", info.ServiceRoute);
+        else if (transport?.RemoteEndPoint != null)
+            message.SetHeader("Route", $"<sip:{transport.RemoteEndPoint};transport=udp;lr>");
         message.SetHeader("Content-Type", ImsSmsHandler.SmsContentType);
         message.SetHeader("Content-Transfer-Encoding", "binary");
         message.SetHeader("Content-Length", body.Length.ToString());
-        _registerSession?.AddSecurityHeaders(message);
+        (source == null ? _registerSession : source.Registration)?.AddSecurityHeaders(message);
         return message;
     }
 
@@ -1694,16 +2088,38 @@ public class VoWifiManager : IDisposable
     /// Submits an SMS message over VoWiFi / IMS (3GPP TS 24.341 / TS 24.011) via SIP MESSAGE.
     /// Requests delivery receipts by default and assigns unique Message References.
     /// </summary>
-    public async Task<SmsSubmitResult> SendSmsOverImsAsync(
+    public Task<SmsSubmitResult> SendSmsOverImsAsync(
         string recipient,
         string text,
         bool requestStatusReport = true,
+        CancellationToken ct = default) => SendSmsCoreAsync(recipient, text, requestStatusReport, null, null, ct);
+
+    public Task<SmsSubmitResult> SendSmsForSubscriptionAsync(string recipient, string text, string expectedImsi, string expectedIccid,
         CancellationToken ct = default)
     {
-        if (State != VoWifiState.ImsRegistered || ImsInfo == null || _sipTransport == null)
-            throw new InvalidOperationException("VoWiFi is not registered. Cannot send SMS over IMS.");
+        if (string.IsNullOrEmpty(expectedImsi) || SmsSubscriptionIdentity.ForIccid(expectedIccid) == null)
+            throw new ArgumentException("A verified original IMS SMS subscription is required.");
+        return SendSmsCoreAsync(recipient, text, true, expectedImsi, expectedIccid, ct);
+    }
 
-        var smsc = EpdgInfo?.SmsCenter;
+    private async Task<SmsSubmitResult> SendSmsCoreAsync(string recipient, string text, bool requestStatusReport,
+        string? expectedImsi, string? expectedIccid, CancellationToken ct)
+    {
+        var source = CaptureSmsSource();
+        if (source == null || State != VoWifiState.ImsRegistered ||
+            expectedIccid != null && (string.IsNullOrEmpty(expectedImsi) || source.Sim.Iccid != expectedIccid || source.Sim.Imsi != expectedImsi))
+            throw new InvalidOperationException("VoWiFi is not registered. Cannot send SMS over IMS.");
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct, source.StopToken);
+        stop.CancelAfter(TimeSpan.FromSeconds(25));
+        ct = stop.Token;
+        void Verify()
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!ReferenceEquals(CaptureSmsSource(), source) || State != VoWifiState.ImsRegistered)
+                throw new InvalidOperationException("The original IMS SMS session ended; no fallback or automatic retry was used.");
+        }
+        Verify();
+        var smsc = source.SmsCenter;
         if (string.IsNullOrWhiteSpace(smsc))
             throw new InvalidOperationException(
                 "The SIM did not provide an SMSC (AT+CSCA). Refusing to route IMS SMS to an unverified service centre.");
@@ -1727,6 +2143,7 @@ public class VoWifiManager : IDisposable
         string psi = "tel:" + SmsPdu.NormalizeRecipient(smsc);
         for (int i = 0; i < parts.Count; i++)
         {
+            Verify();
             var part = parts[i];
             byte reference = unchecked((byte)Interlocked.Increment(ref _nextRpReference));
             if (part.Tpdu.Length >= 2)
@@ -1735,11 +2152,12 @@ public class VoWifiManager : IDisposable
             }
             var rpData = ImsSmsHandler.BuildRpData(reference, smsc, part.Tpdu);
 
-            var msgReq = BuildSmsMessage(psi, rpData);
+            var msgReq = BuildSmsMessage(psi, rpData, source: source);
 
             result = result with { PartsAttempted = result.PartsAttempted + 1 };
 
-            var resp = await _sipTransport.SendAndReceiveAsync(msgReq, ct).ConfigureAwait(false);
+            Verify();
+            var resp = await source.Transport.SendAndReceiveAsync(msgReq, ct).ConfigureAwait(false);
             var partStatus = new SmsSubmitPartStatus(
                 Part: part.PartNumber,
                 Total: part.TotalParts,
@@ -1792,12 +2210,14 @@ public class VoWifiManager : IDisposable
 
     public void Dispose()
     {
+        InvalidateSmsSubscription();
         if (_disposed) return;
         _disposed = true;
         NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
+        NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
         Volatile.Write(ref _keepOnlineRequested, 0);
         _lastStartOptions = null;
-        _recoveryCts?.Cancel();
+        _ = CancelAutomaticRecoveryAsync();
         _healthCts?.Cancel();
         _sessionCts?.Cancel();
         _ctsEspDispatch?.Cancel();

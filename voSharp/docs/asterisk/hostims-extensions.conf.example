@@ -1,0 +1,11 @@
+; Include from extensions.conf; merge with existing contexts instead of duplicating them.
+; Replace 1001/1002/1003 with your actual authenticated SIP phone endpoints.
+; No route from phones to the SIM is enabled in this example.
+
+[from-vowin]
+exten => 600,1,NoOp(Optional VoWin incoming call)
+ same => n,Dial(PJSIP/1001&PJSIP/1002&PJSIP/1003,25)
+ same => n,Hangup()
+
+; Intentionally no Answer() before Dial(): answer the carrier only when a phone answers.
+; Do not include a general outbound/paid-call context in from-vowin.

@@ -106,7 +106,7 @@
           x:Name="TxtCallSubtext"
           FontSize="11"
           Foreground="{DynamicResource AppFloatingTextPrimaryBrush}"
-          Text="AMR-WB 16kHz 高清音频呼叫"
+          Text="等待接听 · 音频格式将在接通时协商"
         />
       </StackPanel>
 

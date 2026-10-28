@@ -385,12 +385,15 @@ public sealed class UimService : IAsyncDisposable
         {
             byte numSlots = tlv.AsByte(0);
             int offset = 1;
-            for (byte i = 0; i < numSlots && offset + 10 <= tlv.Value.Length; i++)
+            for (byte i = 0; i < numSlots; i++)
             {
+                if (offset + 10 > tlv.Value.Length)
+                    throw new FormatException("QMI UIM slot-status list is truncated.");
                 uint cardState = BinaryPrimitives.ReadUInt32LittleEndian(tlv.Value.Span.Slice(offset, 4));
                 uint slotState = BinaryPrimitives.ReadUInt32LittleEndian(tlv.Value.Span.Slice(offset + 4, 4));
                 byte iccidLength = tlv.AsByte(offset + 9);
-                if (offset + 10 + iccidLength > tlv.Value.Length) break;
+                if (offset + 10 + iccidLength > tlv.Value.Length)
+                    throw new FormatException("QMI UIM slot-status ICCID field is truncated.");
                 list.Add(new UimSlotStatus((byte)(i + 1), slotState == 1, cardState == 2));
                 offset += 10 + iccidLength;
             }

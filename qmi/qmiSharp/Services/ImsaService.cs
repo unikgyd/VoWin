@@ -1,27 +1,34 @@
-using System.Buffers.Binary;
-using System.Text;
 using qmiSharp.Client;
 using qmiSharp.Core;
+using qmiSharp.Generated;
 
 namespace qmiSharp.Services;
 
 public readonly record struct ImsRegistrationStatus(
-    bool IsRegistered,
-    ushort ErrorCode,
-    string ErrorMessage,
-    uint RegistrationTechnology);
+    QmiImsaImsRegistrationStatus? Status,
+    ushort? ErrorCode,
+    string? ErrorMessage,
+    QmiImsaRegistrationTechnology? RegistrationTechnology)
+{
+    public bool IsRegistered => Status == QmiImsaImsRegistrationStatus.QMI_IMSA_IMS_REGISTERED;
+}
 
 public readonly record struct ImsServicesStatus(
-    bool SmsSupported,
-    bool VoiceSupported,
-    bool VideoTelephonySupported);
+    QmiImsaServiceStatus? Sms,
+    QmiImsaServiceStatus? Voice,
+    QmiImsaServiceStatus? VideoTelephony)
+{
+    public bool SmsSupported => Sms == QmiImsaServiceStatus.QMI_IMSA_SERVICE_AVAILABLE;
+    public bool VoiceSupported => Voice == QmiImsaServiceStatus.QMI_IMSA_SERVICE_AVAILABLE;
+    public bool VideoTelephonySupported => VideoTelephony == QmiImsaServiceStatus.QMI_IMSA_SERVICE_AVAILABLE;
+}
 
 public sealed class ImsaService : IAsyncDisposable
 {
     private const ushort ImsaMsgGetImsRegistrationStatus = 0x0020;
     private const ushort ImsaMsgGetImsServicesStatus = 0x0021;
-    private const ushort ImsaMsgRegistrationStatusInd = 0x0022;
-    private const ushort ImsaMsgServiceStatusInd = 0x0023;
+    private const ushort ImsaMsgRegistrationStatusInd = 0x0023;
+    private const ushort ImsaMsgServiceStatusInd = 0x0024;
 
     private readonly QmiClient _client;
     private byte _clientId;
@@ -53,16 +60,7 @@ public sealed class ImsaService : IAsyncDisposable
         var resp = await _client.SendMessageAsync(QmiServiceType.IMSA, ImsaMsgGetImsRegistrationStatus, ReadOnlyMemory<byte>.Empty, cancellationToken).ConfigureAwait(false);
         resp.CheckResult();
 
-        // TLV 0x01: IMS Registration Status (1 byte: 0 = Not registered, 1 = Registered, 2 = Registering)
-        // TLV 0x10: IMS Registration Error Code (2 bytes uint16)
-        // TLV 0x11: IMS Registration Error Message (string)
-        // TLV 0x12: IMS Registration Technology (4 bytes uint32: 0 = 3GPP LTE, 1 = 3GPP2, 2 = WLAN)
-        bool reg = (resp.GetTlv(0x01)?.AsByte() ?? 0) == 1;
-        ushort errCode = resp.GetTlv(0x10)?.AsUInt16() ?? 0;
-        string errMsg = resp.GetTlv(0x11)?.AsString() ?? string.Empty;
-        uint tech = resp.GetTlv(0x12)?.AsUInt32() ?? 0;
-
-        return new ImsRegistrationStatus(reg, errCode, errMsg, tech);
+        return ParseRegistrationStatus(resp);
     }
 
     /// <summary>
@@ -75,14 +73,30 @@ public sealed class ImsaService : IAsyncDisposable
         var resp = await _client.SendMessageAsync(QmiServiceType.IMSA, ImsaMsgGetImsServicesStatus, ReadOnlyMemory<byte>.Empty, cancellationToken).ConfigureAwait(false);
         resp.CheckResult();
 
-        // TLV 0x10: SMS service status (uint8: 0 = Not supported, 1 = Supported, 2 = Not available)
-        // TLV 0x11: Voice service status (uint8)
-        // TLV 0x12: Video Telephony service status (uint8)
-        bool sms = (resp.GetTlv(0x10)?.AsByte() ?? 0) == 1;
-        bool voice = (resp.GetTlv(0x11)?.AsByte() ?? 0) == 1;
-        bool vt = (resp.GetTlv(0x12)?.AsByte() ?? 0) == 1;
+        return ParseServicesStatus(resp);
+    }
 
-        return new ImsServicesStatus(sms, voice, vt);
+    internal static ImsRegistrationStatus ParseRegistrationStatus(QmiPacket packet, bool indication = false)
+    {
+        var status = packet.GetTlv(indication ? (byte)0x11 : (byte)0x12)?.AsUInt32();
+        var error = packet.GetTlv(indication ? (byte)0x10 : (byte)0x11)?.AsUInt16();
+        var message = packet.GetTlv(indication ? (byte)0x12 : (byte)0x13)?.AsString();
+        var technology = packet.GetTlv(indication ? (byte)0x13 : (byte)0x14)?.AsUInt32();
+        return new ImsRegistrationStatus(
+            status is null ? null : (QmiImsaImsRegistrationStatus)status.Value,
+            error, message,
+            technology is null ? null : (QmiImsaRegistrationTechnology)technology.Value);
+    }
+
+    internal static ImsServicesStatus ParseServicesStatus(QmiPacket packet) => new(
+        ReadServiceStatus(packet, 0x10),
+        ReadServiceStatus(packet, 0x11),
+        ReadServiceStatus(packet, 0x12));
+
+    private static QmiImsaServiceStatus? ReadServiceStatus(QmiPacket packet, byte type)
+    {
+        var raw = packet.GetTlv(type)?.AsUInt32();
+        return raw is null ? null : (QmiImsaServiceStatus)raw.Value;
     }
 
     private void OnIndicationReceived(QmiPacket packet)
@@ -91,18 +105,11 @@ public sealed class ImsaService : IAsyncDisposable
 
         if (packet.MessageId == ImsaMsgRegistrationStatusInd)
         {
-            bool reg = (packet.GetTlv(0x01)?.AsByte() ?? 0) == 1;
-            ushort errCode = packet.GetTlv(0x10)?.AsUInt16() ?? 0;
-            string errMsg = packet.GetTlv(0x11)?.AsString() ?? string.Empty;
-            uint tech = packet.GetTlv(0x12)?.AsUInt32() ?? 0;
-            RegistrationStatusChanged?.Invoke(new ImsRegistrationStatus(reg, errCode, errMsg, tech));
+            RegistrationStatusChanged?.Invoke(ParseRegistrationStatus(packet, indication: true));
         }
         else if (packet.MessageId == ImsaMsgServiceStatusInd)
         {
-            bool sms = (packet.GetTlv(0x10)?.AsByte() ?? 0) == 1;
-            bool voice = (packet.GetTlv(0x11)?.AsByte() ?? 0) == 1;
-            bool vt = (packet.GetTlv(0x12)?.AsByte() ?? 0) == 1;
-            ServicesStatusChanged?.Invoke(new ImsServicesStatus(sms, voice, vt));
+            ServicesStatusChanged?.Invoke(ParseServicesStatus(packet));
         }
     }
 

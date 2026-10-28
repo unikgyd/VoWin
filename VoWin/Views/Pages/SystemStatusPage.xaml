@@ -23,6 +23,38 @@
     <helpers:BoolToVisibilityConverter x:Key="BoolToVis" />
     <helpers:BoolToVisibilityConverter x:Key="InvertBoolToVis" Invert="True" />
     <helpers:SignalBarsToSymbolConverter x:Key="SignalBarsSymbol" />
+    <Style TargetType="Expander">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Expander">
+            <Border Padding="14,10" CornerRadius="10" Background="{DynamicResource AppCardBrush}"
+                    BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
+              <StackPanel>
+                <ToggleButton IsChecked="{Binding IsExpanded, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}"
+                              HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Background="Transparent" BorderThickness="0"
+                              AutomationProperties.Name="{Binding Header, RelativeSource={RelativeSource TemplatedParent}}">
+                  <ToggleButton.Template>
+                    <ControlTemplate TargetType="ToggleButton">
+                      <Grid Background="Transparent" MinHeight="24">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <ContentPresenter VerticalAlignment="Center" />
+                        <ui:SymbolIcon Grid.Column="1" Symbol="ChevronDown20" FontSize="14" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                      </Grid>
+                    </ControlTemplate>
+                  </ToggleButton.Template>
+                  <ContentPresenter ContentSource="Header" />
+                </ToggleButton>
+                <ContentPresenter x:Name="Expansion" Margin="0,10,0,0" Visibility="Collapsed" />
+              </StackPanel>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsExpanded" Value="True"><Setter TargetName="Expansion" Property="Visibility" Value="Visible" /></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.55" /></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
 
     <!-- Style for Filter Segment Buttons -->
     <Style x:Key="LogFilterButtonStyle" TargetType="ui:Button" BasedOn="{StaticResource {x:Type ui:Button}}">
@@ -71,8 +103,9 @@
             <ComboBox
               ItemsSource="{Binding Slots}"
               SelectedItem="{Binding SelectedSlot, Mode=TwoWay}"
-              DisplayMemberPath="Name"
+              DisplayMemberPath="DisplayTitle"
               MinWidth="130"
+              MaxWidth="270"
               Height="26"
               Padding="6,1"
               BorderThickness="0"
@@ -90,33 +123,24 @@
           Height="16"
           Margin="0,0,10,0"
           IsIndeterminate="True"
-          Visibility="{Binding IsBusy, Converter={StaticResource BoolToVis}}"
+          Foreground="{DynamicResource AppWarningBrush}"
+          Visibility="{Binding IsTelephonyBusy, Converter={StaticResource BoolToVis}}"
         />
 
-        <!-- Action Button when Connected (Danger style: 断开连接) -->
-        <ui:Button
-          Margin="0,0,8,0"
-          Appearance="Danger"
-          Command="{Binding ExecutePrimaryActionCommand}"
-          Icon="{ui:SymbolIcon Symbol=Stop24}"
-          Content="断开连接"
-          Visibility="{Binding IsVoWifiRunning, Converter={StaticResource BoolToVis}}"
-        />
-
-        <!-- Action Button when Not Connected (Primary style: 连接 VoWiFi / 取消连接 / 重新连接) -->
         <ui:Button
           Margin="0,0,8,0"
           Appearance="Primary"
           Command="{Binding ExecutePrimaryActionCommand}"
           Icon="{ui:SymbolIcon Symbol=Play24}"
-          Content="{Binding PrimaryActionButtonText, Mode=OneWay}"
-          Visibility="{Binding IsVoWifiRunning, Converter={StaticResource InvertBoolToVis}}"
+          Content="{Binding TelephonyActionText, Mode=OneWay}"
+          IsEnabled="{Binding CanExecuteTelephonyAction, Mode=OneWay}"
         />
 
         <!-- Refresh Telemetry Button -->
         <ui:Button
           Appearance="Secondary"
           Command="{Binding RefreshMetricsCommand}"
+          IsEnabled="{Binding CanChooseTelephonyMode}"
           Icon="{ui:SymbolIcon Symbol=ArrowSync24}"
           Content="刷新状态"
         />
@@ -124,7 +148,11 @@
     </Grid>
 
     <!-- ================= MAIN CONTENT (Left 70%~75%, Right Collapsible Log 25%~30%) ================= -->
-    <Grid Grid.Row="1">
+    <Grid x:Name="StatusContentGrid" Grid.Row="1">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="*" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*" MinWidth="480" />
         <ColumnDefinition Width="Auto" />
@@ -134,187 +162,182 @@
       <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,14,0">
         <StackPanel>
 
-          <!-- ================= CARD 1: 总状态卡 (Page-level Master Status) ================= -->
-          <Border
-            Margin="0,0,0,14"
-            Padding="18,16"
-            Background="{DynamicResource AppCardBrush}"
-            BorderBrush="{DynamicResource AppCardBorderBrush}"
-            BorderThickness="1"
-            CornerRadius="12"
-          >
-            <StackPanel>
-
-              <!-- Top Row: Ring + Large Status Title + SubSummary -->
-              <Grid Margin="0,0,0,12">
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="Auto" />
-                  <ColumnDefinition Width="*" />
-                </Grid.ColumnDefinitions>
-
-                <!-- 1. Four-segment Ring with Semantic Colors & Hover Motion -->
-                <Border
-                  Grid.Column="0"
-                  Width="92"
-                  Height="92"
-                  Margin="2,0,36,0"
-                  VerticalAlignment="Center"
-                  ClipToBounds="False"
-                >
-                  <controls:VoWifiStageRing
-                    Stage1Brush="{Binding Stage1Brush, Mode=OneWay}"
-                    Stage2Brush="{Binding Stage2Brush, Mode=OneWay}"
-                    Stage3Brush="{Binding Stage3Brush, Mode=OneWay}"
-                    Stage4Brush="{Binding Stage4Brush, Mode=OneWay}"
-                    CenterDotBrush="{Binding CenterDotBrush, Mode=OneWay}"
-                    IsBreathing="{Binding IsRingBreathing, Mode=OneWay}"
-                    Stage1Detail="{Binding Stage1Detail, Mode=OneWay}"
-                    Stage2Detail="{Binding Stage2Detail, Mode=OneWay}"
-                    Stage3Detail="{Binding Stage3Detail, Mode=OneWay}"
-                    Stage4Detail="{Binding Stage4Detail, Mode=OneWay}"
-                  />
-                </Border>
-
-                <!-- 2. Headline & SubSummary -->
-                <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                  <StackPanel Orientation="Horizontal" Margin="0,0,0,5">
-                    <ui:SymbolIcon
-                      Symbol="{Binding MainStatusSymbol, Mode=OneWay}"
-                      Foreground="{Binding MainStatusBrush, Mode=OneWay}"
-                      FontSize="20"
-                      Margin="0,0,8,0"
-                      VerticalAlignment="Center"
-                    />
-                    <TextBlock
-                      FontSize="19"
-                      FontWeight="SemiBold"
-                      Foreground="{DynamicResource AppTextPrimaryBrush}"
-                      Text="{Binding MainStatusTitle, Mode=OneWay}"
-                      VerticalAlignment="Center"
-                    />
-                    <Border
-                      Margin="10,0,0,0"
-                      Padding="8,2"
-                      CornerRadius="6"
-                      Background="{Binding MainStatusBg, Mode=OneWay}"
-                      VerticalAlignment="Center"
-                    >
-                      <TextBlock
-                        FontSize="11"
-                        FontWeight="SemiBold"
-                        Foreground="{Binding MainStatusBrush, Mode=OneWay}"
-                        Text="{Binding StagesProgressText, Mode=OneWay}"
-                      />
+          <ListBox ItemsSource="{Binding ModuleInstances}" SelectedItem="{Binding SelectedModuleInstance, Mode=TwoWay}"
+                   AutomationProperties.Name="模组实例" Background="Transparent" BorderThickness="0" Padding="0" Margin="0,0,0,14"
+                   ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+            <ListBox.ItemsPanel><ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate></ListBox.ItemsPanel>
+            <ListBox.ItemContainerStyle>
+              <Style TargetType="ListBoxItem">
+                <Setter Property="Padding" Value="0" /><Setter Property="Margin" Value="0,0,8,8" />
+                <Setter Property="Template"><Setter.Value>
+                  <ControlTemplate TargetType="ListBoxItem">
+                    <Border x:Name="InstanceTile" Padding="12,9" MinWidth="160" MaxWidth="270" CornerRadius="8"
+                            Background="{DynamicResource AppCardBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
+                      <ContentPresenter />
                     </Border>
-                  </StackPanel>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsSelected" Value="True">
+                        <Setter TargetName="InstanceTile" Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" />
+                        <Setter TargetName="InstanceTile" Property="Background" Value="{DynamicResource AppAccentSoftBrush}" />
+                      </Trigger>
+                      <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="InstanceTile" Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" /></Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </Setter.Value></Setter>
+              </Style>
+            </ListBox.ItemContainerStyle>
+            <ListBox.ItemTemplate><DataTemplate>
+              <StackPanel>
+                <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Title}" />
+                <TextBlock Text="{Binding Port}" ToolTip="{Binding LineSummary}" FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                <TextBlock Text="{Binding SimSummary}" Margin="0,3,0,0" FontSize="12" TextWrapping="Wrap" />
+                <controls:GatewayStatusPanel IsCompact="True" Margin="0,5,0,0" Slot="{Binding Slot}"
+                    Service="{Binding DataContext.GatewayService, RelativeSource={RelativeSource AncestorType=Page}}" />
+              </StackPanel>
+            </DataTemplate></ListBox.ItemTemplate>
+          </ListBox>
 
-                  <!-- Link Summary line (e.g. 51566 PH · COM6 · LTE/NR · IMS Registered) -->
-                  <TextBlock
-                    FontSize="12"
-                    Foreground="{DynamicResource AppTextSecondaryBrush}"
-                    Text="{Binding MainStatusSubText, Mode=OneWay}"
-                    Margin="0,0,0,6"
-                  />
-
-                  <!-- Endpoints: Virtual IP & P-CSCF -->
-                  <TextBlock FontSize="12" Foreground="{DynamicResource AppTextTertiaryBrush}">
-                    <Run Text="虚拟内网 IP: " />
-                    <Run Text="{Binding AssignedIp, Mode=OneWay}" FontFamily="Consolas" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" />
-                    <Run Text="   ·   P-CSCF 端点: " />
-                    <Run Text="{Binding PcscfIp, Mode=OneWay}" FontFamily="Consolas" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" />
-                  </TextBlock>
-                </StackPanel>
-              </Grid>
-
-              <!-- Four Stage Checklist Pills (Unified Semantic Colors: Green=Success, Blue=Running, Gray=Waiting, Red=Error) -->
-              <Grid Margin="0,4,0,0">
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="*" />
-                </Grid.ColumnDefinitions>
-
-                <!-- Stage 1 Pill: ePDG DNS -->
-                <Border Grid.Column="0" Margin="0,0,4,0" Padding="8,6" Background="{Binding Stage1Bg, Mode=OneWay}" CornerRadius="8" ToolTip="{Binding Stage1Detail, Mode=OneWay}">
-                  <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                    <ui:SymbolIcon Symbol="{Binding Stage1Symbol, Mode=OneWay}" Foreground="{Binding Stage1Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
-                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage1Brush, Mode=OneWay}" Text="1. ePDG DNS" VerticalAlignment="Center" />
-                  </StackPanel>
-                </Border>
-
-                <!-- Stage 2 Pill: IKEv2 / EAP-AKA -->
-                <Border Grid.Column="1" Margin="3,0,3,0" Padding="8,6" Background="{Binding Stage2Bg, Mode=OneWay}" CornerRadius="8" ToolTip="{Binding Stage2Detail, Mode=OneWay}">
-                  <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                    <ui:SymbolIcon Symbol="{Binding Stage2Symbol, Mode=OneWay}" Foreground="{Binding Stage2Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
-                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage2Brush, Mode=OneWay}" Text="2. IKEv2 鉴权" VerticalAlignment="Center" />
-                  </StackPanel>
-                </Border>
-
-                <!-- Stage 3 Pill: IPsec Tunnel -->
-                <Border Grid.Column="2" Margin="3,0,3,0" Padding="8,6" Background="{Binding Stage3Bg, Mode=OneWay}" CornerRadius="8" ToolTip="{Binding Stage3Detail, Mode=OneWay}">
-                  <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                    <ui:SymbolIcon Symbol="{Binding Stage3Symbol, Mode=OneWay}" Foreground="{Binding Stage3Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
-                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage3Brush, Mode=OneWay}" Text="3. IPsec 隧道" VerticalAlignment="Center" />
-                  </StackPanel>
-                </Border>
-
-                <!-- Stage 4 Pill: IMS 200 OK -->
-                <Border Grid.Column="3" Margin="4,0,0,0" Padding="8,6" Background="{Binding Stage4Bg, Mode=OneWay}" CornerRadius="8" ToolTip="{Binding Stage4Detail, Mode=OneWay}">
-                  <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                    <ui:SymbolIcon Symbol="{Binding Stage4Symbol, Mode=OneWay}" Foreground="{Binding Stage4Brush, Mode=OneWay}" FontSize="12" Margin="0,0,6,0" VerticalAlignment="Center" />
-                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{Binding Stage4Brush, Mode=OneWay}" Text="4. IMS 200 OK" VerticalAlignment="Center" />
-                  </StackPanel>
-                </Border>
-              </Grid>
-
-              <!-- Error Banner (Shown when HasError == true, provides clear recovery actions) -->
-              <Border
-                Margin="0,10,0,0"
-                Padding="12,10"
-                Background="{DynamicResource AppDangerSoftBrush}"
-                BorderBrush="{DynamicResource AppDangerBrush}"
-                BorderThickness="1"
-                CornerRadius="8"
-                Visibility="{Binding HasError, Converter={StaticResource BoolToVis}}"
-              >
-                <Grid>
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                  </Grid.ColumnDefinitions>
-
-                  <ui:SymbolIcon Grid.Column="0" Symbol="DismissCircle24" Foreground="{DynamicResource AppDangerBrush}" FontSize="18" Margin="0,0,10,0" VerticalAlignment="Center" />
-
-                  <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                    <TextBlock FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource AppDangerBrush}" Text="{Binding ErrorTitle, Mode=OneWay}" />
-                    <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding ErrorDetail, Mode=OneWay}" Margin="0,2,0,0" TextWrapping="Wrap" />
-                  </StackPanel>
-
-                  <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
-                    <ui:Button
-                      Appearance="Secondary"
-                      Padding="10,4"
-                      Margin="0,0,6,0"
-                      Command="{Binding ExportImsDiagnosticsCommand}"
-                      Content="导出诊断"
-                      ToolTip="导出脱敏后的 IMS 注册诊断报告，供技术支持分析"
-                    />
-                    <ui:Button
-                      Appearance="Primary"
-                      Padding="10,4"
-                      Command="{Binding ExecutePrimaryActionCommand}"
-                      Content="重新连接"
-                    />
-                  </StackPanel>
-                </Grid>
-              </Border>
-
+          <controls:GatewayStatusPanel x:Name="GatewayStatus" Margin="0,0,0,14"
+              IsDense="True" Service="{Binding GatewayService}" Slot="{Binding SelectedSlot}" />
+          <Border Margin="0,0,0,14" Padding="18,16" CornerRadius="12"
+                  Background="{DynamicResource AppCardBrush}" BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
+            <StackPanel>
+              <TextBlock FontSize="16" FontWeight="SemiBold" Text="蜂窝线路" Margin="0,0,0,12" />
+              <TextBlock Margin="0,0,0,12" Foreground="{DynamicResource AppTextSecondaryBrush}"
+                         Text="{Binding TelephonyUsageHint}" ToolTip="{Binding TelephonyDetail}" TextWrapping="Wrap">
+                <TextBlock.Style><Style TargetType="TextBlock"><Style.Triggers>
+                  <DataTrigger Binding="{Binding TelephonyUsageHint}" Value=""><Setter Property="Visibility" Value="Collapsed" /></DataTrigger>
+                </Style.Triggers></Style></TextBlock.Style>
+              </TextBlock>
+              <ListBox ItemsSource="{Binding CellularModes}" SelectedItem="{Binding SelectedTelephonyMode, Mode=TwoWay}"
+                       BorderThickness="0" Padding="0" Background="Transparent"
+                       HorizontalContentAlignment="Stretch" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                       AutomationProperties.Name="蜂窝 IMS 模式" IsEnabled="{Binding CanChooseTelephonyMode}">
+                <ListBox.ItemsPanel><ItemsPanelTemplate><UniformGrid Columns="2" /></ItemsPanelTemplate></ListBox.ItemsPanel>
+                <ListBox.ItemContainerStyle>
+                  <Style TargetType="ListBoxItem">
+                    <Setter Property="IsEnabled" Value="{Binding DataContext.CanChooseTelephonyMode, RelativeSource={RelativeSource AncestorType=ListBox}}" />
+                    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    <Setter Property="Margin" Value="0,0,6,0" />
+                    <Setter Property="Template">
+                      <Setter.Value>
+                        <ControlTemplate TargetType="ListBoxItem">
+                          <Border x:Name="ModeCard" Padding="12" CornerRadius="8" BorderThickness="2"
+                                  BorderBrush="Transparent" Background="{DynamicResource AppInputBrush}">
+                            <ContentPresenter />
+                          </Border>
+                          <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                              <Setter TargetName="ModeCard" Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" />
+                              <Setter TargetName="ModeCard" Property="Background" Value="{DynamicResource AppAccentSoftBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                              <Setter TargetName="ModeCard" Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                              <Setter TargetName="ModeCard" Property="BorderBrush" Value="{DynamicResource AppAccentBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                              <Setter TargetName="ModeCard" Property="Opacity" Value="0.55" />
+                            </Trigger>
+                          </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                      </Setter.Value>
+                    </Setter>
+                  </Style>
+                </ListBox.ItemContainerStyle>
+                <ListBox.ItemTemplate>
+                  <DataTemplate>
+                    <StackPanel>
+                      <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <TextBlock FontSize="14" FontWeight="SemiBold" Text="{Binding Title}" TextWrapping="Wrap" />
+                        <ui:SymbolIcon Grid.Column="1" Symbol="CheckmarkCircle20" Foreground="{DynamicResource AppAccentBrush}" FontSize="14" Margin="4,0,0,0"
+                                       Visibility="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}, Converter={StaticResource BoolToVis}}" />
+                      </Grid>
+                      <TextBlock Margin="0,5,0,8" FontSize="11" Foreground="{DynamicResource AppAccentBrush}" Text="{Binding Subtitle}" TextWrapping="Wrap" />
+                    </StackPanel>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+              <CheckBox Margin="0,14,0,0" Content="启动时连接蜂窝 IMS"
+                        IsChecked="{Binding AutoConnectTelephony, Mode=TwoWay}" IsEnabled="{Binding CanChangeAutoConnect}" />
+              <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                <TextBlock Text="默认外拨" VerticalAlignment="Center" Margin="0,0,12,0" />
+                <ComboBox ItemsSource="{Binding OutgoingRoutes}" DisplayMemberPath="Title" SelectedItem="{Binding SelectedOutgoingRoute, Mode=TwoWay}"
+                          MinWidth="140" AutomationProperties.Name="默认外拨线路" IsEnabled="{Binding CanChangeWifiPreference}" />
+              </StackPanel>
             </StackPanel>
           </Border>
 
-          <!-- ================= CARD 2: SIM 开关 ================= -->
+          <Border Margin="0,0,0,14" Padding="18,16" CornerRadius="12" Background="{DynamicResource AppCardBrush}"
+                  BorderBrush="{DynamicResource AppCardBorderBrush}" BorderThickness="1">
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+              <StackPanel Grid.Column="1">
+                <controls:StatusIndicator Item="{Binding WifiStatusIndicator}" FontSize="16" FontWeight="SemiBold" />
+                <TextBlock Text="{Binding VoWifiCurrentEpdg}" TextWrapping="Wrap" Margin="0,8,0,10" FontSize="12"
+                           Foreground="{DynamicResource AppTextSecondaryBrush}" AutomationProperties.Name="当前 ePDG 地址" />
+                <WrapPanel>
+                  <ui:Button Content="{Binding WifiActionText}" Command="{Binding ToggleIndependentVoWifiCommand}" IsEnabled="{Binding CanUseVoWifi}" ToolTip="{Binding WifiActionHint}" Margin="0,0,12,8" />
+                  <CheckBox Content="启动时连接 VoWiFi" IsChecked="{Binding AutoConnectVoWifi, Mode=TwoWay}" IsEnabled="{Binding CanChangeWifiPreference}" VerticalAlignment="Center" />
+                </WrapPanel>
+                <Expander x:Name="VoWifiDiscoveryExpander" Header="高级 · ePDG 发现与回退" IsExpanded="False" Margin="0,10,0,0">
+                  <StackPanel Margin="0,8,0,0">
+                    <TextBlock Text="{Binding VoWifiNetworkStack}" TextWrapping="Wrap" Margin="0,0,0,8" FontSize="12"
+                               Foreground="{DynamicResource AppTextSecondaryBrush}" AutomationProperties.Name="VoWiFi 网络协议栈" />
+                    <TextBlock Text="{Binding VoWifiDiscoveryIdentitySummary}" FontSize="12" TextWrapping="Wrap"
+                               Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                    <TextBlock Text="域名格式：epdg.epc.mnc{MNC补足3位}.mcc{MCC}.pub.3gppnetwork.org" Margin="0,8,0,0" FontSize="11"
+                               Foreground="{DynamicResource AppTextSecondaryBrush}" TextWrapping="Wrap" />
+                    <StackPanel IsEnabled="{Binding CanEditVoWifiDiscovery}">
+                      <TextBlock Text="优先尝试的 ePDG（可选）" Margin="0,12,0,5" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" />
+                      <TextBox Text="{Binding VoWifiPreferredEpdgs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                               AcceptsReturn="True" MinLines="2" MaxLines="4" MaxLength="8192" TextWrapping="Wrap"
+                               VerticalScrollBarVisibility="Auto" FontFamily="Consolas" AutomationProperties.Name="优先尝试的 ePDG 地址"
+                               ToolTip="域名、IPv4 或 IPv6；每行一个，也可用逗号分隔。不填写时自动发现，不含协议或端口。" />
+                      <TextBlock Text="留空自动发现；地址不含协议或端口。" Margin="0,5,0,0"
+                                 FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                      <TextBlock Text="补充发现 PLMN（可选）" Margin="0,12,0,5" FontWeight="SemiBold" Foreground="{DynamicResource AppTextPrimaryBrush}" />
+                      <TextBox Text="{Binding VoWifiAdditionalPlmns, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                               MaxLength="8192" AutomationProperties.Name="补充 ePDG 发现 PLMN"
+                               ToolTip="MCC-MNC 或 5 / 6 位数字，多个用空格或逗号分隔；只补充 ePDG 域名，不改 IMSI 或认证 Realm。" />
+                      <TextBlock Text="{Binding VoWifiGeneratedEpdgPreview}" Margin="0,6,0,6" FontFamily="Consolas" FontSize="11"
+                                 Foreground="{DynamicResource AppTextSecondaryBrush}" TextWrapping="Wrap" AutomationProperties.Name="PLMN 生成的 ePDG 地址" />
+                      <ui:Button Content="按 PLMN 生成并加入地址" Command="{Binding GenerateVoWifiEpdgCommand}" HorizontalAlignment="Left" />
+                      <CheckBox Content="仅使用手动地址，不回退自动发现" Margin="0,12,0,0"
+                                IsChecked="{Binding VoWifiManualDiscoveryOnly, Mode=TwoWay}" />
+                      <TextBlock Text="按 SIM 保存，下次连接生效。手动地址不能代替 SIM 认证。"
+                                 Margin="0,8,0,0" FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                      <WrapPanel Margin="0,12,0,0">
+                        <ui:Button Content="保存此卡配置" Command="{Binding SaveVoWifiDiscoveryCommand}" Margin="0,0,8,6" />
+                        <ui:Button Content="恢复自动发现" Command="{Binding ResetVoWifiDiscoveryCommand}" Appearance="Secondary" Margin="0,0,0,6" />
+                      </WrapPanel>
+                    </StackPanel>
+                    <TextBlock Text="{Binding VoWifiDiscoverySettingsMessage}" Margin="0,6,0,0" FontSize="12" TextWrapping="Wrap"
+                               Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                  </StackPanel>
+                </Expander>
+              </StackPanel>
+            </Grid>
+          </Border>
+
+          <Expander Header="运行组件与系统驱动" IsExpanded="False" Margin="0,0,0,14">
+            <StackPanel>
+              <TextBlock Text="{Binding RuntimeDependencySummary}" TextWrapping="Wrap"
+                         Foreground="{DynamicResource AppTextPrimaryBrush}" />
+              <TextBlock Margin="0,8,0,0" Text="{Binding RuntimeDriverSummary}" TextWrapping="Wrap"
+                         Foreground="{DynamicResource AppTextSecondaryBrush}" />
+              <WrapPanel Margin="0,12,0,0">
+                <ui:Button Content="安装内置模组驱动" Command="{Binding InstallBundledDriversCommand}"
+                           IsEnabled="{Binding CanInstallBundledDrivers}" Margin="0,0,8,0"
+                           Visibility="{Binding HasBundledModemDrivers, Converter={StaticResource BoolToVis}}" />
+                <ui:Button Content="第三方组件与许可证" Command="{Binding OpenRuntimeNoticesCommand}" />
+              </WrapPanel>
+            </StackPanel>
+          </Expander>
+
+          <Expander Header="高级设置 · 蜂窝射频与数据" IsExpanded="False" Margin="0,0,0,14" IsEnabled="{Binding CanEditRadioSettings}">
           <Border
             Margin="0,0,0,14"
             Padding="18,16"
@@ -333,7 +356,6 @@
                   <ui:SymbolIcon Symbol="ToggleRight24" FontSize="16" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,8,0" />
                   <StackPanel>
                     <TextBlock FontSize="15" FontWeight="SemiBold" Text="开关" />
-                    <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="只按当前 SIM 卡保存；换卡后按该卡自己的设置恢复。新卡默认全部关闭。" />
                   </StackPanel>
                 </StackPanel>
                 <TextBlock Grid.Column="1" VerticalAlignment="Center" FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Text="{Binding Iccid, Mode=OneWay}" />
@@ -350,10 +372,9 @@
                 <Border Grid.Column="0" Margin="0,0,5,0" Padding="12,10" Background="{DynamicResource AppInputBrush}" CornerRadius="8">
                   <Grid>
                     <StackPanel Margin="0,0,36,0">
-                      <TextBlock FontWeight="SemiBold" Text="VoWiFi" />
-                      <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="启动或断开 IMS 通话与短信" TextWrapping="Wrap" />
+                      <TextBlock FontWeight="SemiBold" Text="通信方式" />
+                      <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="请使用上方工作方式选择器" TextWrapping="Wrap" />
                     </StackPanel>
-                    <ui:ToggleSwitch HorizontalAlignment="Right" VerticalAlignment="Top" IsChecked="{Binding VoWifiSwitchEnabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                   </Grid>
                 </Border>
 
@@ -397,6 +418,7 @@
           </Border>
 
           <!-- ================= CARD 2: 蜂窝网络 (Cellular Network & SIM Card) ================= -->
+          </Expander>
           <Border
             Margin="0,0,0,14"
             Padding="18,16"
@@ -462,7 +484,6 @@
                 <StackPanel Grid.Column="1" Margin="4,0,8,0">
                   <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="接入制式 (RAT)" />
                   <TextBlock FontSize="16" FontWeight="Bold" Margin="0,3,0,0" Text="{Binding Rat, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" Text="4G / 5G 蜂窝数据" />
                 </StackPanel>
 
                 <!-- 3. Carrier text reported by the SIM/modem -->
@@ -484,7 +505,8 @@
 
               <!-- Exact VoWiFi egress decision. Its source is shown so a multi-IMSI
                    card's retail country is never confused with the country rule. -->
-              <Border Margin="0,8,0,0" Padding="10,8" Background="{DynamicResource AppInputBrush}" CornerRadius="8">
+              <Border Margin="0,8,0,0" Padding="10,8" Background="{DynamicResource AppInputBrush}" CornerRadius="8"
+                      Visibility="{Binding IsVoWifiMode, Converter={StaticResource BoolToVis}}">
                 <Grid>
                   <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
@@ -588,244 +610,6 @@
           </Border>
 
           <!-- ================= CARD 3: 蜂窝 Host IMS 数据面 ================= -->
-          <Border
-            Margin="0,0,0,14"
-            Padding="18,16"
-            Background="{DynamicResource AppCardBrush}"
-            BorderBrush="{DynamicResource AppCardBorderBrush}"
-            BorderThickness="1"
-            CornerRadius="12"
-          >
-            <StackPanel>
-              <Grid Margin="0,0,0,12">
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-
-                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                  <ui:SymbolIcon Symbol="CellularData224" FontSize="16" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,8,0" />
-                  <StackPanel>
-                    <StackPanel Orientation="Horizontal">
-                      <TextBlock FontSize="15" FontWeight="SemiBold" Text="蜂窝 Host IMS 数据面" />
-                      <Border Margin="8,0,0,0" Padding="7,2" Background="{DynamicResource AppInputBrush}" CornerRadius="5">
-                        <TextBlock FontSize="10" FontWeight="SemiBold" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="探测 / 实验注册" />
-                      </Border>
-                    </StackPanel>
-                    <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="检查 IMS APN / PDN / P-CSCF 是否真正暴露给 Windows；不依赖 ADB。" />
-                  </StackPanel>
-                </StackPanel>
-
-                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                  <ui:ProgressRing Width="15" Height="15" Margin="0,0,8,0" IsIndeterminate="True"
-                                   Visibility="{Binding IsHostImsProbeRunning, Converter={StaticResource BoolToVis}}" />
-                  <ui:Button Padding="10,3" Appearance="Secondary" Command="{Binding ProbeHostImsCommand}"
-                             ToolTip="发送只读 AT 查询并匹配 Windows 网卡地址；不会修改 APN、激活 PDP 或切换 USB 模式">
-                    <StackPanel Orientation="Horizontal">
-                      <ui:SymbolIcon Symbol="ArrowSync16" FontSize="12" Margin="0,0,4,0" VerticalAlignment="Center" />
-                      <TextBlock FontSize="11" FontWeight="SemiBold" Text="探测数据面" VerticalAlignment="Center" />
-                    </StackPanel>
-                  </ui:Button>
-                </StackPanel>
-              </Grid>
-
-              <Border Margin="0,0,0,12" Padding="12,10" Background="{Binding HostImsStatusBackground, Mode=OneWay}" CornerRadius="8">
-                <Grid>
-                  <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                  </Grid.ColumnDefinitions>
-                  <ui:SymbolIcon Grid.Column="0" Symbol="{Binding HostImsStatusSymbol, Mode=OneWay}" Foreground="{Binding HostImsStatusBrush, Mode=OneWay}" FontSize="20" Margin="0,0,10,0" VerticalAlignment="Center" />
-                  <StackPanel Grid.Column="1">
-                    <TextBlock FontSize="13" FontWeight="SemiBold" Foreground="{Binding HostImsStatusBrush, Mode=OneWay}" Text="{Binding HostImsStatusTitle, Mode=OneWay}" />
-                    <TextBlock Margin="0,2,12,0" FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding HostImsStatusDetail, Mode=OneWay}" TextWrapping="Wrap" />
-                  </StackPanel>
-                  <Border Grid.Column="2" Padding="8,3" Background="{DynamicResource AppCardBrush}" CornerRadius="6" VerticalAlignment="Center">
-                    <TextBlock FontFamily="Consolas" FontSize="10" FontWeight="Bold" Foreground="{Binding HostImsStatusBrush, Mode=OneWay}" Text="{Binding HostImsReadinessText, Mode=OneWay}" />
-                  </Border>
-                </Grid>
-              </Border>
-
-              <Grid Margin="0,0,0,10">
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="1.35*" />
-                </Grid.ColumnDefinitions>
-                <StackPanel Grid.Column="0" Margin="0,0,10,0">
-                  <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="USB 数据模式" />
-                  <TextBlock Margin="0,3,0,0" FontSize="13" FontWeight="SemiBold" Text="{Binding HostImsUsbMode, Mode=OneWay}" TextTrimming="CharacterEllipsis" ToolTip="{Binding HostImsUsbMode, Mode=OneWay}" />
-                </StackPanel>
-                <StackPanel Grid.Column="1" Margin="4,0,10,0">
-                  <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="模组 IMS 设置" />
-                  <TextBlock Margin="0,3,0,0" FontSize="13" FontWeight="SemiBold" Text="{Binding HostImsModemSetting, Mode=OneWay}" TextTrimming="CharacterEllipsis" ToolTip="{Binding HostImsModemSetting, Mode=OneWay}" />
-                </StackPanel>
-                <StackPanel Grid.Column="2" Margin="4,0,0,0">
-                  <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="IMS PDP Context" />
-                  <TextBlock Margin="0,3,0,0" FontFamily="Consolas" FontSize="11" FontWeight="SemiBold" Text="{Binding HostImsContextText, Mode=OneWay}" TextTrimming="CharacterEllipsis" ToolTip="{Binding HostImsContextText, Mode=OneWay}" />
-                </StackPanel>
-              </Grid>
-
-              <StackPanel Margin="0,0,0,10">
-                <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="Windows 移动宽带候选网卡（未与所选卡槽绑定）" />
-                <TextBlock Margin="0,3,0,0" FontSize="11" FontWeight="SemiBold" Text="{Binding HostImsWindowsCellularAdapters, Mode=OneWay}" TextWrapping="Wrap" />
-              </StackPanel>
-
-              <StackPanel Margin="0,0,0,10">
-                <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="IMS 同族端点候选（仍需路由验证）" />
-                <TextBlock Margin="0,3,0,0" FontFamily="Consolas" FontSize="11" FontWeight="SemiBold" Text="{Binding HostImsEndpointCandidates, Mode=OneWay}" TextWrapping="Wrap" />
-              </StackPanel>
-
-              <Grid>
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="*" />
-                </Grid.ColumnDefinitions>
-                <StackPanel Grid.Column="0" Margin="0,0,10,0">
-                  <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="IMS 本机地址" />
-                  <TextBlock Margin="0,3,0,0" FontFamily="Consolas" FontSize="11" FontWeight="SemiBold" Text="{Binding HostImsPdnAddress, Mode=OneWay}" TextTrimming="CharacterEllipsis" ToolTip="{Binding HostImsPdnAddress, Mode=OneWay}" />
-                </StackPanel>
-                <StackPanel Grid.Column="1" Margin="4,0,10,0">
-                  <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="P-CSCF" />
-                  <TextBlock Margin="0,3,0,0" FontFamily="Consolas" FontSize="11" FontWeight="SemiBold" Text="{Binding HostImsPcscf, Mode=OneWay}" TextTrimming="CharacterEllipsis" ToolTip="{Binding HostImsPcscf, Mode=OneWay}" />
-                </StackPanel>
-                <StackPanel Grid.Column="2" Margin="4,0,0,0">
-                  <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="Windows 网卡映射" />
-                  <TextBlock Margin="0,3,0,0" FontSize="11" FontWeight="SemiBold" Text="{Binding HostImsWindowsInterface, Mode=OneWay}" TextTrimming="CharacterEllipsis" ToolTip="{Binding HostImsWindowsInterface, Mode=OneWay}" />
-                </StackPanel>
-              </Grid>
-
-              <Border Margin="0,12,0,0" Padding="12,10" Background="{DynamicResource AppInputBrush}" CornerRadius="8">
-                <StackPanel>
-                  <StackPanel Orientation="Horizontal">
-                    <TextBlock FontSize="12" FontWeight="SemiBold" Text="实验性 Host IMS SIP 注册" />
-                    <Border Margin="8,0,0,0" Padding="6,1" Background="{DynamicResource AppCardBrush}" CornerRadius="4">
-                      <TextBlock FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="仅已有 bearer" />
-                    </Border>
-                  </StackPanel>
-                  <TextBlock Margin="0,4,0,8" FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}" TextWrapping="Wrap"
-                             Text="选择刚探测出的端点后，优先使用 ISIM；仅在确认无 ISIM 且验证 USIM 身份时尝试回退注册。不会激活 IMS PDN，也不提供蜂窝 ipsec-3gpp 或 Host 通话数据面。" />
-                  <Grid>
-                    <Grid.ColumnDefinitions>
-                      <ColumnDefinition Width="*" />
-                      <ColumnDefinition Width="Auto" />
-                      <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <ComboBox Grid.Column="0" Margin="0,0,8,0" Padding="8,4"
-                              ItemsSource="{Binding HostImsCandidateOptions}"
-                              SelectedItem="{Binding SelectedHostImsEndpoint, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                              DisplayMemberPath="Display"
-                              ToolTip="多个 IPv4/IPv6 IMS 候选时，请明确选择一个；注册前会重新探测确认" />
-                    <ui:Button Grid.Column="1" Margin="0,0,6,0" Padding="10,3" Appearance="Primary"
-                               Command="{Binding StartHostImsRegistrationCommand}"
-                               IsEnabled="{Binding CanStartHostImsRegistration}" Content="尝试注册" />
-                    <ui:Button Grid.Column="2" Padding="10,3" Appearance="Secondary"
-                               Command="{Binding StopHostImsRegistrationCommand}"
-                               IsEnabled="{Binding CanStopHostImsRegistration}" Content="停止并注销" />
-                  </Grid>
-                  <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                    <ui:ProgressRing Width="14" Height="14" Margin="0,0,6,0" IsIndeterminate="True"
-                                     Visibility="{Binding IsHostImsRegistrationBusy, Converter={StaticResource BoolToVis}}" />
-                    <TextBlock FontSize="11" FontWeight="SemiBold" Text="{Binding HostImsRegistrationStatusText, Mode=OneWay}" />
-                  </StackPanel>
-                  <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="{DynamicResource AppTextSecondaryBrush}"
-                             Text="{Binding HostImsRegistrationDetail, Mode=OneWay}" TextWrapping="Wrap" />
-                </StackPanel>
-              </Border>
-
-              <TextBlock Margin="0,10,0,0" FontSize="10" Foreground="{DynamicResource AppTextTertiaryBrush}" TextWrapping="Wrap"
-                         Text="HostRoutable 仅表示 Windows 已具备 IMS 数据面的前置条件，不等于 SIP REGISTER、VoLTE 通话或 SMS over IMS 已经完成。" />
-            </StackPanel>
-          </Border>
-
-          <!-- ================= CARD 4: IMS / SIP 网络质量与实时保活 ================= -->
-          <Border
-            Padding="18,16"
-            Background="{DynamicResource AppCardBrush}"
-            BorderBrush="{DynamicResource AppCardBorderBrush}"
-            BorderThickness="1"
-            CornerRadius="12"
-          >
-            <StackPanel>
-              <!-- Card Header -->
-              <Grid Margin="0,0,0,12">
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-
-                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                  <ui:SymbolIcon Symbol="Pulse24" FontSize="16" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,8,0" />
-                  <TextBlock FontSize="15" FontWeight="SemiBold" Text="IMS / SIP 网络质量与保活" />
-                </StackPanel>
-
-                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                  <!-- Probe Now Manual Trigger -->
-                  <ui:Button
-                    Margin="0,0,8,0"
-                    Padding="10,3"
-                    Appearance="Secondary"
-                    Command="{Binding SendSipProbeCommand}"
-                    IsEnabled="{Binding Stage3Success, Mode=OneWay}"
-                    ToolTip="立即发送 SIP OPTIONS 探测包并测试实时往返延迟"
-                  >
-                    <StackPanel Orientation="Horizontal">
-                      <ui:SymbolIcon Symbol="ArrowSync16" FontSize="12" Margin="0,0,4,0" VerticalAlignment="Center" />
-                      <TextBlock FontSize="11" FontWeight="SemiBold" Text="立即探测" VerticalAlignment="Center" />
-                    </StackPanel>
-                  </ui:Button>
-
-                  <Border Margin="0,0,6,0" Padding="8,3" Background="{Binding Stage4Bg, Mode=OneWay}" CornerRadius="6">
-                    <TextBlock FontSize="11" FontWeight="Bold" Foreground="{Binding Stage4Brush, Mode=OneWay}" Text="{Binding SipProbeStatus, Mode=OneWay}" />
-                  </Border>
-                  <Border Padding="8,3" Background="{DynamicResource AppInputBrush}" CornerRadius="6">
-                    <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="NAT-T RFC 3948" />
-                  </Border>
-                </StackPanel>
-              </Grid>
-
-              <!-- 4 Real-time Quality & Probe Metrics -->
-              <Grid>
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="*" />
-                  <ColumnDefinition Width="1.4*" />
-                </Grid.ColumnDefinitions>
-
-                <!-- 1. RTT Latency -->
-                <StackPanel Grid.Column="0" Margin="0,0,8,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="往返延迟 (RTT)" />
-                  <TextBlock FontSize="16" FontWeight="Bold" Margin="0,3,0,0" Foreground="{Binding Stage4Brush, Mode=OneWay}" Text="{Binding SipProbeRtt, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastProbeStatusText, Mode=OneWay}" />
-                </StackPanel>
-
-                <!-- 2. Probe Stats (Success / Failed / Loss Rate) -->
-                <StackPanel Grid.Column="1" Margin="4,0,8,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="探针统计 (成功 / 失败)" />
-                  <TextBlock FontSize="15" FontWeight="Bold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SipProbeCountText, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding SipProbeLossDetailText, Mode=OneWay}" />
-                </StackPanel>
-
-                <!-- 3. Last Probe Time & Interval -->
-                <StackPanel Grid.Column="2" Margin="4,0,8,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="上次探测保活" />
-                  <TextBlock FontSize="15" FontWeight="SemiBold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastHeartbeatRelativeText, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis" Text="{Binding LastHeartbeatExactText, Mode=OneWay}" />
-                </StackPanel>
-
-                <!-- 4. NAT Binding -->
-                <StackPanel Grid.Column="3" Margin="4,0,0,0">
-                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="NAT 映射与端点" />
-                  <TextBlock FontSize="12" FontFamily="Consolas" FontWeight="SemiBold" Margin="0,3,0,0" TextTrimming="CharacterEllipsis" Text="{Binding NatBindingText, Mode=OneWay}" />
-                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextTertiaryBrush}" Margin="0,2,0,0" Text="RFC 3948 UDP 5060 (20s窗口)" />
-                </StackPanel>
-              </Grid>
-
-            </StackPanel>
-          </Border>
         </StackPanel>
       </ScrollViewer>
 
@@ -847,7 +631,6 @@
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
           </Grid.RowDefinitions>
 
@@ -861,7 +644,7 @@
             <!-- Title & Count -->
             <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
               <ui:SymbolIcon Symbol="Code24" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,6,0" FontSize="16" />
-              <TextBlock FontSize="14" FontWeight="SemiBold" Text="实时日志" VerticalAlignment="Center" />
+              <TextBlock FontSize="14" FontWeight="SemiBold" Text="日志与诊断" VerticalAlignment="Center" />
               <Border Margin="6,0,0,0" Padding="6,2" Background="{DynamicResource AppInputBrush}" CornerRadius="4">
                 <TextBlock FontSize="10" FontWeight="Medium" Foreground="{DynamicResource AppTextSecondaryBrush}" Text="{Binding FilteredLogsCountText, Mode=OneWay}" />
               </Border>
@@ -882,15 +665,6 @@
                   <TextBlock FontSize="11" Text="{Binding AutoScrollStatusText, Mode=OneWay}" />
                 </StackPanel>
               </ui:Button>
-
-              <ui:Button
-                Appearance="Transparent"
-                Padding="6,2"
-                Margin="0,0,2,0"
-                Command="{Binding ExportImsDiagnosticsCommand}"
-                Content="导出"
-                ToolTip="导出 IMS 注册诊断报告（已脱敏）"
-              />
 
               <!-- Copy button -->
               <ui:Button
@@ -923,8 +697,30 @@
             </StackPanel>
           </Grid>
 
-          <!-- Module Filter Pills Bar: 全部 / Modem / VoWiFi / IMS / SIP -->
-          <Grid Grid.Row="1" Margin="0,0,0,6">
+          <StackPanel Grid.Row="1" Margin="0,0,0,10">
+            <DockPanel>
+              <ui:Button DockPanel.Dock="Right" Content="{Binding DiagnosticExportButtonText}"
+                         Command="{Binding ExportImsDiagnosticsCommand}" Padding="10,4"
+                         ToolTip="导出脱敏 ZIP；保留网络 IP / 域名" />
+              <CheckBox Content="记录详细日志" IsChecked="{Binding DetailedDiagnosticsEnabled, Mode=TwoWay}"
+                        IsEnabled="{Binding CanChangeDiagnosticSetting}" VerticalAlignment="Center" />
+            </DockPanel>
+            <TextBlock Text="{Binding DiagnosticRecordingStatus}" FontSize="11" Margin="0,5,0,0"
+                       TextWrapping="Wrap" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+            <TextBlock Text="{Binding DiagnosticExportStatus}" FontSize="11" Margin="0,3,0,0"
+                       TextTrimming="CharacterEllipsis" ToolTip="{Binding DiagnosticExportStatus}" />
+          </StackPanel>
+
+          <TabControl Grid.Row="2" Background="Transparent" BorderThickness="0"
+                      Foreground="{DynamicResource AppTextPrimaryBrush}">
+            <TabItem Header="日志">
+              <Grid Margin="0,8,0,0">
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+          <Grid Grid.Row="0" Margin="0,0,0,6">
             <StackPanel Orientation="Horizontal">
               <ui:Button
                 Content="全部"
@@ -1010,7 +806,7 @@
 
           <!-- Search Input Box -->
           <ui:TextBox
-            Grid.Row="2"
+            Grid.Row="1"
             Margin="0,0,0,8"
             Padding="8,3"
             FontSize="11"
@@ -1021,7 +817,7 @@
 
           <!-- Structured Log List with Fixed Columns (Time / Level / Module / Message) -->
           <Border
-            Grid.Row="3"
+            Grid.Row="2"
             Background="{DynamicResource AppInputBrush}"
             BorderBrush="{DynamicResource AppCardBorderBrush}"
             BorderThickness="1"
@@ -1124,6 +920,53 @@
               </ListBox.ItemTemplate>
             </ListBox>
           </Border>
+              </Grid>
+            </TabItem>
+            <TabItem Header="连接详情" x:Name="ConnectionDetailsTab">
+              <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Margin="0,10,0,0">
+                <StackPanel>
+                  <TextBlock FontSize="11" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="0,0,0,10">
+                    <Run Text="控制端口：" /><Run Text="{Binding SelectedSlot.PortName, Mode=OneWay}" />
+                  </TextBlock>
+                  <TextBlock Text="{Binding TelephonyDetail}" TextWrapping="Wrap" FontSize="12" Margin="0,0,0,10" />
+                  <StackPanel>
+                    <TextBlock Text="{Binding MainStatusTitle}" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding Stage1Detail}" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,0" />
+                    <TextBlock Text="{Binding Stage2Detail}" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,0" />
+                    <TextBlock Text="{Binding Stage3Detail}" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,0" />
+                    <TextBlock Text="{Binding Stage4Detail}" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,0" />
+                    <TextBlock Text="隧道地址 / P-CSCF" FontSize="11" Margin="0,14,0,4" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                    <TextBlock Text="{Binding AssignedIp}" FontFamily="Consolas" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding PcscfIp}" FontFamily="Consolas" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding ErrorDetail}" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,0"
+                               Visibility="{Binding HasError, Converter={StaticResource BoolToVis}}" Foreground="{DynamicResource AppDangerBrush}" />
+                    <TextBlock Text="SIP 保活" FontWeight="SemiBold" Margin="0,16,0,6" />
+                    <TextBlock Text="{Binding SipProbeRtt}" />
+                    <TextBlock Text="{Binding SipProbeCountText}" FontSize="12" />
+                    <TextBlock Text="{Binding LastProbeStatusText}" FontSize="12" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding NatBindingText}" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0" />
+                    <ui:Button Content="探测 SIP" Command="{Binding SendSipProbeCommand}" IsEnabled="{Binding Stage3Success}"
+                               HorizontalAlignment="Left" Margin="0,8,0,0" ToolTip="发送 SIP OPTIONS，测试往返延迟" />
+                  </StackPanel>
+                  <StackPanel Visibility="{Binding IsHostImsMode, Converter={StaticResource BoolToVis}}">
+                    <TextBlock Text="{Binding HostImsRegistrationStatusText}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding HostImsPppStatusText}" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,0" />
+                    <TextBlock Text="{Binding HostImsMediaStatusText}" TextWrapping="Wrap" FontSize="12" Margin="0,8,0,0" />
+                    <TextBlock Text="本机地址 / P-CSCF" FontSize="11" Margin="0,14,0,4" Foreground="{DynamicResource AppTextSecondaryBrush}" />
+                    <TextBlock Text="{Binding HostImsPdnAddress}" FontFamily="Consolas" FontSize="12" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding HostImsPcscf}" FontFamily="Consolas" FontSize="12" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding HostImsWindowsInterface}" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0" />
+                    <TextBlock Text="模组数据面" FontWeight="SemiBold" Margin="0,16,0,6" />
+                    <TextBlock Text="{Binding HostImsStatusTitle}" FontSize="12" />
+                    <TextBlock Text="{Binding HostImsStatusDetail}" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0" />
+                    <TextBlock Text="{Binding HostImsContextText}" FontFamily="Consolas" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0" />
+                    <ui:Button Content="探测数据面" Command="{Binding ProbeHostImsCommand}" HorizontalAlignment="Left"
+                               Margin="0,8,0,0" ToolTip="读取模组状态；不修改 APN、不激活 PDP" />
+                  </StackPanel>
+                </StackPanel>
+              </ScrollViewer>
+            </TabItem>
+          </TabControl>
         </Grid>
       </Border>
 
@@ -1145,13 +988,13 @@
           HorizontalAlignment="Stretch"
           VerticalAlignment="Stretch"
           Command="{Binding ToggleLogPanelCommand}"
-          ToolTip="展开实时日志面板"
+          ToolTip="展开日志与诊断"
         >
           <StackPanel Orientation="Vertical" HorizontalAlignment="Center" VerticalAlignment="Center">
             <ui:SymbolIcon Symbol="ChevronLeft24" FontSize="16" Foreground="{DynamicResource AppAccentBrush}" Margin="0,0,0,10" />
             <ui:SymbolIcon Symbol="Code24" FontSize="16" Foreground="{DynamicResource AppTextSecondaryBrush}" Margin="0,0,0,10" />
             <TextBlock
-              Text="实时日志"
+              Text="日志与诊断"
               FontSize="11"
               FontWeight="SemiBold"
               Foreground="{DynamicResource AppTextSecondaryBrush}"

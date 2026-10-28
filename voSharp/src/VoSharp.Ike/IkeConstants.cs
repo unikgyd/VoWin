@@ -19,7 +19,8 @@ public enum IkePayloadType : byte
     TrafficSelectorResponder = 45,
     Encrypted = 46,
     Configuration = 47,
-    Eap = 48
+    Eap = 48,
+    EncryptedFragment = 53
 }
 
 /// <summary>IKEv2 exchange types (RFC 7296 §3.1).</summary>

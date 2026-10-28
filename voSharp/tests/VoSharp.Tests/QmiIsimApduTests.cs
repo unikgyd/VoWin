@@ -29,14 +29,40 @@ public sealed class QmiIsimApduTests
     }
 
     [Fact]
-    public async Task MultiplePhysicalSlotsDoNotGuessAnApduTarget()
+    public async Task ExtraEmptyPhysicalSlotAllowsTheOnlySelectedCard()
     {
         await using var wire = new ScriptedIsimTransport { ReportSecondSlot = true };
         await using var client = await QmiClient.CreateAsync(wire,
             new QmiClientOptions { SyncOnOpen = false });
         await using var uim = new UimService(client);
 
+        var transport = await QmiIsimApduTransport.CreateAsync(uim, CancellationToken.None);
+        Assert.Equal("A0000000871002", transport.GetReadySelectedUsimAid());
+        Assert.Equal(0, wire.OpenCount); // Selecting the target does not send an APDU.
+    }
+
+    [Fact]
+    public async Task SecondPresentCardStillRejectsAmbiguousApduTarget()
+    {
+        await using var wire = new ScriptedIsimTransport { ReportSecondCardPresent = true };
+        await using var client = await QmiClient.CreateAsync(wire,
+            new QmiClientOptions { SyncOnOpen = false });
+        await using var uim = new UimService(client);
+
         await Assert.ThrowsAsync<NotSupportedException>(() =>
+            QmiIsimApduTransport.CreateAsync(uim, CancellationToken.None));
+        Assert.Equal(0, wire.OpenCount);
+    }
+
+    [Fact]
+    public async Task TruncatedSecondSlotCannotMasqueradeAsTheOnlyCard()
+    {
+        await using var wire = new ScriptedIsimTransport { ReportTruncatedSecondSlot = true };
+        await using var client = await QmiClient.CreateAsync(wire,
+            new QmiClientOptions { SyncOnOpen = false });
+        await using var uim = new UimService(client);
+
+        await Assert.ThrowsAsync<FormatException>(() =>
             QmiIsimApduTransport.CreateAsync(uim, CancellationToken.None));
         Assert.Equal(0, wire.OpenCount);
     }
@@ -76,6 +102,8 @@ public sealed class QmiIsimApduTests
         public int CloseCount { get; private set; }
         public int AkaCount { get; private set; }
         public bool ReportSecondSlot { get; init; }
+        public bool ReportSecondCardPresent { get; init; }
+        public bool ReportTruncatedSecondSlot { get; init; }
         public List<string> OpenedAids { get; } = [];
         public List<byte> ApduChannels { get; } = [];
         public string Name => "scripted-isim";
@@ -93,9 +121,13 @@ public sealed class QmiIsimApduTests
                     tlvs.Add(new QmiTlv(0x10, CardStatus()));
                     break;
                 case 0x0047:
-                    tlvs.Add(new QmiTlv(0x10, ReportSecondSlot
-                        ? [2, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-                        : [1, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0]));
+                    tlvs.Add(new QmiTlv(0x10, ReportTruncatedSecondSlot
+                        ? [2, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0]
+                        : ReportSecondCardPresent
+                            ? [2, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                            : ReportSecondSlot
+                                ? [2, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                                : [1, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0]));
                     break;
                 case 0x0042:
                     Assert.Equal((byte)1, request.GetTlv(0x01)!.AsByte());

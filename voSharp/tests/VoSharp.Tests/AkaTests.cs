@@ -183,6 +183,27 @@ public class AkaTests
     // ── Full EC25 flows through a scripted modem ─────────────────────────────
 
     [Fact]
+    public async Task Ec25InventoryCleanupSelectsUsimWithoutPinGateAkaOrProfileMutation()
+    {
+        var modem = new ScriptedAtSession();
+        modem.On("AT+CPIN?", "+CME ERROR: 13"); // Cleanup must not wait for a healthy baseband first.
+        modem.OnCsim(command => command[1] == 0xA4 ? "+CSIM: 4,\"9000\"\r\nOK" : "ERROR");
+        Assert.True(await new Ec25AkaProvider(modem).RestoreBasicUsimApplicationAsync());
+        Assert.NotEmpty(modem.CsimCommands);
+        Assert.All(modem.CsimCommands, command => { Assert.Equal(0, command[0]); Assert.Equal(0xA4, command[1]); });
+        Assert.DoesNotContain("AT+CPIN?", modem.Executed);
+        Assert.DoesNotContain(modem.Executed, command => command.StartsWith("AT+CCHO", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Ec25InventoryCleanupDoesNotPretendARejectedUsimSelectionSucceeded()
+    {
+        var modem = new ScriptedAtSession();
+        modem.OnCsim(_ => "+CSIM: 4,\"6A82\"\r\nOK");
+        Assert.False(await new Ec25AkaProvider(modem).RestoreBasicUsimApplicationAsync());
+    }
+
+    [Fact]
     public async Task Ec25UsesLogicalChannelWhenTheCardAcceptsIt()
     {
         var modem = new ScriptedAtSession();

@@ -5,6 +5,9 @@ using System.Text;
 using VoSharp.Common.Events;
 using VoSharp.Kernel.Events;
 using VoSharp.Sim.Pcsc;
+using VoSharp.Modem;
+using qmiSharp.Transport;
+using VoSharp.Telephony.VoWifi;
 
 namespace VoSharp.Kernel.Pool;
 
@@ -18,6 +21,17 @@ public class ModemPool : IAsyncDisposable
     private readonly AsyncEventBus _eventBus;
     private readonly object _lock = new();
     private readonly SemaphoreSlim _discoveryGate = new(1, 1);
+    // Keep gates for the pool lifetime. Replacing a gate after removal would let
+    // old waiters and a newly added slot operate on the same device concurrently.
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _slotLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _portLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Func<ModemSlot, CancellationToken, Task<bool>> _attachSlot;
+    private readonly IkeRetryGate _ikeRetryGate;
+    private readonly TaskCompletionSource _operationsDrained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _operationCount;
+    private bool _stopping;
+    private bool _applicationExitRequested;
+    private Task? _disposeTask;
 
     private string? _activeSlotId;
 
@@ -28,6 +42,17 @@ public class ModemPool : IAsyncDisposable
     public event EventHandler<SlotListChangedEventArgs>? SlotListChanged;
 
     public IReadOnlyDictionary<string, ModemSlot> Slots => _slots;
+    private volatile ModemControlPreference _controlPreference;
+    public ModemControlPreference ControlPreference
+    {
+        get => _controlPreference;
+        set
+        {
+            if (!Enum.IsDefined(value)) throw new ArgumentOutOfRangeException(nameof(value));
+            _controlPreference = value;
+            foreach (var slot in _slots.Values) slot.ControlPreference = value;
+        }
+    }
     public string? ActiveSlotId => _activeSlotId;
 
     public ModemSlot? ActiveSlot
@@ -40,64 +65,125 @@ public class ModemPool : IAsyncDisposable
         }
     }
 
-    public ModemPool(AsyncEventBus? eventBus = null)
+    public ModemPool(AsyncEventBus? eventBus = null, IkeRetryGate? ikeRetry = null)
+        : this(eventBus, (slot, ct) => slot.AttachAsync(ct), ikeRetry)
+    {
+    }
+
+    internal ModemPool(AsyncEventBus? eventBus, Func<ModemSlot, CancellationToken, Task<bool>> attachSlot, IkeRetryGate? ikeRetry = null)
     {
         _eventBus = eventBus ?? new AsyncEventBus();
+        _attachSlot = attachSlot;
+        _ikeRetryGate = ikeRetry ?? new(new MemoryIkeRetryJournalStore(), new WindowsIkeRetryClock());
     }
+
+    internal ModemSlot CreateSlot(string id, string port, int baud, string? name = null, string? proxy = null)
+        => new(id, port, baud, name, proxy, _eventBus, ikeRetry: _ikeRetryGate);
 
     /// <summary>
     /// Adds or updates a modem slot, attaching to the serial port.
     /// </summary>
-    public async Task<ModemSlot> AddOrUpdateSlotAsync(
+    public Task<ModemSlot> AddOrUpdateSlotAsync(
         string portName,
         int baudRate = 115200,
         string? name = null,
         string? slotId = null,
         string? proxyUrl = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default) =>
+        AddOrUpdateSerialSlotAsync(portName, baudRate, name, slotId, proxyUrl, refreshExisting: false, ct);
+
+    private async Task<ModemSlot> AddOrUpdateSerialSlotAsync(
+        string portName, int baudRate, string? name, string? slotId, string? proxyUrl,
+        bool refreshExisting, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(portName);
+        if (slotId is not null) ArgumentException.ThrowIfNullOrWhiteSpace(slotId);
+        portName = portName.Trim();
+        using var operation = BeginOperation();
 
-        var id = slotId ?? portName.ToLowerInvariant();
-
-        if (_slots.TryGetValue(id, out var existing))
+        // A manually named slot and discovery of its COM port must converge on
+        // the same instance. Resolve again after waiting if another add won.
+        while (true)
         {
-            if (existing.Modem != null)
-                await existing.DetachHardwareAsync(ct).ConfigureAwait(false);
-            existing.PortName = portName;
-            existing.BaudRate = baudRate;
-            if (!string.IsNullOrWhiteSpace(name)) existing.Name = name;
-            if (proxyUrl != null) existing.ProxyUrl = proxyUrl;
-            await existing.AttachAsync(ct).ConfigureAwait(false);
-            try { SlotListChanged?.Invoke(this, new SlotListChangedEventArgs(_slots.Values.ToList())); } catch { }
-            _eventBus.Publish("pool.slot.reattached", "ModemPool", existing.GetDiagnosticInfo());
-            return existing;
-        }
-
-        var slot = new ModemSlot(id, portName, baudRate, name, proxyUrl, _eventBus);
-        slot.StateChanged += (s, e) =>
-        {
-            try { SlotStateChanged?.Invoke(this, e); } catch { }
-        };
-
-        await slot.AttachAsync(ct).ConfigureAwait(false);
-
-        _slots[id] = slot;
-
-        lock (_lock)
-        {
-            if (_activeSlotId == null || !_slots.ContainsKey(_activeSlotId))
+            var id = slotId ?? FindPortOwner(portName)?.Id ?? portName.ToLowerInvariant();
+            using var mutation = await AcquireMutationAsync(id, portName, ct).ConfigureAwait(false);
+            if (FindPortOwner(portName) is { } owner && !owner.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
             {
-                _activeSlotId = id;
-                slot.IsActive = true;
-                try { ActiveSlotChanged?.Invoke(this, new ActiveSlotChangedEventArgs(null, id, slot)); } catch { }
+                if (slotId is null) continue;
+                throw new InvalidOperationException($"Port {portName} is already managed by slot {owner.Id}.");
             }
-        }
 
-        try { SlotAdded?.Invoke(this, slot); } catch { }
-        try { SlotListChanged?.Invoke(this, new SlotListChangedEventArgs(_slots.Values.ToList())); } catch { }
-        _eventBus.Publish("pool.slot.added", "ModemPool", slot.GetDiagnosticInfo());
-        return slot;
+            if (_slots.TryGetValue(id, out var existing))
+            {
+                if (existing.IsHostImsPppTransitionOrActive)
+                    return existing;
+                if (existing.State == SlotState.Busy)
+                {
+                    if (!existing.PortName.Equals(portName, StringComparison.OrdinalIgnoreCase) || existing.BaudRate != baudRate)
+                        throw new InvalidOperationException("Cannot change the serial connection of a busy modem.");
+                    // A scan or duplicate add must not tear down an ongoing call.
+                    if (!string.IsNullOrWhiteSpace(name)) existing.Name = name;
+                    return existing;
+                }
+                if (refreshExisting && existing.State == SlotState.Online)
+                {
+                    var responsive = false;
+                    try { responsive = existing.Modem?.IsOpen == true && await existing.Modem.PingAsync(ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch { }
+                    if (responsive)
+                    {
+                        await existing.RefreshMetricsAsync(ct).ConfigureAwait(false);
+                        return existing;
+                    }
+                }
+                if (existing.Modem != null)
+                    await existing.DetachHardwareAsync(ct).ConfigureAwait(false);
+                existing.PortName = portName;
+                existing.BaudRate = baudRate;
+                if (!string.IsNullOrWhiteSpace(name)) existing.Name = name;
+                if (proxyUrl != null) existing.ProxyUrl = proxyUrl;
+                await _attachSlot(existing, ct).ConfigureAwait(false);
+                try { SlotListChanged?.Invoke(this, new SlotListChangedEventArgs(_slots.Values.ToList())); } catch { }
+                _eventBus.Publish("pool.slot.reattached", "ModemPool", existing.GetDiagnosticInfo());
+                return existing;
+            }
+
+            var slot = CreateSlot(id, portName, baudRate, name, proxyUrl);
+            slot.ControlPreference = ControlPreference;
+            slot.StateChanged += (s, e) =>
+            {
+                try { SlotStateChanged?.Invoke(this, e); } catch { }
+            };
+
+            try
+            {
+                await _attachSlot(slot, ct).ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+            }
+            catch
+            {
+                await slot.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+
+            lock (_lock)
+            {
+                _slots[id] = slot;
+                slot.ControlPreference = ControlPreference;
+                if (_activeSlotId == null || !_slots.ContainsKey(_activeSlotId))
+                {
+                    _activeSlotId = id;
+                    slot.IsActive = true;
+                    try { ActiveSlotChanged?.Invoke(this, new ActiveSlotChangedEventArgs(null, id, slot)); } catch { }
+                }
+            }
+
+            try { SlotAdded?.Invoke(this, slot); } catch { }
+            try { SlotListChanged?.Invoke(this, new SlotListChangedEventArgs(_slots.Values.ToList())); } catch { }
+            _eventBus.Publish("pool.slot.added", "ModemPool", slot.GetDiagnosticInfo());
+            return slot;
+        }
     }
 
     /// <summary>
@@ -106,8 +192,17 @@ public class ModemPool : IAsyncDisposable
     public bool TryAddSlot(ModemSlot slot)
     {
         ArgumentNullException.ThrowIfNull(slot);
+        using var operation = BeginOperation();
+        var idGate = _slotLocks.GetOrAdd(slot.Id, _ => new SemaphoreSlim(1, 1));
+        if (!idGate.Wait(0)) return false;
+        using var idLease = new GateLease([idGate]);
+        var portGate = _portLocks.GetOrAdd(slot.PortName, _ => new SemaphoreSlim(1, 1));
+        if (!portGate.Wait(0)) return false;
+        using var portLease = new GateLease([portGate]);
+        if (FindPortOwner(slot.PortName) is not null) return false;
         if (_slots.TryAdd(slot.Id, slot))
         {
+            slot.ControlPreference = ControlPreference;
             lock (_lock)
             {
                 if (_activeSlotId == null)
@@ -123,45 +218,51 @@ public class ModemPool : IAsyncDisposable
         return false;
     }
 
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _slotLocks = new(StringComparer.OrdinalIgnoreCase);
-
     /// <summary>
     /// Acquires an exclusive async lease on a slot for safe multi-operation execution.
     /// </summary>
     public async Task<IAsyncDisposable?> AcquireSlotLeaseAsync(string slotId, int timeoutMs = 5000, CancellationToken ct = default)
     {
-        if (!_slots.TryGetValue(slotId, out _))
-            return null;
-
-        var sem = _slotLocks.GetOrAdd(slotId, _ => new SemaphoreSlim(1, 1));
-        bool acquired = await sem.WaitAsync(timeoutMs, ct).ConfigureAwait(false);
-        if (!acquired) return null;
-
-        return new SlotLease(sem);
+        var operation = BeginOperation();
+        try
+        {
+            if (!_slots.TryGetValue(slotId, out var slot)) return null;
+            var sem = _slotLocks.GetOrAdd(slotId, _ => new SemaphoreSlim(1, 1));
+            if (!await sem.WaitAsync(timeoutMs, ct).ConfigureAwait(false)) return null;
+            if (!_slots.TryGetValue(slotId, out var current) || !ReferenceEquals(current, slot))
+            {
+                sem.Release();
+                return null;
+            }
+            var lease = new SlotLease(sem, operation);
+            operation = null!; // The returned lease owns the lifetime reservation.
+            return lease;
+        }
+        finally { operation?.Dispose(); }
     }
 
     /// <summary>
     /// Removes and disposes a slot by ID with graceful draining of active leases.
     /// </summary>
-    public async Task<bool> RemoveSlotAsync(string slotId, CancellationToken ct = default)
+    public Task<bool> RemoveSlotAsync(string slotId, CancellationToken ct = default) =>
+        RemoveSlotCoreAsync(slotId, ct);
+
+    private async Task<bool> RemoveSlotCoreAsync(string slotId, CancellationToken ct, ModemSlot? failedProbe = null)
     {
-        if (_slots.TryRemove(slotId, out var slot))
+        using var operation = BeginOperation();
+        using var mutation = await AcquireMutationAsync(slotId, null, ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+        if (_slots.TryGetValue(slotId, out var slot))
         {
-            if (_slotLocks.TryGetValue(slotId, out var sem))
-            {
-                try
-                {
-                    await sem.WaitAsync(3000, ct).ConfigureAwait(false);
-                    sem.Release();
-                }
-                catch { }
-                _slotLocks.TryRemove(slotId, out _);
-            }
-
-            await slot.DisposeAsync().ConfigureAwait(false);
-
+            if (failedProbe is not null && (!ReferenceEquals(slot, failedProbe) ||
+                slot.State is SlotState.Online or SlotState.Busy || slot.IsHostImsPppTransitionOrActive)) return false;
+            // Stop new routing immediately after leases drain. The mutation
+            // still holds both ID and port gates until hardware is fully closed.
+            // Cancellation cannot leave a half-disposed slot once this starts.
             lock (_lock)
             {
+                _slots.TryRemove(slotId, out _);
+                slot.IsActive = false;
                 if (_activeSlotId != null && _activeSlotId.Equals(slotId, StringComparison.OrdinalIgnoreCase))
                 {
                     var prevId = _activeSlotId;
@@ -175,6 +276,7 @@ public class ModemPool : IAsyncDisposable
                 }
             }
 
+            await slot.DisposeAsync().ConfigureAwait(false);
             try { SlotRemoved?.Invoke(this, slotId); } catch { }
             try { SlotListChanged?.Invoke(this, new SlotListChangedEventArgs(_slots.Values.ToList())); } catch { }
             _eventBus.Publish("pool.slot.removed", "ModemPool", slotId);
@@ -184,7 +286,7 @@ public class ModemPool : IAsyncDisposable
         return false;
     }
 
-    private sealed class SlotLease(SemaphoreSlim semaphore) : IAsyncDisposable, IDisposable
+    private sealed class SlotLease(SemaphoreSlim semaphore, PoolOperation operation) : IAsyncDisposable, IDisposable
     {
         private int _disposed;
         public ValueTask DisposeAsync()
@@ -198,6 +300,70 @@ public class ModemPool : IAsyncDisposable
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
                 semaphore.Release();
+                operation.Dispose();
+            }
+        }
+    }
+
+    private ModemSlot? FindPortOwner(string portName) =>
+        _slots.Values.FirstOrDefault(slot => slot.PortName.Equals(portName, StringComparison.OrdinalIgnoreCase));
+
+    private async Task<GateLease> AcquireMutationAsync(string slotId, string? requestedPort, CancellationToken ct)
+    {
+        var held = new List<SemaphoreSlim>();
+        try
+        {
+            var idGate = _slotLocks.GetOrAdd(slotId, _ => new SemaphoreSlim(1, 1));
+            await idGate.WaitAsync(ct).ConfigureAwait(false);
+            held.Add(idGate);
+            var currentPort = _slots.TryGetValue(slotId, out var slot) ? slot.PortName : null;
+            // A move reserves both ports. Sorted acquisition avoids opposite
+            // port moves deadlocking; independent modems still run in parallel.
+            foreach (var port in new[] { currentPort, requestedPort }.OfType<string>()
+                         .Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase))
+            {
+                var gate = _portLocks.GetOrAdd(port, _ => new SemaphoreSlim(1, 1));
+                await gate.WaitAsync(ct).ConfigureAwait(false);
+                held.Add(gate);
+            }
+            return new GateLease(held);
+        }
+        catch
+        {
+            new GateLease(held).Dispose();
+            throw;
+        }
+    }
+
+    private sealed class GateLease(IReadOnlyList<SemaphoreSlim> held) : IDisposable
+    {
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            for (var i = held.Count - 1; i >= 0; i--) held[i].Release();
+        }
+    }
+
+    private PoolOperation BeginOperation()
+    {
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_stopping || _applicationExitRequested, this);
+            _operationCount++;
+            return new PoolOperation(this);
+        }
+    }
+
+    private sealed class PoolOperation(ModemPool pool) : IDisposable
+    {
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            lock (pool._lock)
+            {
+                if (--pool._operationCount == 0 && pool._stopping) pool._operationsDrained.TrySetResult();
             }
         }
     }
@@ -207,26 +373,19 @@ public class ModemPool : IAsyncDisposable
     /// </summary>
     public bool SelectSlot(string slotId)
     {
-        if (_slots.TryGetValue(slotId, out var slot))
+        ModemSlot? slot;
+        string? prevId;
+        lock (_lock)
         {
-            string? prevId;
-            lock (_lock)
-            {
-                prevId = _activeSlotId;
-                foreach (var s in _slots.Values)
-                {
-                    s.IsActive = false;
-                }
-                _activeSlotId = slot.Id;
-                slot.IsActive = true;
-            }
-
-            try { ActiveSlotChanged?.Invoke(this, new ActiveSlotChangedEventArgs(prevId, slot.Id, slot)); } catch { }
-            _eventBus.Publish("pool.slot.selected", "ModemPool", slotId);
-            return true;
+            if (_stopping || !_slots.TryGetValue(slotId, out slot)) return false;
+            prevId = _activeSlotId;
+            foreach (var s in _slots.Values) s.IsActive = false;
+            _activeSlotId = slot.Id;
+            slot.IsActive = true;
         }
-
-        return false;
+        try { ActiveSlotChanged?.Invoke(this, new ActiveSlotChangedEventArgs(prevId, slot.Id, slot)); } catch { }
+        _eventBus.Publish("pool.slot.selected", "ModemPool", slotId);
+        return true;
     }
 
     /// <summary>
@@ -265,6 +424,7 @@ public class ModemPool : IAsyncDisposable
 
     public async Task<IReadOnlyList<ModemSlot>> DiscoverAndEnrichAsync(CancellationToken ct = default)
     {
+        using var operation = BeginOperation();
         // SerialPort.Open and the first AT read can block synchronously before
         // their async wrappers yield.  Keep concurrent discovery requests from
         // fighting over ports, while each individual port probe runs on the
@@ -272,6 +432,15 @@ public class ModemPool : IAsyncDisposable
         await _discoveryGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+        // Unclassified sibling AT ports may belong to the same rebooting modem.
+        // Do not open them or run SIM/APDU probes against an owned IMS bearer.
+        var ownedSlots = _slots.Values.Where(slot => slot.IsHostImsPppTransitionOrActive).ToArray();
+        IReadOnlyList<WindowsUsbFunction> inventory;
+        try { inventory = WindowsUsbTopology.EnumeratePresent(); }
+        catch { inventory = []; }
+        if (ownedSlots.Any(slot => (slot.UsbContainerId ?? ModemDiscoveryPolicy.FindContainer(inventory, slot.PortName)) is null))
+            return _slots.Values.Where(slot => slot.IsHostImsPppTransitionOrActive ||
+                slot.State is SlotState.Online or SlotState.Busy).ToArray();
         string[] portNames;
 
         try
@@ -283,30 +452,15 @@ public class ModemPool : IAsyncDisposable
             portNames = Array.Empty<string>();
         }
 
-        var tasks = portNames
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+        var probePorts = ModemDiscoveryPolicy.SelectPorts(portNames, inventory,
+            ownedSlots.Select(slot => (slot.PortName, slot.UsbContainerId)));
+        var tasks = probePorts
             // SerialPort's Windows driver can block a worker thread for the
             // entire probe timeout. LongRunning gives each candidate port a
             // dedicated thread so one dead Bluetooth/debug port cannot starve
             // the remaining probes in the thread pool.
             .Select(port => Task.Factory.StartNew(async () =>
         {
-            // Skip ports already attached and online
-            var existing = _slots.Values.FirstOrDefault(s => s.PortName.Equals(port, StringComparison.OrdinalIgnoreCase));
-            if (existing != null && existing.State == SlotState.Online)
-            {
-                var responsive = false;
-                try { responsive = existing.Modem?.IsOpen == true && await existing.Modem.PingAsync(ct).ConfigureAwait(false); }
-                catch { }
-                if (responsive)
-                {
-                    await existing.RefreshMetricsAsync(ct).ConfigureAwait(false);
-                    return existing;
-                }
-
-                await existing.DetachHardwareAsync(ct).ConfigureAwait(false);
-            }
-
             try
             {
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -315,14 +469,15 @@ public class ModemPool : IAsyncDisposable
                 // The old 1.5 s budget often cancelled this setup halfway through.
                 cts.CancelAfter(15000);
 
-                var slot = await AddOrUpdateSlotAsync(port, ct: cts.Token).ConfigureAwait(false);
-                if (slot.State == SlotState.Online)
+                var slot = await AddOrUpdateSerialSlotAsync(port, 115200, null, null, null,
+                    refreshExisting: true, cts.Token).ConfigureAwait(false);
+                if (slot.State is SlotState.Online or SlotState.Busy || slot.IsHostImsPppTransitionOrActive)
                 {
                     return slot;
                 }
                 else
                 {
-                    await RemoveSlotAsync(slot.Id, ct).ConfigureAwait(false);
+                    await RemoveSlotCoreAsync(slot.Id, ct, failedProbe: slot).ConfigureAwait(false);
                 }
             }
             catch
@@ -333,30 +488,10 @@ public class ModemPool : IAsyncDisposable
         }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap());
 
         var probedSlots = await Task.WhenAll(tasks).ConfigureAwait(false);
-        var validSlots = probedSlots.Where(s => s != null).ToList();
+        var validSlots = probedSlots.Where(s => s != null).Concat(ownedSlots).ToList();
 
-        // Deduplicate by IMEI or IMSI (some modems expose multiple AT-capable COM ports)
-        var discovered = new List<ModemSlot>();
-        var seenIdentities = new HashSet<string>();
-
-        foreach (var slot in validSlots)
-        {
-            if (slot == null) continue;
-            string identity = slot.Id;
-            if (!string.IsNullOrWhiteSpace(slot.Imei)) identity = slot.Imei;
-            else if (slot.Sim != null && !string.IsNullOrWhiteSpace(slot.Sim.Imsi)) identity = slot.Sim.Imsi;
-            else if (slot.Sim != null && !string.IsNullOrWhiteSpace(slot.Sim.Iccid)) identity = slot.Sim.Iccid;
-
-            if (seenIdentities.Add(identity))
-            {
-                discovered.Add(slot);
-            }
-            else
-            {
-                // It's a duplicate COM port for the same physical modem. Discard it.
-                await RemoveSlotAsync(slot.Id, ct).ConfigureAwait(false);
-            }
-        }
+        // Deduplicate physical devices, never SIM identities shared across devices.
+        var discovered = await DeduplicateDiscoveredSlotsAsync(validSlots.OfType<ModemSlot>(), ct).ConfigureAwait(false);
 
         // PC/SC readers are not serial ports, so include them in the same user
         // initiated scan. A reader becomes a normal slot only after EF.ICCID,
@@ -391,10 +526,31 @@ public class ModemPool : IAsyncDisposable
         }
     }
 
+    internal async Task<List<ModemSlot>> DeduplicateDiscoveredSlotsAsync(IEnumerable<ModemSlot> candidates, CancellationToken ct = default)
+    {
+        var discovered = new List<ModemSlot>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        // Retained identity on an offline port must not defeat a newly verified
+        // live sibling. Stable ordering otherwise preserves the existing selection.
+        foreach (var slot in candidates.DistinctBy(s => s.Id, StringComparer.OrdinalIgnoreCase)
+                     .OrderByDescending(s => s.IsHostImsPppTransitionOrActive)
+                     .ThenByDescending(s => s.State is SlotState.Online or SlotState.Busy)
+                     .ThenByDescending(s => s.Modem?.IsOpen == true).ThenByDescending(s => s.Sim != null))
+        {
+            var identity = slot.UsbContainerId is { } container ? $"usb:{container}" :
+                !string.IsNullOrWhiteSpace(slot.Imei) ? $"imei:{slot.Imei}" : $"slot:{slot.Id}";
+            if (seen.Add(identity)) discovered.Add(slot);
+            else await RemoveSlotAsync(slot.Id, ct).ConfigureAwait(false);
+        }
+        return discovered;
+    }
+
     private async Task<ModemSlot?> AddOrUpdatePcscSlotAsync(string readerName, CancellationToken ct)
     {
+        using var operation = BeginOperation();
         var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(readerName)))[..12].ToLowerInvariant();
         var id = $"pcsc-{fingerprint}";
+        using var mutation = await AcquireMutationAsync(id, $"PC/SC · {readerName}", ct).ConfigureAwait(false);
 
         if (_slots.TryGetValue(id, out var existing))
         {
@@ -402,7 +558,7 @@ public class ModemPool : IAsyncDisposable
             return await existing.AttachPcscAsync(readerName, ct).ConfigureAwait(false) ? existing : null;
         }
 
-        var slot = new ModemSlot(id, $"PC/SC · {readerName}", 0, "PC/SC 读卡器", eventBus: _eventBus);
+        var slot = CreateSlot(id, $"PC/SC · {readerName}", 0, "PC/SC 读卡器");
         slot.StateChanged += (_, args) =>
         {
             try { SlotStateChanged?.Invoke(this, args); } catch { }
@@ -473,13 +629,52 @@ public class ModemPool : IAsyncDisposable
         return _slots.Values.Select(s => s.GetDiagnosticInfo()).ToList();
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        foreach (var slot in _slots.Values)
+        TaskCompletionSource completion;
+        Task operationsDrained;
+        lock (_lock)
         {
-            try { await slot.DisposeAsync().ConfigureAwait(false); } catch { }
+            if (_disposeTask is not null) return new ValueTask(_disposeTask);
+            _stopping = true;
+            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _disposeTask = completion.Task;
+            operationsDrained = _operationCount == 0 ? Task.CompletedTask : _operationsDrained.Task;
         }
-        _slots.Clear();
-        _discoveryGate.Dispose();
+        _ = DisposeCoreAsync(operationsDrained, completion);
+        return new ValueTask(completion.Task);
+    }
+
+    public void PrepareForApplicationExit()
+    {
+        lock (_lock)
+        {
+            _applicationExitRequested = true;
+            foreach (var slot in _slots.Values) slot.PrepareForApplicationExit();
+        }
+    }
+
+    private async Task DisposeCoreAsync(Task operationsDrained, TaskCompletionSource completion)
+    {
+        try
+        {
+            await operationsDrained.ConfigureAwait(false);
+            // Each independent line unregisters in parallel on application exit;
+            // none waits for its modem's re-enumeration or restoration.
+            async Task StopSlot(ModemSlot slot)
+            {
+                if (_applicationExitRequested) slot.PrepareForApplicationExit();
+                try { await slot.DisposeAsync().ConfigureAwait(false); } catch { }
+            }
+            if (_applicationExitRequested) await Task.WhenAll(_slots.Values.Select(StopSlot)).ConfigureAwait(false);
+            else foreach (var slot in _slots.Values) await StopSlot(slot).ConfigureAwait(false);
+            _slots.Clear();
+            _activeSlotId = null;
+            foreach (var gate in _slotLocks.Values) gate.Dispose();
+            foreach (var gate in _portLocks.Values) gate.Dispose();
+            _discoveryGate.Dispose();
+            completion.TrySetResult();
+        }
+        catch (Exception ex) { completion.TrySetException(ex); }
     }
 }

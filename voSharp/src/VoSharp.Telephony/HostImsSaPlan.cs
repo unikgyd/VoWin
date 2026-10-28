@@ -12,6 +12,10 @@ namespace VoSharp.Telephony;
 /// </summary>
 public sealed class HostImsSaPlan : IDisposable
 {
+    // A real WFP AddInbound1 call rejected UINT32_MAX with FWP_E_OUT_OF_BOUNDS.
+    // Refresh/rekey is required before this finite kernel lifetime expires.
+    public const uint WindowsSaLifetimeSeconds = 3600;
+
     private readonly byte[][] _keyCopies;
     private bool _disposed;
 
@@ -86,9 +90,7 @@ public sealed class HostImsSaPlan : IDisposable
                     Auth = auth,
                     CipherKey = cipherCopy,
                     AuthKey = authCopy,
-                    // TS 33.203 keeps the network-layer SA alive until SIP tears
-                    // it down; WFP represents the specified 2^32-1 seconds.
-                    LifetimeSeconds = uint.MaxValue
+                    LifetimeSeconds = WindowsSaLifetimeSeconds
                 };
             }
 

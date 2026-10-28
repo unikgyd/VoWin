@@ -54,6 +54,7 @@ namespace VoWin.Services
         Task<CallExperienceSettings> GetCallExperienceSettingsAsync();
         Task SaveCallExperienceSettingsAsync(CallExperienceSettings settings);
         SipGatewayStatus? GetSipGatewayStatus();
+        GatewayStatusSnapshot GetGatewayStatus(string? slotId);
         Task StartSipGatewayAsync(SipGatewayOptions options, CancellationToken cancellationToken = default);
         Task StopSipGatewayAsync();
 
@@ -71,10 +72,30 @@ namespace VoWin.Services
         Task<bool> RebootModemAsync(string? slotId = null);
         Task<(bool Success, long RttMs, string Status)> ProbeVoWifiLivenessAsync(string? slotId = null);
         Task<HostImsProbeResult> ProbeHostImsAsync(string? slotId = null, CancellationToken cancellationToken = default);
+        HostImsPppBearerStatus GetHostImsPppBearerStatus(string? slotId = null);
+        Task<HostImsPppBearerStatus> StartHostImsPppBearerAsync(
+            string handoffScript, string rasProbeExecutable, bool handoffApproved = false,
+            string? slotId = null, CancellationToken cancellationToken = default);
+        Task StopHostImsPppBearerAsync(string? slotId = null);
         HostImsRegistrationStatus GetHostImsRegistrationStatus(string? slotId = null);
         Task<HostImsRegistrationStatus> StartHostImsRegistrationAsync(
-            string? slotId = null, HostImsEndpointCandidate? endpoint = null, CancellationToken cancellationToken = default);
+            string? slotId = null, HostImsEndpointCandidate? endpoint = null,
+            bool subscriberEgressApproved = false, bool useUserspaceEsp = true,
+            string? winDivertDll = null, CancellationToken cancellationToken = default,
+            bool enableSmsReceiver = false);
         Task StopHostImsRegistrationAsync(string? slotId = null);
+        Task<SimTelephonyPreferences> GetTelephonyPreferencesAsync(string slotId);
+        ModuleManagementInstance GetModuleInstance(string slotId);
+        Task UpdateTelephonyPreferencesAsync(string slotId, Func<SimTelephonyPreferences, SimTelephonyPreferences> update);
+        Task SetPreferredTelephonyRouteAsync(string slotId, TelephonyMode route);
+        Task SaveTelephonyPreferencesAsync(string slotId, SimTelephonyPreferences preferences);
+        TelephonyModeStatus GetTelephonyModeStatus(string slotId);
+        Task EnableTelephonyModeAsync(string slotId, TelephonyMode mode);
+        void CancelTelephonyModeConnection(string slotId);
+        Task StopTelephonyModeAsync(string slotId);
+        Task<TelephonySettings> GetTelephonySettingsAsync();
+        Task SetModemControlPreferenceAsync(ModemControlPreference preference);
+        Task SaveTelephonySetupAsync(bool autoDiscover, string? winDivertDll, string? handoffScript = null, string? rasHelper = null);
 
         // Calls
         Task<CallInfo> DialAsync(string number, string? slotId = null, bool forceCellular = false);
@@ -82,6 +103,9 @@ namespace VoWin.Services
         Task<CallInfo?> AnswerAsync(string? slotId = null);
         Task<CallInfo?> RejectAsync(string? slotId = null);
         Task<bool> SendDtmfAsync(char digit, string? slotId = null);
+        MicrophoneUplinkStatus GetMicrophoneUplinkStatus();
+        bool SetMicrophoneMuted(bool muted);
+        Task<bool> RestartMicrophoneAsync();
 
         // SMS
         Task<SmsSubmitResult> SendSmsAsync(string recipient, string text, bool requestStatusReport = true, string? slotId = null, bool forceVowifi = false, bool forceCellular = false);
@@ -96,6 +120,10 @@ namespace VoWin.Services
         Task<bool> StartVoWifiAsync(string? slotId = null);
         Task<bool> StopVoWifiAsync(string? slotId = null);
         Task<string> BuildImsDiagnosticReportAsync(string? slotId = null);
+        bool DetailedDiagnosticsEnabled { get; }
+        string DiagnosticRecordingStatus { get; }
+        Task SetDetailedDiagnosticsAsync(bool enabled);
+        Task ExportDiagnosticBundleAsync(string destination, string? slotId = null, CancellationToken cancellationToken = default);
 
         // eSIM / eUICC
         Task<EuiccProbeResult> ProbeEuiccAsync(string? slotId = null, CancellationToken cancellationToken = default);

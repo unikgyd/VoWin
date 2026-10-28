@@ -1,0 +1,50 @@
+; OPTIONAL VoWin private UDP trunk. Include AFTER replacing addresses and BOTH independent secrets.
+; Do not duplicate an existing hostims/vowin endpoint from another starter kit.
+; Example: Asterisk 192.168.1.10:5060 <-> Windows 192.168.1.20:5062.
+; transport-udp must already exist and listen on the configured Asterisk UDP port.
+; Requires SHA-256-capable Asterisk/PJProject. Configure one challenge algorithm, not a list.
+; https://docs.asterisk.org/Configuration/Channel-Drivers/SIP/Configuring-res_pjsip/PJSIP-Authentication/
+
+[vowin-in]
+type=auth
+auth_type=userpass
+; VoWin -> Asterisk: match VoWin outbound username/password/expected realm.
+username=vowin-to-pbx
+password=REPLACE_WITH_OUTBOUND_RANDOM_SECRET
+realm=pbx.example
+supported_algorithms_uas=SHA-256
+
+[vowin-out]
+type=auth
+auth_type=userpass
+; Asterisk -> VoWin: match VoWin inbound username/password and local realm.
+username=pbx-to-vowin
+password=REPLACE_WITH_DIFFERENT_INBOUND_RANDOM_SECRET
+realm=vowin.local
+supported_algorithms_uac=SHA-256
+
+[vowin-aor]
+type=aor
+contact=sip:gateway@192.168.1.20:5062
+qualify_frequency=30
+
+[vowin]
+type=endpoint
+transport=transport-udp
+context=from-vowin
+auth=vowin-in
+outbound_auth=vowin-out
+aors=vowin-aor
+identify_by=ip
+disallow=all
+allow=alaw,ulaw
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+dtmf_mode=rfc4733
+
+[vowin-identify]
+type=identify
+endpoint=vowin
+match=192.168.1.20/32

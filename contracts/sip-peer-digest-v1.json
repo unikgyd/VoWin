@@ -1,0 +1,131 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "md5-auth",
+      "challenge": "Digest realm=\"asterisk\", nonce=\"n\", algorithm=MD5, qop=\"auth\"",
+      "supported": true,
+      "realm": "asterisk",
+      "nonce": "n",
+      "algorithm": "MD5",
+      "qop": true
+    },
+    {
+      "name": "sha256-qop-list-and-opaque",
+      "challenge": "Digest realm=\"asterisk\", nonce=\"n\", algorithm=SHA-256, qop=\"auth-int, auth\", opaque=\"a,b\"",
+      "supported": true,
+      "realm": "asterisk",
+      "nonce": "n",
+      "algorithm": "SHA-256",
+      "qop": true,
+      "opaque": "a,b"
+    },
+    {
+      "name": "legacy-no-qop",
+      "challenge": "Digest realm=\"asterisk\", nonce=\"n\"",
+      "supported": true,
+      "realm": "asterisk",
+      "nonce": "n",
+      "algorithm": "MD5",
+      "qop": false
+    },
+    {
+      "name": "case-and-escaping",
+      "challenge": "dIgEsT ReAlM=\"a\\\"b\", NONCE=\"n\\\\x\", algorithm=sha-256, qop=AUTH",
+      "supported": true,
+      "realm": "a\"b",
+      "nonce": "n\\x",
+      "algorithm": "SHA-256",
+      "qop": true
+    },
+    {
+      "name": "empty-realm",
+      "challenge": "Digest realm=\"\", nonce=\"n\", qop=auth",
+      "supported": true,
+      "realm": "",
+      "nonce": "n",
+      "algorithm": "MD5",
+      "qop": true
+    },
+    {
+      "name": "unsupported-algorithm",
+      "challenge": "Digest realm=\"a\", nonce=\"n\", algorithm=SHA-512-256",
+      "supported": false
+    },
+    {
+      "name": "auth-int-only",
+      "challenge": "Digest realm=\"a\", nonce=\"n\", qop=auth-int",
+      "supported": false
+    },
+    {
+      "name": "empty-nonce",
+      "challenge": "Digest realm=\"a\", nonce=\"\"",
+      "supported": false
+    },
+    {
+      "name": "missing-nonce",
+      "challenge": "Digest realm=\"a\", qop=auth",
+      "supported": false
+    },
+    {
+      "name": "missing-realm",
+      "challenge": "Digest nonce=\"n\"",
+      "supported": false
+    },
+    {
+      "name": "duplicate-nonce",
+      "challenge": "Digest realm=\"a\", nonce=\"n\", NONCE=\"other\"",
+      "supported": false
+    },
+    {
+      "name": "duplicate-algorithm",
+      "challenge": "Digest realm=\"a\", nonce=\"n\", algorithm=MD5, algorithm=SHA-256",
+      "supported": false
+    },
+    {
+      "name": "unterminated-quote",
+      "challenge": "Digest realm=\"a\", nonce=\"n",
+      "supported": false
+    },
+    {
+      "name": "junk-between-fields",
+      "challenge": "Digest realm=\"a\" junk, nonce=\"n\"",
+      "supported": false
+    },
+    {
+      "name": "trailing-comma",
+      "challenge": "Digest realm=\"a\", nonce=\"n\",",
+      "supported": false
+    },
+    {
+      "name": "empty-fragment",
+      "challenge": "Digest realm=\"a\",, nonce=\"n\"",
+      "supported": false
+    },
+    {
+      "name": "unsupported-scheme",
+      "challenge": "Basic realm=\"a\", nonce=\"n\"",
+      "supported": false
+    },
+    {
+      "name": "control-character",
+      "challenge": "Digest realm=\"a\", nonce=\"n\r\nX: bad\"",
+      "supported": false
+    },
+    {
+      "name": "unquoted-whitespace",
+      "challenge": "Digest realm=\"a\", nonce=n x",
+      "supported": false
+    },
+    {
+      "name": "junk-before-realm",
+      "challenge": "Digest junk realm=\"a\", nonce=\"n\"",
+      "supported": false
+    },
+    {
+      "name": "unterminated-escape",
+      "challenge": "Digest realm=\"a\", nonce=\"n\\",
+      "supported": false
+    }
+  ]
+}

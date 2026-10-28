@@ -2,7 +2,8 @@ namespace VoSharp.Telephony.Audio;
 
 public static class G711Codec
 {
-    private static readonly short[] SegAEnd = [0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF];
+    // Thresholds for full-scale 16-bit PCM (not a pre-shifted 13-bit input).
+    private static readonly int[] SegAEnd = [0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF];
 
     public static short AlawToPcm(byte alaw)
     {
@@ -30,6 +31,7 @@ public static class G711Codec
 
     public static byte PcmToAlaw(short pcm)
     {
+        var magnitude = Math.Min(Math.Abs((int)pcm), short.MaxValue);
         int mask;
         if (pcm >= 0)
         {
@@ -38,14 +40,12 @@ public static class G711Codec
         else
         {
             mask = 0x55;
-            pcm = (short)-pcm;
-            if (pcm < 0) pcm = short.MaxValue;
         }
 
         int seg;
         for (seg = 0; seg < 8; seg++)
         {
-            if (pcm <= SegAEnd[seg]) break;
+            if (magnitude <= SegAEnd[seg]) break;
         }
 
         if (seg >= 8)
@@ -56,11 +56,11 @@ public static class G711Codec
         byte aval = (byte)(seg << 4);
         if (seg < 2)
         {
-            aval |= (byte)((pcm >> 4) & 0x0F);
+            aval |= (byte)((magnitude >> 4) & 0x0F);
         }
         else
         {
-            aval |= (byte)((pcm >> (seg + 3)) & 0x0F);
+            aval |= (byte)((magnitude >> (seg + 3)) & 0x0F);
         }
         return (byte)(aval ^ mask);
     }
@@ -71,17 +71,15 @@ public static class G711Codec
         const int CLIP = 32635;
 
         int sign = (pcm >> 8) & 0x80;
-        if (sign != 0) pcm = (short)-pcm;
-        if (pcm > CLIP) pcm = CLIP;
-        pcm += BIAS;
+        int magnitude = Math.Min(Math.Abs((int)pcm), CLIP) + BIAS;
 
         int exponent = 7;
-        for (int expMask = 0x4000; (pcm & expMask) == 0 && exponent > 0; expMask >>= 1)
+        for (int expMask = 0x4000; (magnitude & expMask) == 0 && exponent > 0; expMask >>= 1)
         {
             exponent--;
         }
 
-        int mantissa = (pcm >> (exponent + 3)) & 0x0F;
+        int mantissa = (magnitude >> (exponent + 3)) & 0x0F;
         byte ulaw = (byte)(sign | (exponent << 4) | mantissa);
         return (byte)~ulaw;
     }

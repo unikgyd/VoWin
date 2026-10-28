@@ -1,0 +1,38 @@
+{
+  "schema": "host-ims-pdn-v1",
+  "addresses": [
+    { "id": "decimal-v4", "value": "192.0.2.1", "local": false, "expected": ["192.0.2.1"] },
+    { "id": "leading-zero-decimal-not-octal", "value": "010.020.030.040", "local": false, "expected": ["10.20.30.40"] },
+    { "id": "v4-local-mask", "value": "192.0.2.1.255.255.255.0", "local": true, "expected": ["192.0.2.1"] },
+    { "id": "v4-mask-not-remote", "value": "192.0.2.1.255.255.255.0", "local": false, "expected": [] },
+    { "id": "noncontiguous-v4-mask", "value": "192.0.2.1.255.0.255.0", "local": true, "expected": [] },
+    { "id": "v6-colon-prefix-not-another-ip", "value": "2001:db8::1/64", "local": true, "expected": ["2001:db8::1"] },
+    { "id": "v6-decimal-octets", "value": "32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1", "local": false, "expected": ["2001:db8::1"] },
+    { "id": "v6-decimal-local-mask", "value": "32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1.255.255.255.255.255.255.255.255.0.0.0.0.0.0.0.0", "local": true, "expected": ["2001:db8::1"] },
+    { "id": "noncontiguous-v6-mask", "value": "32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1.255.0.255.255.255.255.255.255.0.0.0.0.0.0.0.0", "local": true, "expected": [] },
+    { "id": "dual-stack-dedup", "value": "192.0.2.1 2001:db8::1 192.0.2.1", "local": true, "expected": ["192.0.2.1", "2001:db8::1"] },
+    { "id": "unspecified", "value": "0.0.0.0 ::", "local": false, "expected": [] },
+    { "id": "no-shorthand", "value": "127.1", "local": false, "expected": [] },
+    { "id": "no-scalar", "value": "64", "local": false, "expected": [] },
+    { "id": "no-hex", "value": "0xc0000201", "local": false, "expected": [] },
+    { "id": "no-dword", "value": "3221225985", "local": false, "expected": [] },
+    { "id": "no-signed-octet", "value": "+192.0.2.1", "local": false, "expected": [] },
+    { "id": "no-overflow", "value": "256.0.2.1", "local": false, "expected": [] },
+    { "id": "no-zone", "value": "fe80::1%3", "local": false, "expected": [] },
+    { "id": "no-hostname", "value": "pcscf.example.invalid", "local": false, "expected": [] },
+    { "id": "empty", "value": "", "local": false, "expected": [] }
+  ],
+  "runtime": [
+    { "id": "quoted", "line": "+CGCONTRDP: 5,5,\"ims\",\"192.0.2.1.255.255.255.255\",\"192.0.2.2\",\"203.0.113.53\",\"\",\"198.51.100.1\",\"\"", "accepted": true, "cid": 5, "apn": "ims", "local": ["192.0.2.1"], "pcscf": ["198.51.100.1"] },
+    { "id": "case-insensitive", "line": "  +cgcontrdp: 5,5,ims,2001:db8::1/64,,,,2001:db8::2,  ", "accepted": true, "cid": 5, "apn": "ims", "local": ["2001:db8::1"], "pcscf": ["2001:db8::2"] },
+    { "id": "dns-not-pcscf", "line": "+CGCONTRDP: 1,5,ims,192.0.2.1,192.0.2.2,203.0.113.53,203.0.113.54", "accepted": true, "cid": 1, "apn": "ims", "local": ["192.0.2.1"], "pcscf": [] },
+    { "id": "no-substring-prefix", "line": "UNRELATED +CGCONTRDP: 5,5,ims,192.0.2.1,,,,198.51.100.1,", "accepted": false },
+    { "id": "unclosed-quote", "line": "+CGCONTRDP: 5,5,\"ims,192.0.2.1", "accepted": false },
+    { "id": "quoted-trailing-junk", "line": "+CGCONTRDP: 5,5,\"ims\"junk,192.0.2.1", "accepted": false },
+    { "id": "embedded-quote", "line": "+CGCONTRDP: 5,5,im\"s,192.0.2.1", "accepted": false },
+    { "id": "zero-cid", "line": "+CGCONTRDP: 0,5,ims,192.0.2.1", "accepted": false },
+    { "id": "signed-cid", "line": "+CGCONTRDP: +5,5,ims,192.0.2.1", "accepted": false },
+    { "id": "large-cid", "line": "+CGCONTRDP: 256,5,ims,192.0.2.1", "accepted": false },
+    { "id": "control-in-field", "line": "+CGCONTRDP: 5,5,im\u0001s,192.0.2.1", "accepted": false }
+  ]
+}

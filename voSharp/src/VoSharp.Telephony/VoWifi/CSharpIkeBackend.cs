@@ -21,6 +21,28 @@ public sealed class CSharpIkeBackend : IIkeBackend
 
     public EspTunnel? EspTunnel => _espTunnel;
     public IkeTransport? Transport => _transport;
+    /// <summary>Per-endpoint MNC-length inference; never changes the verified SIM identity.</summary>
+    public (string Mcc, string Mnc)? AuthenticationHomePlmn { get; init; }
+    public IkeResponderAuthenticationOptions? ResponderAuthentication { get; init; }
+    public Func<IPAddress, CancellationToken, Task>? BeforeInitialSend { get; init; }
+    public Func<IkeNetworkRejection, IPAddress, CancellationToken, Task>? ObserveNetworkRejection { get; init; }
+    internal Func<IkeSessionRequest, CancellationToken, Task<IkeSessionResult>> EstablishSession { get; init; } = IkeSession.EstablishAsync;
+
+    internal (string Mcc, string Mnc) ResolveAuthenticationHomePlmn(SimIdentity sim)
+    {
+        var candidates = EpdgResolver.BuildHomePlmnCandidates(sim);
+        if (AuthenticationHomePlmn is not { } selected) return candidates[0];
+        if (!candidates.Contains(selected))
+            throw new InvalidOperationException("The authentication home PLMN does not match the live SIM's MNC length.");
+        return selected;
+    }
+
+    internal static bool HasUsablePdn(IkeSessionResult result) => result.Success &&
+        !string.IsNullOrEmpty(result.AssignedIp) && !string.IsNullOrEmpty(result.PcscfIp) &&
+        IkeSession.IsUsablePdn(result.AssignedIp, result.PcscfIp);
+
+    internal static bool CanRetryInnerFamily(IkeSessionResult result) => result.RetryableAddressFamilyFailure ||
+        result.Success && !HasUsablePdn(result);
 
     /// <summary>Proves the ePDG IKE SA is alive with an encrypted INFORMATIONAL exchange.</summary>
     public Task ProbeLivenessAsync(CancellationToken ct = default)
@@ -57,7 +79,7 @@ public sealed class CSharpIkeBackend : IIkeBackend
                 nameof(proxyUrl));
         }
 
-        var homePlmn = EpdgResolver.ResolveHomePlmn(sim);
+        var homePlmn = ResolveAuthenticationHomePlmn(sim);
 
         var legacyIkeSuite = new IkeSuite(
             IkeEncryptionId.AesCbc, 128, IkePrfId.HmacSha1,
@@ -94,14 +116,16 @@ public sealed class CSharpIkeBackend : IIkeBackend
 
         IkeSessionResult? result = null;
         var familyErrors = new List<string>();
+        var identityRetrySafe = true;
+        var finalAuthVerified = false;
         foreach (var addressFamily in new[]
                  {
-                     IkeAddressFamilyMode.Ipv6,
                      IkeAddressFamilyMode.Dual,
+                     IkeAddressFamilyMode.Ipv6,
                      IkeAddressFamilyMode.Ipv4
                  })
         {
-            result = await IkeSession.EstablishAsync(new IkeSessionRequest(
+            result = await EstablishSession(new IkeSessionRequest(
                 EpdgIp: remoteIp,
                 AkaProvider: akaProvider,
                 Imsi: sim.Imsi,
@@ -119,15 +143,18 @@ public sealed class CSharpIkeBackend : IIkeBackend
                 AddressFamilyMode: addressFamily,
                 DiagnosticLog: diagnosticLog,
                 ForceNatt: forceNatt,
-                LocalAddress: localAddress), ct).ConfigureAwait(false);
+                LocalAddress: localAddress,
+                ResponderAuthentication: ResponderAuthentication ?? new(remoteIp.ToString()),
+                BeforeInitialSend: BeforeInitialSend,
+                ObserveNetworkRejection: ObserveNetworkRejection), ct).ConfigureAwait(false);
 
             // IDi precedes EAP type negotiation. If the ePDG selects AKA',
             // start a fresh IKE SA with the mandatory '6' permanent identity;
             // continuing this SA would bind AUTH to the earlier AKA identity.
-            if (result.RequestedEapType == EapType.AkaPrime)
+            if (result.RequestedEapType == EapType.AkaPrime && identityRetrySafe)
             {
                 diagnosticLog?.Invoke("ePDG selected EAP-AKA'; restarting IKE_AUTH with the AKA' permanent identity.");
-                result = await IkeSession.EstablishAsync(new IkeSessionRequest(
+                result = await EstablishSession(new IkeSessionRequest(
                     EpdgIp: remoteIp,
                     AkaProvider: akaProvider,
                     Imsi: sim.Imsi,
@@ -146,35 +173,50 @@ public sealed class CSharpIkeBackend : IIkeBackend
                     DiagnosticLog: diagnosticLog,
                     ForceNatt: forceNatt,
                     LocalAddress: localAddress,
-                    EapMethod: EapType.AkaPrime), ct).ConfigureAwait(false);
+                    EapMethod: EapType.AkaPrime,
+                    ResponderAuthentication: ResponderAuthentication ?? new(remoteIp.ToString()),
+                    BeforeInitialSend: BeforeInitialSend,
+                    ObserveNetworkRejection: ObserveNetworkRejection), ct).ConfigureAwait(false);
             }
 
             // An ePDG that answers a dual-family CFG_REQUEST with a mismatched pair (an IPv6
             // address but an IPv4 P-CSCF) succeeds at IKE_AUTH yet leaves a tunnel that cannot
             // carry IMS signalling, so this rung is not a usable PDN — keep searching, as the
             // reference engine does when a family yields no usable P-CSCF.
-            var usablePdn = result.Success &&
-                            !string.IsNullOrEmpty(result.AssignedIp) &&
-                            !string.IsNullOrEmpty(result.PcscfIp) &&
-                            IkeSession.IsUsablePdn(result.AssignedIp, result.PcscfIp);
+            finalAuthVerified |= result.FinalAuthVerified;
+            var usablePdn = HasUsablePdn(result);
             if (usablePdn)
                 break;
 
             familyErrors.Add(result.Success && !string.IsNullOrEmpty(result.AssignedIp)
                 ? $"{addressFamily}: ePDG assigned {result.AssignedIp} but returned P-CSCF {result.PcscfIp} (address families differ)"
                 : $"{addressFamily}: {result.ErrorMessage ?? "no usable assigned IP/P-CSCF"}");
-            result.Controller?.Dispose();
-            result.Transport?.Dispose();
+            try
+            {
+                if (result.Controller != null)
+                {
+                    using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    await result.Controller.SendIkeDeleteWithoutReplyAsync(cleanup.Token).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                try { result.Controller?.Dispose(); }
+                finally { result.Transport?.Dispose(); }
+            }
+            ct.ThrowIfCancellationRequested();
 
-            // As in the reference engine, only change CP/TS family after the
-            // SIM has authenticated. Earlier rejection is identity/AAA, not PDN family.
-            if (!result.EapSucceeded)
+            // A verified final AUTH with unusable CP, or an explicit pre-AKA
+            // address-family rejection, permits another CP/TS request. EAP
+            // success alone must never bypass failed responder AUTH validation.
+            if (!CanRetryInnerFamily(result))
                 break;
+            identityRetrySafe &= result.PreEapFamilyFailure;
         }
 
         if (result == null)
             throw new InvalidOperationException("IKE address-family discovery did not run.");
-        if (!result.Success || result.AssignedIp == null || result.PcscfIp == null)
+        if (!HasUsablePdn(result))
         {
             return new IkeBackendResult(
                 Success: false,
@@ -185,7 +227,18 @@ public sealed class CSharpIkeBackend : IIkeBackend
                 OutboundSpi: 0,
                 ErrorMessage: familyErrors.Count > 0
                     ? string.Join(" | ", familyErrors)
-                    : result.ErrorMessage ?? "IKE session establishment failed."
+                    : result.ErrorMessage ?? "IKE session establishment failed.",
+                RetryableTransportFailure: identityRetrySafe && result.RetryableTransportFailure,
+                RetryableAddressFamilyFailure: CanRetryInnerFamily(result),
+                RetryableIdentityRejection: identityRetrySafe && result.RetryableIdentityRejection,
+                RetryableInitialTimeout: familyErrors.Count == 1 && result.RetryableInitialTimeout,
+                RetryableInitialProposal: familyErrors.Count == 1 && result.RetryableInitialProposal,
+                FinalAuthVerified: finalAuthVerified,
+                InitialResponderAuthVerified: result.InitialResponderAuthVerified,
+                // Historical final-auth evidence protects home binding, not
+                // the authentication of this current attempt's rejection.
+                NetworkRejection: result.InitialResponderAuthVerified || result.FinalAuthVerified
+                    ? result.NetworkRejection : null
             );
         }
 
@@ -211,9 +264,14 @@ public sealed class CSharpIkeBackend : IIkeBackend
             // The responder can choose any transform we offered.  These values
             // must match the CHILD_SA selection, not the initial IKE preference.
             encryption: $"AES-CBC-{negotiatedEsp.EncryptionBits}",
-            integrity: negotiatedEsp.IntegrityId == IkeIntegrityId.HmacSha1_96
-                ? "HMAC-SHA1-96"
-                : "HMAC-SHA256-128"
+            integrity: negotiatedEsp.IntegrityId switch
+            {
+                IkeIntegrityId.HmacMd5_96 => "HMAC-MD5-96",
+                IkeIntegrityId.HmacSha1_96 => "HMAC-SHA1-96",
+                IkeIntegrityId.HmacSha2_256_128 => "HMAC-SHA256-128",
+                _ => throw new InvalidOperationException("Unsupported negotiated ESP integrity algorithm.")
+            },
+            policy: result.ChildPolicy ?? throw new InvalidOperationException("IKE completed without its negotiated traffic policy.")
         );
 
         if (_transport != null)
@@ -233,7 +291,8 @@ public sealed class CSharpIkeBackend : IIkeBackend
             IkeSuite: result.IkeSuite,
             EspSuite: negotiatedEsp,
             EspTunnel: _espTunnel,
-            Transport: _transport
+            Transport: _transport,
+            InitialResponderAuthVerified: result.InitialResponderAuthVerified
         );
     }
 

@@ -24,7 +24,7 @@ namespace VoWin.ViewModels.Pages
         private string _buildInfo = ".NET 10.0 x64 · Release";
 
         [ObservableProperty]
-        private string _projectDescription = "VoWin 是一个基于 .NET 10 与 WPF-UI Fluent Design 体系构建的现代化 Windows 蜂窝通信与卡池路由管理终端。面向实体硬件 SIM 矩阵与 GSMA 规范虚拟 eSIM，提供高品质语音呼叫、短信收发与国家智能出站分流能力。";
+        private string _projectDescription = "VoWin 是基于 .NET 10 与 WPF 的 Windows 通信网关。通过 QMI / AT 管理模组与 SIM，支持 Host IMS、模组语音桥接和独立 VoWiFi，提供通话、短信、eSIM 与出站路由管理；可按需启用 SIP 网关对接软电话或 Asterisk。同一窗口内各模组独立管理，具体能力取决于硬件、驱动与运营商网络。";
 
         [ObservableProperty]
         private string _gitHubUrl = "https://github.com/unikgyd/VoWin";

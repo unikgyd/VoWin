@@ -1,5 +1,4 @@
 using System.Buffers.Binary;
-using System.Numerics;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
@@ -62,11 +61,16 @@ public sealed record AkaDerivedKeys(byte[] KEncr, byte[] KAut, byte[] Msk, byte[
 public sealed class EapMethodMismatchException : AuthenticationException
 {
     public byte RequestedType { get; }
+    internal bool IdentityOnlyExchange { get; }
 
     public EapMethodMismatchException(byte requestedType, byte selectedType)
+        : this(requestedType, selectedType, false) { }
+
+    internal EapMethodMismatchException(byte requestedType, byte selectedType, bool identityOnlyExchange)
         : base($"ePDG requested EAP type {requestedType}, but this IKE identity was configured for type {selectedType}.")
     {
         RequestedType = requestedType;
+        IdentityOnlyExchange = identityOnlyExchange;
     }
 }
 
@@ -74,7 +78,7 @@ public sealed class EapMethodMismatchException : AuthenticationException
 /// Dual-mode EAP-AKA client supporting RFC 4187 (type 23) and RFC 5448 (type 50).
 /// Integrates with <see cref="IAkaProvider"/> (e.g. EC25 / PC/SC).
 /// </summary>
-public sealed class EapAkaClient
+public sealed class EapAkaClient : IDisposable
 {
     private readonly IAkaProvider _akaProvider;
     private readonly string _imsi;
@@ -83,6 +87,16 @@ public sealed class EapAkaClient
     private readonly string? _expectedIccid;
     private readonly Action<string>? _diagnosticLog;
     private readonly byte _selectedEapMethod;
+    private readonly string? _expectedNetworkName;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly bool[] _seenIds = new bool[256];
+    private readonly HashSet<string> _usedVectors = [];
+    private byte? _lastId;
+    private byte[] _lastRequest = [], _lastResponse = [], _identityTranscript = [];
+    private byte? _identityRank;
+    private bool _checkcodeRequired, _failed, _succeeded, _terminalResponse, _disposed;
+    private bool _identityOnlyExchange = true;
+    private ushort[]? _pendingKdfs, _activeKdfs;
 
     public byte[] Identity { get; }
     public AkaDerivedKeys? Keys { get; private set; }
@@ -90,6 +104,7 @@ public sealed class EapAkaClient
     public bool ResultIndication { get; private set; }
     public bool ProtectedSuccess { get; private set; }
     public string? LastAkaFailure { get; private set; }
+    internal bool IdentityRejectedBeforeChallenge { get; private set; }
 
     public EapAkaClient(
         IAkaProvider akaProvider,
@@ -98,7 +113,8 @@ public sealed class EapAkaClient
         string homeMnc,
         string? expectedIccid = null,
         Action<string>? diagnosticLog = null,
-        byte selectedEapMethod = EapType.Aka)
+        byte selectedEapMethod = EapType.Aka,
+        string? expectedNetworkName = null)
     {
         _akaProvider = akaProvider ?? throw new ArgumentNullException(nameof(akaProvider));
         _imsi = imsi?.Trim() ?? throw new ArgumentNullException(nameof(imsi));
@@ -109,6 +125,9 @@ public sealed class EapAkaClient
         if (selectedEapMethod is not (EapType.Aka or EapType.AkaPrime))
             throw new ArgumentOutOfRangeException(nameof(selectedEapMethod));
         _selectedEapMethod = selectedEapMethod;
+        if (expectedNetworkName != null && (expectedNetworkName.Length is 0 or > 1016 || expectedNetworkName.Any(char.IsControl)))
+            throw new ArgumentException("Invalid expected AKA' network name.", nameof(expectedNetworkName));
+        _expectedNetworkName = expectedNetworkName;
 
         Identity = BuildPermanentIdentity(_imsi, _homeMcc, _homeMnc, selectedEapMethod);
     }
@@ -126,7 +145,7 @@ public sealed class EapAkaClient
         if (imsi.Length < 5 || imsi.Length > 16 || !imsi.All(char.IsAsciiDigit))
             throw new ArgumentException("Invalid IMSI for EAP-AKA.", nameof(imsi));
 
-        if (mcc.Length != 3 || (mnc.Length != 2 && mnc.Length != 3))
+        if (mcc.Length != 3 || (mnc.Length != 2 && mnc.Length != 3) || !mcc.All(char.IsAsciiDigit) || !mnc.All(char.IsAsciiDigit))
             throw new ArgumentException("MCC must be 3 digits, MNC must be 2 or 3 digits.", nameof(mcc));
         if (eapMethod is not (EapType.Aka or EapType.AkaPrime))
             throw new ArgumentOutOfRangeException(nameof(eapMethod));
@@ -143,6 +162,46 @@ public sealed class EapAkaClient
         byte[] encodedPacket,
         CancellationToken ct = default)
     {
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_failed) throw new AuthenticationException("EAP run is invalidated; establish a fresh session.");
+            _failed = true; // cancellation during USIM AUTHENTICATE cannot retry it
+            var packet = ParseEapPacket(encodedPacket);
+            if (packet.Code == EapCode.Success && _lastId != packet.Identifier)
+                throw new AuthenticationException("EAP Success identifier does not match the last request.");
+            if (packet.Code == EapCode.Request)
+            {
+                if (_succeeded) throw new AuthenticationException("EAP run is already complete.");
+                if (_lastId == packet.Identifier)
+                {
+                    if (!_lastRequest.AsSpan().SequenceEqual(encodedPacket))
+                        throw new AuthenticationException("EAP identifier reused with different content.");
+                    _failed = false;
+                    return (_lastResponse.ToArray(), false);
+                }
+                if (_seenIds[packet.Identifier] || _seenIds.Count(value => value) >= 16 || _terminalResponse)
+                    throw new AuthenticationException("EAP request is outside the current method state.");
+            }
+            var result = await HandleCoreAsync(encodedPacket, ct).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (result.Response != null)
+            {
+                _seenIds[packet.Identifier] = true; _lastId = packet.Identifier;
+                CryptographicOperations.ZeroMemory(_lastRequest); CryptographicOperations.ZeroMemory(_lastResponse);
+                _lastRequest = encodedPacket.ToArray(); _lastResponse = result.Response.ToArray();
+            }
+            _succeeded = result.IsSuccess; _failed = false;
+            return result;
+        }
+        catch { ClearKeys(); CryptographicOperations.ZeroMemory(_lastResponse); throw; }
+        finally { _gate.Release(); }
+    }
+
+    private async Task<(byte[]? Response, bool IsSuccess)> HandleCoreAsync(byte[] encodedPacket, CancellationToken ct)
+    {
         var packet = ParseEapPacket(encodedPacket);
         Trace($"inbound code={DescribeCode(packet.Code)}; id={packet.Identifier}; type={DescribeType(packet.Type)}; data-bytes={packet.Data.Length}.");
 
@@ -154,10 +213,12 @@ public sealed class EapAkaClient
                 if (!string.IsNullOrWhiteSpace(LastAkaFailure))
                     throw new AuthenticationException(
                         $"EAP-AKA authentication rejected by ePDG {stage} after local failure: {LastAkaFailure}");
-                throw new AuthenticationException($"EAP-AKA authentication rejected by ePDG ({stage}).");
+                var rejection = $"EAP-AKA authentication rejected by ePDG ({stage}).";
+                IdentityRejectedBeforeChallenge = _identityOnlyExchange && !_terminalResponse;
+                throw new AuthenticationException(rejection);
 
             case EapCode.Success:
-                if (!ChallengeComplete)
+                if (!ChallengeComplete || _terminalResponse)
                     throw new AuthenticationException("EAP Success received before authenticated AKA challenge.");
                 if (ResultIndication && !ProtectedSuccess)
                     throw new AuthenticationException("Unprotected EAP Success received after AT_RESULT_IND.");
@@ -174,6 +235,7 @@ public sealed class EapAkaClient
         switch (packet.Type)
         {
             case EapType.Identity:
+                if (ChallengeComplete) throw new AuthenticationException("Identity request after AKA challenge.");
                 Trace("responding with permanent 3GPP NAI identity (identity value redacted).");
                 var idResp = MarshalEapPacket(new EapPacket(
                     Code: EapCode.Response,
@@ -185,7 +247,7 @@ public sealed class EapAkaClient
             case EapType.Aka:
             case EapType.AkaPrime:
                 if (packet.Type != _selectedEapMethod)
-                    throw new EapMethodMismatchException(packet.Type, _selectedEapMethod);
+                    throw new EapMethodMismatchException(packet.Type, _selectedEapMethod, _identityOnlyExchange);
                 var akaResp = await HandleAkaRequestAsync(packet, ct).ConfigureAwait(false);
                 return (akaResp, false);
 
@@ -196,7 +258,10 @@ public sealed class EapAkaClient
 
     private async Task<byte[]> HandleAkaRequestAsync(EapPacket packet, CancellationToken ct)
     {
-        if (packet.Data.Length < 3 || packet.Data[1] != 0 || packet.Data[2] != 0)
+        // A malformed challenge is still past the identity-only boundary,
+        // even when no vector is consumed and a client-error is returned.
+        _identityOnlyExchange &= packet.Data.Length >= 3 && packet.Data[0] == AkaSubtype.Identity;
+        if (packet.Data.Length < 3)
             return ClientErrorResponse(packet.Identifier, packet.Type);
 
         var subtype = packet.Data[0];
@@ -206,7 +271,11 @@ public sealed class EapAkaClient
         switch (subtype)
         {
             case AkaSubtype.Identity:
-                return RespondAkaIdentity(packet.Identifier, packet.Type, attributes);
+                var identityResponse = RespondAkaIdentity(packet.Identifier, packet.Type, attributes);
+                var transcript = Combine(_identityTranscript, MarshalEapPacket(packet), identityResponse);
+                if (transcript.Length > 32768) throw new AuthenticationException("AKA identity transcript exceeds limit.");
+                CryptographicOperations.ZeroMemory(_identityTranscript); _identityTranscript = transcript;
+                return identityResponse;
 
             case AkaSubtype.Challenge:
                 return await RespondAkaChallengeAsync(packet, attributes, ct).ConfigureAwait(false);
@@ -221,6 +290,13 @@ public sealed class EapAkaClient
 
     private byte[] RespondAkaIdentity(byte identifier, byte eapType, List<AkaAttribute> attributes)
     {
+        if (ChallengeComplete || _usedVectors.Count != 0) throw new AuthenticationException("Unexpected AKA identity round.");
+        EapAkaValidation.Attributes(attributes, 10, 13, 17);
+        var requests = attributes.Where(a => a.Type is 10 or 13 or 17).ToArray();
+        if (requests.Length != 1) throw new AuthenticationException("AKA identity request must select one identity class.");
+        byte rank = requests[0].Type switch { 13 => 0, 17 => 1, _ => 2 };
+        if (_identityRank.HasValue && rank <= _identityRank.Value) throw new AuthenticationException("AKA identity request did not advance.");
+        _identityRank = rank; _checkcodeRequired |= attributes.Any(a => a.Type is not (10 or 13 or 17));
         var identityAttr = MarshalAkaAttribute(AkaAttributeType.Identity,
             Combine(new byte[] { (byte)(Identity.Length >> 8), (byte)Identity.Length }, Identity));
 
@@ -233,6 +309,8 @@ public sealed class EapAkaClient
         List<AkaAttribute> attributes,
         CancellationToken ct)
     {
+        if (ChallengeComplete) throw new AuthenticationException("A new challenge cannot replace completed AKA keys.");
+        EapAkaValidation.Attributes(attributes, 1, 2, 11, 23, 24, 129, 130, 134, 135, 136);
         var randAttr = attributes.FirstOrDefault(a => a.Type == AkaAttributeType.Rand)
             ?? throw new AuthenticationException("EAP-AKA challenge missing AT_RAND.");
         var autnAttr = attributes.FirstOrDefault(a => a.Type == AkaAttributeType.Autn)
@@ -245,10 +323,38 @@ public sealed class EapAkaClient
 
         var rand = randAttr.Raw[4..20];
         var autn = autnAttr.Raw[4..20];
+        var isPrime = request.Type == EapType.AkaPrime;
+        EapAkaValidation.Checkcode(attributes, _identityTranscript, _checkcodeRequired, isPrime);
+        byte[]? kdfInputName = null;
+        if (isPrime)
+        {
+            if ((autn[6] & 0x80) == 0 || attributes.Any(a => a.Type == 136))
+                throw new AuthenticationException("Invalid AKA' separation or bidding attribute.");
+            var negotiation = NegotiateKdf(request.Identifier, attributes);
+            if (negotiation != null) return negotiation;
+            kdfInputName = EapAkaValidation.NetworkName(attributes.FirstOrDefault(a => a.Type == 23), _expectedNetworkName);
+        }
+        else
+        {
+            if (attributes.Any(a => a.Type is 23 or 24)) throw new AuthenticationException("AKA' KDF in legacy AKA request.");
+            if (attributes.Any(a => a.Type == 136 && (a.Raw[2] & 0x80) != 0))
+                throw new EapMethodMismatchException(EapType.AkaPrime, EapType.Aka);
+        }
+        var iv = attributes.FirstOrDefault(a => a.Type == 129);
+        var encrypted = attributes.FirstOrDefault(a => a.Type == 130);
+        if ((iv == null) != (encrypted == null) || encrypted != null && (encrypted.Raw.Length < 20 || (encrypted.Raw.Length - 4) % 16 != 0))
+            throw new AuthenticationException("Invalid EAP-AKA encrypted attribute framing.");
+        if (_usedVectors.Count >= 3 || !_usedVectors.Add(Convert.ToHexString(SHA256.HashData(Combine(rand, autn)))))
+            throw new AuthenticationException("AKA vector was already used or resynchronization limit reached.");
         var challenge = AkaChallenge.Create(rand, autn);
 
+        if (!await _akaProvider.CheckReadyAsync(_expectedIccid, ct).ConfigureAwait(false))
+            throw new AuthenticationException("Selected SIM is no longer ready for AKA.");
         Trace("AKA challenge complete; invoking USIM AUTHENTICATE (RAND/AUTN redacted).");
         var result = await _akaProvider.AuthenticateAsync(challenge, ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+        if (!await _akaProvider.CheckReadyAsync(_expectedIccid, ct).ConfigureAwait(false))
+            throw new AuthenticationException("Selected SIM changed during AKA.");
         // AkaResult deliberately throws when AUTS is read outside a sync-failure
         // response.  Diagnostics must observe that contract rather than turning
         // a successful AKA exchange into a logging failure.
@@ -265,107 +371,121 @@ public sealed class EapAkaClient
         {
             LastAkaFailure = "USIM AUTHENTICATE reported synchronization failure; AUTS was returned to the ePDG.";
             var auts = result.Auts ?? throw new AuthenticationException("SIM reported sync failure without AUTS.");
+            if (auts.Length != 14) throw new AuthenticationException("SIM returned invalid AUTS length.");
             var autsAttr = MarshalAkaAttribute(AkaAttributeType.Auts, auts);
-            var syncData = Combine(new byte[] { AkaSubtype.SynchronizationFailure, 0, 0 }, autsAttr);
+            var syncData = Combine(new byte[] { AkaSubtype.SynchronizationFailure, 0, 0 }, autsAttr,
+                isPrime ? attributes.Where(a => a.Type == 24).SelectMany(a => a.Raw).ToArray() : []);
             return MarshalEapPacket(new EapPacket(EapCode.Response, request.Identifier, request.Type, syncData));
         }
 
         if (!result.Success || result.Res == null || result.Ck == null || result.Ik == null)
         {
             LastAkaFailure = $"USIM AUTHENTICATE failed: {result.ErrorMessage ?? "no authentication vector was returned"}";
+            _terminalResponse = true;
             Trace("USIM result cannot form EAP-AKA response; sending AuthenticationReject.");
             // Authentication reject
             var rejData = new byte[] { AkaSubtype.AuthenticationReject, 0, 0 };
             return MarshalEapPacket(new EapPacket(EapCode.Response, request.Identifier, request.Type, rejData));
         }
 
-        var res = result.Res;
-        var ck = result.Ck;
-        var ik = result.Ik;
+        var res = result.Res.ToArray();
+        var ck = result.Ck.ToArray();
+        var ik = result.Ik.ToArray();
         LastAkaFailure = null;
-
-        // Derive keys based on EAP type (type 23 vs type 50)
-        var isPrime = request.Type == EapType.AkaPrime;
-        byte[]? kdfInputName = null;
-        if (isPrime)
+        AkaDerivedKeys? pendingKeys = null;
+        try
         {
-            if ((autn[6] & 0x80) == 0)
-                throw new AuthenticationException("EAP-AKA' AUTN lacks the AMF separation bit.");
-            var kdfAttr = attributes.FirstOrDefault(a => a.Type == AkaAttributeType.Kdf);
-            if (kdfAttr?.Raw.Length != 4 || BinaryPrimitives.ReadUInt16BigEndian(kdfAttr.Raw.AsSpan(2, 2)) != 1)
-                throw new AuthenticationException("EAP-AKA' challenge must select supported AT_KDF value 1.");
+            if (res.Length is < 4 or > 16 || ck.Length != 16 || ik.Length != 16)
+                throw new AuthenticationException("SIM returned invalid AKA key lengths.");
+            var keys = isPrime
+                ? DeriveAkaPrimeKeys(Identity, ik, ck, autn, kdfInputName!)
+                : DeriveAkaKeys(Identity, ik, ck);
+            pendingKeys = keys;
 
-            var kdfInputAttr = attributes.FirstOrDefault(a => a.Type == AkaAttributeType.KdfInput);
-            if (kdfInputAttr?.Raw.Length is not >= 5)
-                throw new AuthenticationException("EAP-AKA' challenge is missing AT_KDF_INPUT.");
-            var nameLen = BinaryPrimitives.ReadUInt16BigEndian(kdfInputAttr.Raw.AsSpan(2, 2));
-            if (nameLen == 0 || kdfInputAttr.Raw.Length < 4 + nameLen)
-                throw new AuthenticationException("EAP-AKA' AT_KDF_INPUT has an invalid network name.");
-            kdfInputName = kdfInputAttr.Raw.AsSpan(4, nameLen).ToArray();
+            // Verify server AT_MAC
+            var requestBytes = MarshalEapPacket(request);
+            var zeroed = (byte[])requestBytes.Clone();
+            var macOffset = 4 + 1 + 3 + macAttr.Offset; // 4 header + 1 type + 3 subtype/reserved + offset
+            for (var i = macOffset + 4; i < macOffset + 20; i++)
+                zeroed[i] = 0;
+
+            var expectedMac = ComputeMac(keys.KAut, zeroed, isPrime);
+            var actualMac = macAttr.Raw.AsSpan(4, 16);
+            var serverMacValid = CryptographicOperations.FixedTimeEquals(expectedMac, actualMac);
+            Trace($"server AT_MAC verified={serverMacValid}.");
+            if (!serverMacValid)
+                throw new AuthenticationException("EAP-AKA server AT_MAC verification failed.");
+            EapAkaValidation.EncryptedAttributes(attributes, keys);
+
+            // Normal challenge response: RES + optional RESULT_IND + AT_MAC.
+            // AT_KDF alone is used only for negotiation, or copied on prime AUTS.
+            var resVal = new byte[2 + res.Length];
+            BinaryPrimitives.WriteUInt16BigEndian(resVal.AsSpan(0, 2), (ushort)(res.Length * 8));
+            Buffer.BlockCopy(res, 0, resVal, 2, res.Length);
+            var resAttr = MarshalAkaAttribute(AkaAttributeType.Res, resVal);
+
+            var responsePayload = new List<byte> { AkaSubtype.Challenge, 0, 0 };
+            responsePayload.AddRange(resAttr);
+
+            var hasResultInd = attributes.Any(a => a.Type == AkaAttributeType.ResultInd);
+            if (hasResultInd)
+            {
+                responsePayload.AddRange(MarshalAkaAttribute(AkaAttributeType.ResultInd, Array.Empty<byte>()));
+            }
+
+            // Placeholder MAC (16 bytes of zeros inside attribute)
+            var emptyMacAttr = MarshalAkaAttribute(AkaAttributeType.Mac, new byte[18]); // 2 bytes reserved + 16 bytes MAC
+            responsePayload.AddRange(emptyMacAttr);
+
+            var responsePacket = new EapPacket(EapCode.Response, request.Identifier, request.Type, responsePayload.ToArray());
+            var responseBytes = MarshalEapPacket(responsePacket);
+
+            // Compute MAC over responseBytes with zeroed MAC
+            var responseAttrs = ParseAkaAttributes(responsePayload.ToArray().AsSpan(3));
+            var respMacAttr = responseAttrs.First(a => a.Type == AkaAttributeType.Mac);
+            var respMacOffset = 4 + 1 + 3 + respMacAttr.Offset;
+
+            var computedMac = ComputeMac(keys.KAut, responseBytes, isPrime);
+            Buffer.BlockCopy(computedMac, 0, responseBytes, respMacOffset + 4, 16);
+
+            Keys = keys;
+            pendingKeys = null;
+            ChallengeComplete = true;
+            ResultIndication = hasResultInd;
+            Trace($"AKA challenge response prepared; res-bytes={res.Length}; aka-prime={isPrime}; result-indication={hasResultInd}.");
+
+            return responseBytes;
         }
-
-        var keys = isPrime
-            ? DeriveAkaPrimeKeys(Identity, ik, ck, autn, kdfInputName!)
-            : DeriveAkaKeys(Identity, ik, ck);
-
-        // Verify server AT_MAC
-        var requestBytes = MarshalEapPacket(request);
-        var zeroed = (byte[])requestBytes.Clone();
-        var macOffset = 4 + 1 + 3 + macAttr.Offset; // 4 header + 1 type + 3 subtype/reserved + offset
-        for (var i = macOffset + 4; i < macOffset + 20; i++)
-            zeroed[i] = 0;
-
-        var expectedMac = ComputeMac(keys.KAut, zeroed, isPrime);
-        var actualMac = macAttr.Raw.AsSpan(4, 16);
-        var serverMacValid = CryptographicOperations.FixedTimeEquals(expectedMac, actualMac);
-        Trace($"server AT_MAC verified={serverMacValid}.");
-        if (!serverMacValid)
-            throw new AuthenticationException("EAP-AKA server AT_MAC verification failed.");
-
-        // Build Response: RES + optional RESULT_IND + AT_KDF (if prime) + AT_MAC
-        var resVal = new byte[2 + res.Length];
-        BinaryPrimitives.WriteUInt16BigEndian(resVal.AsSpan(0, 2), (ushort)(res.Length * 8));
-        Buffer.BlockCopy(res, 0, resVal, 2, res.Length);
-        var resAttr = MarshalAkaAttribute(AkaAttributeType.Res, resVal);
-
-        var responsePayload = new List<byte> { AkaSubtype.Challenge, 0, 0 };
-        responsePayload.AddRange(resAttr);
-
-        if (isPrime)
+        finally
         {
-            responsePayload.AddRange(MarshalAkaAttribute(AkaAttributeType.Kdf, new byte[] { 0, 1 }));
+            CryptographicOperations.ZeroMemory(res); CryptographicOperations.ZeroMemory(ck); CryptographicOperations.ZeroMemory(ik);
+            Wipe(pendingKeys);
         }
-
-        var hasResultInd = attributes.Any(a => a.Type == AkaAttributeType.ResultInd);
-        if (hasResultInd)
-        {
-            responsePayload.AddRange(MarshalAkaAttribute(AkaAttributeType.ResultInd, Array.Empty<byte>()));
-        }
-
-        // Placeholder MAC (16 bytes of zeros inside attribute)
-        var emptyMacAttr = MarshalAkaAttribute(AkaAttributeType.Mac, new byte[18]); // 2 bytes reserved + 16 bytes MAC
-        responsePayload.AddRange(emptyMacAttr);
-
-        var responsePacket = new EapPacket(EapCode.Response, request.Identifier, request.Type, responsePayload.ToArray());
-        var responseBytes = MarshalEapPacket(responsePacket);
-
-        // Compute MAC over responseBytes with zeroed MAC
-        var responseAttrs = ParseAkaAttributes(responsePayload.ToArray().AsSpan(3));
-        var respMacAttr = responseAttrs.First(a => a.Type == AkaAttributeType.Mac);
-        var respMacOffset = 4 + 1 + 3 + respMacAttr.Offset;
-
-        var computedMac = ComputeMac(keys.KAut, responseBytes, isPrime);
-        Buffer.BlockCopy(computedMac, 0, responseBytes, respMacOffset + 4, 16);
-
-        Keys = keys;
-        ChallengeComplete = true;
-        ResultIndication = hasResultInd;
-        Trace($"AKA challenge response prepared; res-bytes={res.Length}; aka-prime={isPrime}; result-indication={hasResultInd}.");
-
-        return responseBytes;
     }
 
-    private void Trace(string message) => _diagnosticLog?.Invoke(message);
+    private byte[]? NegotiateKdf(byte identifier, List<AkaAttribute> attributes)
+    {
+        var offered = attributes.Where(a => a.Type == 24).Select(a => BinaryPrimitives.ReadUInt16BigEndian(a.Raw.AsSpan(2, 2))).ToArray();
+        if (_pendingKdfs != null)
+        {
+            if (!offered.SequenceEqual(new ushort[] { 1 }.Concat(_pendingKdfs)))
+                throw new AuthenticationException("AKA' KDF negotiation changed the original offer.");
+            _pendingKdfs = null; _activeKdfs = offered; return null;
+        }
+        if (_activeKdfs != null)
+        {
+            if (!offered.SequenceEqual(_activeKdfs)) throw new AuthenticationException("AKA' KDF changed during authentication.");
+            return null;
+        }
+        if (offered.Length == 0 || offered.Distinct().Count() != offered.Length || !offered.Contains((ushort)1))
+            throw new AuthenticationException("AKA' has no valid supported KDF offer.");
+        if (offered[0] == 1) { _activeKdfs = offered; return null; }
+        _pendingKdfs = offered;
+        return MarshalEapPacket(new(EapCode.Response, identifier, EapType.AkaPrime,
+            Combine([AkaSubtype.Challenge, 0, 0], MarshalAkaAttribute(24, [0, 1]))));
+    }
+
+    private void Trace(string message) { try { _diagnosticLog?.Invoke(message); } catch { } }
 
     private static string DescribeCode(byte code) => code switch
     {
@@ -411,48 +531,38 @@ public sealed class EapAkaClient
 
     private byte[] RespondAkaNotification(EapPacket request, List<AkaAttribute> attributes)
     {
-        var notifAttr = attributes.FirstOrDefault(a => a.Type == AkaAttributeType.Notification);
-        if (notifAttr == null || notifAttr.Raw.Length != 4)
-            return ClientErrorResponse(request.Identifier, request.Type);
-
-        var code = BinaryPrimitives.ReadUInt16BigEndian(notifAttr.Raw.AsSpan(2, 2));
-        var isPrime = request.Type == EapType.AkaPrime;
-
-        if (code == 32768) // Protected success notification
+        EapAkaValidation.Attributes(attributes, 12, 11);
+        var notification = attributes.FirstOrDefault(a => a.Type == 12)
+            ?? throw new AuthenticationException("Missing AT_NOTIFICATION.");
+        var code = BinaryPrimitives.ReadUInt16BigEndian(notification.Raw.AsSpan(2, 2));
+        if ((code & 0x4000) != 0)
         {
-            if (!ChallengeComplete || !ResultIndication || Keys == null)
-                throw new AuthenticationException("Unexpected protected EAP success notification.");
-
-            var macAttr = attributes.FirstOrDefault(a => a.Type == AkaAttributeType.Mac)
-                ?? throw new AuthenticationException("Protected success notification missing AT_MAC.");
-
-            var requestBytes = MarshalEapPacket(request);
-            var zeroed = (byte[])requestBytes.Clone();
-            var macOffset = 4 + 1 + 3 + macAttr.Offset;
-            for (var i = macOffset + 4; i < macOffset + 20; i++)
-                zeroed[i] = 0;
-
-            var expectedMac = ComputeMac(Keys.KAut, zeroed, isPrime);
-            if (!CryptographicOperations.FixedTimeEquals(expectedMac, macAttr.Raw.AsSpan(4, 16)))
-                throw new AuthenticationException("Protected success notification AT_MAC is invalid.");
-
-            // Acknowledge with empty notification response containing MAC
-            var emptyMac = MarshalAkaAttribute(AkaAttributeType.Mac, new byte[18]);
-            var respData = Combine(new byte[] { AkaSubtype.Notification, 0, 0 }, emptyMac);
-            var responseBytes = MarshalEapPacket(new EapPacket(EapCode.Response, request.Identifier, request.Type, respData));
-
-            var respAttrs = ParseAkaAttributes(respData.AsSpan(3));
-            var respMac = respAttrs.First(a => a.Type == AkaAttributeType.Mac);
-            var offset = 4 + 1 + 3 + respMac.Offset;
-            Buffer.BlockCopy(ComputeMac(Keys.KAut, responseBytes, isPrime), 0, responseBytes, offset + 4, 16);
-
-            ProtectedSuccess = true;
-            return responseBytes;
+            if (ChallengeComplete || (code & 0x8000) != 0 || attributes.Any(a => a.Type == 11))
+                throw new AuthenticationException("Invalid pre-authentication AKA notification.");
+            _terminalResponse = true;
+            return MarshalEapPacket(new(EapCode.Response, request.Identifier, request.Type, [AkaSubtype.Notification, 0, 0]));
         }
-
-        // Other notification codes
-        var data = new byte[] { AkaSubtype.Notification, 0, 0 };
-        return MarshalEapPacket(new EapPacket(EapCode.Response, request.Identifier, request.Type, data));
+        if (!ChallengeComplete || Keys == null) throw new AuthenticationException("Protected AKA notification before challenge.");
+        var mac = attributes.FirstOrDefault(a => a.Type == 11)
+            ?? throw new AuthenticationException("Protected AKA notification missing MAC.");
+        var zeroed = MarshalEapPacket(request);
+        try
+        {
+            zeroed.AsSpan(12 + mac.Offset, 16).Clear();
+            if (!CryptographicOperations.FixedTimeEquals(ComputeMac(Keys.KAut, zeroed, request.Type == EapType.AkaPrime), mac.Raw.AsSpan(4, 16)))
+                throw new AuthenticationException("Protected AKA notification MAC is invalid.");
+        }
+        finally { CryptographicOperations.ZeroMemory(zeroed); }
+        if (code == 32768)
+        {
+            if (!ResultIndication || ProtectedSuccess) throw new AuthenticationException("Unexpected protected EAP success.");
+            ProtectedSuccess = true;
+        }
+        else _terminalResponse = true;
+        var response = MarshalEapPacket(new(EapCode.Response, request.Identifier, request.Type,
+            Combine([AkaSubtype.Notification, 0, 0], MarshalAkaAttribute(11, new byte[18]))));
+        ComputeMac(Keys.KAut, response, request.Type == EapType.AkaPrime).CopyTo(response, 12);
+        return response;
     }
 
     private static byte[] ClientErrorResponse(byte identifier, byte eapType)
@@ -470,6 +580,7 @@ public sealed class EapAkaClient
 
         var mac = new byte[16];
         Buffer.BlockCopy(full, 0, mac, 0, 16);
+        CryptographicOperations.ZeroMemory(full);
         return mac;
     }
 
@@ -481,7 +592,7 @@ public sealed class EapAkaClient
         ArgumentNullException.ThrowIfNull(ik);
         ArgumentNullException.ThrowIfNull(ck);
 
-        if (ik.Length != 16 || ck.Length != 16)
+        if (ik.Length != 16 || ck.Length != 16 || identity.Length is 0 or > 1024)
             throw new ArgumentException("IK and CK must be exactly 16 bytes.");
 
         var material = new byte[identity.Length + 32];
@@ -491,55 +602,50 @@ public sealed class EapAkaClient
 
         var mk = SHA1.HashData(material);
         var stream = Fips1862Prf(mk, 160);
+        try
+        {
+            var kEncr = new byte[16];
+            var kAut = new byte[16];
+            var msk = new byte[64];
+            var emsk = new byte[64];
 
-        var kEncr = new byte[16];
-        var kAut = new byte[16];
-        var msk = new byte[64];
-        var emsk = new byte[64];
+            Buffer.BlockCopy(stream, 0, kEncr, 0, 16);
+            Buffer.BlockCopy(stream, 16, kAut, 0, 16);
+            Buffer.BlockCopy(stream, 32, msk, 0, 64);
+            Buffer.BlockCopy(stream, 96, emsk, 0, 64);
 
-        Buffer.BlockCopy(stream, 0, kEncr, 0, 16);
-        Buffer.BlockCopy(stream, 16, kAut, 0, 16);
-        Buffer.BlockCopy(stream, 32, msk, 0, 64);
-        Buffer.BlockCopy(stream, 96, emsk, 0, 64);
-
-        return new AkaDerivedKeys(kEncr, kAut, msk, emsk);
+            return new AkaDerivedKeys(kEncr, kAut, msk, emsk);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(material); CryptographicOperations.ZeroMemory(mk); CryptographicOperations.ZeroMemory(stream);
+        }
     }
 
     public static byte[] Fips1862Prf(byte[] seed, int length)
     {
-        // BigInteger in C# is little-endian signed by default, so we ensure positive big-endian
-        var unsignedSeed = new byte[seed.Length + 1];
-        Buffer.BlockCopy(seed, 0, unsignedSeed, 1, seed.Length); // prepend 0 for positive
-        Array.Reverse(unsignedSeed); // to little-endian for BigInteger constructor
-        var xkey = new BigInteger(unsignedSeed);
-
-        var modulus = BigInteger.One << 160;
-        var result = new byte[length];
-        var offset = 0;
-
-        while (offset < length)
+        if (seed.Length != 20 || length is < 0 or > 4096) throw new ArgumentException("Invalid FIPS PRF seed or output length.");
+        var key = seed.ToArray(); var result = new byte[length];
+        try
         {
-            var xval = new byte[20];
-            var keyBytes = xkey.ToByteArray(); // little-endian
-            for (var i = 0; i < Math.Min(20, keyBytes.Length); i++)
+            for (var offset = 0; offset < length; offset += 20)
             {
-                xval[19 - i] = keyBytes[i];
+                var word = FipsSha1G(key);
+                try
+                {
+                    word.AsSpan(0, Math.Min(20, length - offset)).CopyTo(result.AsSpan(offset));
+                    var carry = 1;
+                    for (var i = 19; i >= 0; i--)
+                    {
+                        var sum = key[i] + word[i] + carry; key[i] = (byte)sum; carry = sum >> 8;
+                    }
+                }
+                finally { CryptographicOperations.ZeroMemory(word); }
             }
-
-            var word = FipsSha1G(xval);
-            var toCopy = Math.Min(20, length - offset);
-            Buffer.BlockCopy(word, 0, result, offset, toCopy);
-            offset += toCopy;
-
-            var wordUnsigned = new byte[21];
-            Buffer.BlockCopy(word, 0, wordUnsigned, 1, 20);
-            Array.Reverse(wordUnsigned);
-            var increment = new BigInteger(wordUnsigned);
-
-            xkey = (xkey + increment + BigInteger.One) % modulus;
+            return result;
         }
-
-        return result;
+        catch { CryptographicOperations.ZeroMemory(result); throw; }
+        finally { CryptographicOperations.ZeroMemory(key); }
     }
 
     private static byte[] FipsSha1G(byte[] xval)
@@ -599,6 +705,7 @@ public sealed class EapAkaClient
         BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(8, 4), initC + c);
         BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(12, 4), initD + d);
         BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(16, 4), initE + e);
+        CryptographicOperations.ZeroMemory(block); Array.Clear(words);
         return result;
     }
 
@@ -606,64 +713,31 @@ public sealed class EapAkaClient
 
     public static AkaDerivedKeys DeriveAkaPrimeKeys(byte[] identity, byte[] ik, byte[] ck, byte[] autn, byte[] networkName)
     {
-        ArgumentNullException.ThrowIfNull(identity);
-        ArgumentNullException.ThrowIfNull(ik);
-        ArgumentNullException.ThrowIfNull(ck);
-        ArgumentNullException.ThrowIfNull(autn);
-        ArgumentNullException.ThrowIfNull(networkName);
-        if (ik.Length != 16 || ck.Length != 16 || autn.Length != 16 || networkName.Length == 0)
-            throw new ArgumentException("EAP-AKA' requires 16-byte IK, CK and AUTN plus a nonempty network name.");
-        if ((autn[6] & 0x80) == 0)
-            throw new AuthenticationException("EAP-AKA' AUTN lacks the AMF separation bit.");
-
-        // 3GPP TS 33.402 Annex A.2: CK' || IK' = HMAC-SHA-256(CK || IK,
-        // FC || network name || length || SQN xor AK || 0x0006).
-        var s = Combine([0x20], networkName,
-            [(byte)(networkName.Length >> 8), (byte)networkName.Length],
-            autn[..6], [0, 6]);
-        var ckIkPrime = HMACSHA256.HashData(Combine(ck, ik), s);
-        var ckPrime = ckIkPrime[..16];
-        var ikPrime = ckIkPrime[16..];
-
-        // RFC 5448 §3.3: PRF'(IK' || CK', "EAP-AKA'" || Identity).
-        var stream = PrfSha256(Combine(ikPrime, ckPrime),
-            Combine(Encoding.ASCII.GetBytes("EAP-AKA'"), identity), 208);
-
-        var kEncr = new byte[16];
-        var kAut = new byte[32];
-        var msk = new byte[64];
-        var emsk = new byte[64];
-
-        Buffer.BlockCopy(stream, 0, kEncr, 0, 16);
-        Buffer.BlockCopy(stream, 16, kAut, 0, 32);
-        Buffer.BlockCopy(stream, 80, msk, 0, 64);
-        Buffer.BlockCopy(stream, 144, emsk, 0, 64);
-
-        return new AkaDerivedKeys(kEncr, kAut, msk, emsk);
-    }
-
-    private static byte[] PrfSha256(byte[] key, byte[] seed, int length)
-    {
-        var result = new byte[length];
-        var offset = 0;
-        byte[]? prev = null;
-        for (byte counter = 1; offset < length; counter++)
+        if (identity.Length is 0 or > 1024 || ik.Length != 16 || ck.Length != 16 || autn.Length != 16 || networkName.Length is 0 or > 1016)
+            throw new ArgumentException("Invalid EAP-AKA' key derivation input.");
+        if ((autn[6] & 0x80) == 0) throw new AuthenticationException("AKA' AUTN lacks separation bit.");
+        var input = Combine([0x20], networkName, [(byte)(networkName.Length >> 8), (byte)networkName.Length], autn[..6], [0, 6]);
+        var key = Combine(ck, ik); byte[] derived = [], reordered = [], stream = [], seed = [];
+        try
         {
-            var input = Combine(prev ?? Array.Empty<byte>(), seed, new[] { counter });
-            var block = HMACSHA256.HashData(key, input);
-            var toCopy = Math.Min(block.Length, length - offset);
-            Buffer.BlockCopy(block, 0, result, offset, toCopy);
-            offset += toCopy;
-            prev = block;
+            derived = HMACSHA256.HashData(key, input);
+            reordered = new byte[32];
+            derived.AsSpan(16, 16).CopyTo(reordered); derived.AsSpan(0, 16).CopyTo(reordered.AsSpan(16));
+            seed = Combine(Encoding.ASCII.GetBytes("EAP-AKA'"), identity);
+            stream = IkeCrypto.PrfPlus(IkeSuite.Preferred, reordered, seed, 208);
+            return new(stream[..16], stream[16..48], stream[80..144], stream[144..208]);
         }
-        return result;
+        finally
+        {
+            foreach (var value in new[] { input, key, derived, reordered, stream, seed }) CryptographicOperations.ZeroMemory(value);
+        }
     }
 
     // ── Packet & Attribute Codec ──────────────────────────────────────────────
 
     public static EapPacket ParseEapPacket(ReadOnlySpan<byte> buffer)
     {
-        if (buffer.Length < 4)
+        if (buffer.Length is < 4 or > EapAkaValidation.MaximumPacket)
             throw new IkeFormatException($"Truncated EAP header ({buffer.Length} bytes).");
 
         var length = BinaryPrimitives.ReadUInt16BigEndian(buffer.Slice(2, 2));
@@ -672,6 +746,7 @@ public sealed class EapAkaClient
 
         var code = buffer[0];
         var id = buffer[1];
+        if (code is < 1 or > 4) throw new IkeFormatException("Invalid EAP code.");
 
         if (code is EapCode.Success or EapCode.Failure)
         {
@@ -691,6 +766,9 @@ public sealed class EapAkaClient
     public static byte[] MarshalEapPacket(EapPacket packet)
     {
         ArgumentNullException.ThrowIfNull(packet);
+        if (packet.Code is < 1 or > 4 || packet.Data.Length + 5 > EapAkaValidation.MaximumPacket ||
+            packet.Code is EapCode.Success or EapCode.Failure && packet.Data.Length != 0)
+            throw new IkeFormatException("Invalid EAP packet code or size.");
 
         var length = 4;
         if (packet.Code is EapCode.Request or EapCode.Response)
@@ -716,6 +794,8 @@ public sealed class EapAkaClient
     {
         var attributes = new List<AkaAttribute>();
         var offset = 0;
+        var seen = new HashSet<byte>();
+        if (buffer.Length > EapAkaValidation.MaximumPacket) throw new IkeFormatException("Excessive AKA attributes.");
 
         while (offset < buffer.Length)
         {
@@ -723,6 +803,8 @@ public sealed class EapAkaClient
                 throw new IkeFormatException("Truncated AKA attribute header.");
 
             var type = buffer[offset];
+            if (attributes.Count >= 64 || !seen.Add(type) && type != AkaAttributeType.Kdf)
+                throw new IkeFormatException("Duplicate or excessive AKA attributes.");
             var lenUnits = buffer[offset + 1];
             var totalLen = lenUnits * 4;
 
@@ -764,5 +846,17 @@ public sealed class EapAkaClient
             offset += arr.Length;
         }
         return res;
+    }
+
+    private static void Wipe(AkaDerivedKeys? keys)
+    {
+        if (keys == null) return;
+        foreach (var key in new[] { keys.KEncr, keys.KAut, keys.Msk, keys.Emsk }) CryptographicOperations.ZeroMemory(key);
+    }
+    private void ClearKeys() { Wipe(Keys); Keys = null; ChallengeComplete = false; ResultIndication = false; ProtectedSuccess = false; }
+    public void Dispose()
+    {
+        if (_disposed) return; _disposed = true; _failed = true; ClearKeys();
+        foreach (var bytes in new[] { Identity, _lastRequest, _lastResponse, _identityTranscript }) CryptographicOperations.ZeroMemory(bytes);
     }
 }

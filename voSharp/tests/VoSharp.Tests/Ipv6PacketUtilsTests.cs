@@ -50,13 +50,14 @@ public class Ipv6PacketUtilsTests
     {
         var ue = IPAddress.Parse("2001:db8::10");
         var pcscf = IPAddress.Parse("2001:db8::20");
-        var ueProposal = new SecurityProposal("hmac-sha-1-96", "aes-cbc", 100, 200, 40000, 40001);
+        // RFC 4303 reserves SPI 1..255; all four test SAs need distinct, usable SPIs.
+        var ueProposal = new SecurityProposal("hmac-sha-1-96", "aes-cbc", 1101, 1102, 40000, 40001);
         var pcscfProposal = new SecurityProposal("hmac-sha-1-96", "aes-cbc", 1001, 1002, 41000, 41001);
         var key = Enumerable.Range(0, 16).Select(i => (byte)i).ToArray();
         using var ueTransport = new ImsIpsecTransport(ue, pcscf, ueProposal);
         using var pcscfTransport = new ImsIpsecTransport(pcscf, ue, pcscfProposal);
         ueTransport.Activate(new SecurityAgreement(ueProposal, "verify", 1001, 1002, 41000, 41001), key, key);
-        pcscfTransport.Activate(new SecurityAgreement(pcscfProposal, "verify", 100, 200, 40000, 40001), key, key);
+        pcscfTransport.Activate(new SecurityAgreement(pcscfProposal, "verify", 1101, 1102, 40000, 40001), key, key);
 
         var payload = "REGISTER sip:ims.test SIP/2.0\r\nContent-Length: 0\r\n\r\n"u8.ToArray();
         var protectedPacket = ueTransport.Protect(new SipDatagram(payload,
@@ -73,7 +74,7 @@ public class Ipv6PacketUtilsTests
     {
         var ue = IPAddress.Parse("2001:db8::10");
         var pcscf = IPAddress.Parse("2001:db8::20");
-        var proposal = new SecurityProposal("hmac-sha-1-96", "aes-cbc", 100, 200, 40000, 40001);
+        var proposal = new SecurityProposal("hmac-sha-1-96", "aes-cbc", 1101, 1102, 40000, 40001);
         var key = RandomNumberGenerator.GetBytes(16);
         using var transport = new ImsIpsecTransport(ue, pcscf, proposal);
         transport.Activate(new SecurityAgreement(proposal, "verify", 1001, 1002, 41000, 41001), key, key);

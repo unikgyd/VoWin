@@ -14,6 +14,20 @@ public sealed class RemoteControlSettings
     public string QqClientSecret { get; set; } = string.Empty;
     public string QqAllowedUsers { get; set; } = string.Empty;
 
+    public bool TelegramEnabled { get; set; }
+    public string TelegramApiBaseUrl { get; set; } = "https://api.telegram.org";
+    public string TelegramBotToken { get; set; } = string.Empty;
+    public string TelegramAllowedUsers { get; set; } = string.Empty;
+    public bool BarkEnabled { get; set; }
+    public string BarkServerUrl { get; set; } = "https://api.day.app";
+    public string BarkDeviceKey { get; set; } = string.Empty;
+    public bool BarkIncludeSmsContent { get; set; }
+
+    public bool AllowRemoteCalls { get; set; }
+    public bool AllowRemoteSms { get; set; }
+    public bool AllowRemoteLineChanges { get; set; }
+    public bool AllowRemoteReadSms { get; set; }
+
     public bool NotifyIncomingSms { get; set; } = true;
     public bool NotifyOtpOnly { get; set; }
     public bool NotifyIncomingCalls { get; set; } = true;
@@ -24,7 +38,8 @@ public sealed class RemoteControlSettings
 public enum RemoteChannelKind
 {
     Weixin,
-    Qq
+    Qq,
+    Telegram
 }
 
 public sealed record RemoteInboundMessage(
